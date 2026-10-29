@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: interlink-dispatch-hpc-a
+  namespace: interlink-dispatch
+  labels:
+    app: interlink-dispatch
+    interlink.eu/site: hpc-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: interlink-dispatch
+      interlink.eu/site: hpc-a
+  template:
+    metadata:
+      labels:
+        app: interlink-dispatch
+        interlink.eu/site: hpc-a
+    spec:
+      serviceAccountName: interlink-dispatch
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: dispatcher
+        image: interlink-dispatch:latest
+        command: [/dispatcher]
+        args:
+        - --site=hpc-a
+        - --namespace=interlink-dispatch
+        - --token-file=/var/run/secrets/interlink/token
+        - --metrics-bind-address=:8080
+        - --health-probe-bind-address=:8081
+        - --leader-elect
+        ports:
+        - {name: metrics, containerPort: 8080}
+        - {name: probes, containerPort: 8081}
+        livenessProbe:
+          httpGet: {path: /healthz, port: probes}
+        readinessProbe:
+          httpGet: {path: /readyz, port: probes}
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {memory: 256Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]
+        volumeMounts:
+        - name: interlink-token
+          mountPath: /var/run/secrets/interlink
+          readOnly: true
+      volumes:
+      - name: interlink-token
+        projected:
+          sources:
+          - serviceAccountToken:
+              audience: interlink-agent
+              expirationSeconds: 3600
+              path: token

@@ -1,0 +1,6 @@
+resources:
+- siteconfig.yaml
+- associations.yaml
+- agent-template.yaml
+- identitymap.yaml
+- projectquota.yaml

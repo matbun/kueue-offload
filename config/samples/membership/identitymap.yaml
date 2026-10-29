@@ -1,0 +1,8 @@
+apiVersion: interlink.eu/v1alpha1
+kind: IdentityMap
+metadata:
+  name: hpc-a
+spec:
+  entries:
+  - {kubernetesUser: alice, site: hpc-a, hpcUser: alice}
+  - {kubernetesUser: bob@example.org, namespace: bob, site: hpc-a, hpcUser: bob}

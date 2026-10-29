@@ -1,0 +1,130 @@
+# The agent objects of one tenant namespace. The membership controller executes
+# this Go text/template once per namespace with .Namespace, .Site, .HPCUser,
+# .Accounts (sorted), .Image, .AgentService and .AgentPort, and applies every
+# document in that namespace. Functions: join, quote, toJson.
+#
+# The Secrets <site>-submit-key and <site>-tunnel-key and the ConfigMap
+# <site>-known-hosts are created by the user or the site, never by the
+# controller.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hpc-a-agent-template
+  namespace: interlink-membership
+data:
+  template.yaml: |
+    apiVersion: v1
+    kind: ServiceAccount
+    metadata:
+      name: {{ .AgentService }}
+    ---
+    apiVersion: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    metadata:
+      name: {{ .AgentService }}
+    roleRef:
+      apiGroup: rbac.authorization.k8s.io
+      kind: ClusterRole
+      name: interlink-agent
+    subjects:
+    - kind: ServiceAccount
+      name: {{ .AgentService }}
+      namespace: {{ .Namespace }}
+    ---
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: {{ .AgentService }}
+    data:
+      SlurmConfig.yaml: |
+        SidecarPort: "{{ .AgentPort }}"
+        DataRootFolder: /scratch/{{ .HPCUser }}/.interlink/
+        SocketDirRoot: /scratch/{{ .HPCUser }}/.interlink/sockets
+        SbatchPath: /usr/local/bin/ssh-shim sbatch
+        SqueuePath: /usr/local/bin/ssh-shim squeue
+        ScancelPath: /usr/local/bin/ssh-shim scancel
+        ContainerRuntime: singularity
+        Dispatch:
+          Enabled: true
+          Auth:
+            Mode: tokenreview
+            Audience: interlink-agent
+            AllowedServiceAccounts: ["system:serviceaccount:interlink-dispatch:interlink-dispatch"]
+        Sites:
+          {{ .Site }}:
+            LoginHost: login.hpc-a.example.org
+            User: {{ .HPCUser }}
+            Port: 22
+            KeyFile: /etc/interlink/keys/{{ .Site }}/ssh-privatekey
+            AllowedAccounts: {{ toJson .Accounts }}
+        Shadow:
+          Enabled: true
+          AlwaysShadow: true
+          Image: ghcr.io/interlink-hq/interlink/ssh-tunnel:0.6.3-pre2
+          AgentURL: http://{{ .AgentService }}:{{ .AgentPort }}
+          KeySecret: {{ .Site }}-tunnel-key
+          KeySecretKey: ssh-privatekey
+          KnownHostsConfigMap: {{ .Site }}-known-hosts
+          NodeHostKeys: verify
+          ForwardTarget: node
+          ForwardMode: portforward
+    ---
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: {{ .AgentService }}
+    spec:
+      replicas: 1
+      selector:
+        matchLabels: {app: {{ .AgentService }}}
+      template:
+        metadata:
+          labels: {app: {{ .AgentService }}}
+          annotations:
+            # A changed membership rolls the agent, which reads its config once.
+            hpc.interlink.eu/accounts: {{ join "," .Accounts | quote }}
+        spec:
+          serviceAccountName: {{ .AgentService }}
+          containers:
+          - name: agent
+            image: {{ .Image }}
+            env:
+            - {name: SLURMCONFIGPATH, value: /etc/interlink/SlurmConfig.yaml}
+            - {name: AGENT_IMAGE, value: {{ quote .Image }}}
+            ports:
+            - {containerPort: {{ .AgentPort }}}
+            readinessProbe:
+              httpGet: {path: /healthz, port: {{ .AgentPort }}}
+            volumeMounts:
+            - {name: config, mountPath: /etc/interlink}
+            - {name: submit-key, mountPath: /etc/interlink/keys/{{ .Site }}, readOnly: true}
+          volumes:
+          - name: config
+            configMap: {name: {{ .AgentService }}}
+          - name: submit-key
+            secret: {secretName: {{ .Site }}-submit-key, defaultMode: 0400}
+    ---
+    apiVersion: v1
+    kind: Service
+    metadata:
+      name: {{ .AgentService }}
+    spec:
+      selector: {app: {{ .AgentService }}}
+      ports:
+      - {port: {{ .AgentPort }}, targetPort: {{ .AgentPort }}}
+    ---
+    apiVersion: networking.k8s.io/v1
+    kind: NetworkPolicy
+    metadata:
+      name: {{ .AgentService }}
+    spec:
+      podSelector: {matchLabels: {app: {{ .AgentService }}}}
+      policyTypes: [Ingress]
+      ingress:
+      - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: interlink-dispatch}}
+          podSelector: {matchLabels: {app: interlink-dispatch}}
+        ports: [{port: {{ .AgentPort }}}]
+      - from:
+        - podSelector: {matchLabels: {interlink.eu/shadow: "true"}}
+        ports: [{port: {{ .AgentPort }}}]

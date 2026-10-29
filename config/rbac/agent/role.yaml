@@ -1,0 +1,30 @@
+# The agent's permissions in its tenant namespace. The membership controller
+# binds the agent's ServiceAccount to this ClusterRole with a RoleBinding in
+# that namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: interlink-agent
+rules:
+- apiGroups: [""]
+  resources: [secrets, configmaps]
+  verbs: [get, list]
+- apiGroups: [""]
+  resources: [configmaps, services]
+  verbs: [create, update, patch, delete, get, list, watch]
+- apiGroups: [apps]
+  resources: [deployments]
+  verbs: [create, update, patch, delete, get, list, watch]
+# patch: a node change annotates the shadow's pods so the kubelet refreshes
+# the node ConfigMap at once.
+- apiGroups: [""]
+  resources: [pods]
+  verbs: [get, list, watch, patch]
+# Pipeline steps carry a ServiceAccount token, minted by the agent.
+- apiGroups: [""]
+  resources: [serviceaccounts/token]
+  verbs: [create]
+# Stage-in and stage-out run as Jobs in the agent's namespace.
+- apiGroups: [batch]
+  resources: [jobs]
+  verbs: [create, get, list, watch, delete]

@@ -1,0 +1,204 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.16.5
+  name: projectquotas.interlink.eu
+spec:
+  group: interlink.eu
+  names:
+    kind: ProjectQuota
+    listKind: ProjectQuotaList
+    plural: projectquotas
+    singular: projectquota
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.site
+      name: Site
+      type: string
+    - jsonPath: .spec.account
+      name: Account
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          ProjectQuota overrides the site's default quota for one project. It is
+          named <site>-<account>. Quota is an administrator's number and is never
+          derived from Slurm.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ProjectQuotaSpec is the concurrent quota of one project on
+              one site.
+            properties:
+              account:
+                description: account is the Slurm account of the project.
+                minLength: 1
+                type: string
+              resourceGroups:
+                description: resourceGroups become the resourceGroups of the project's
+                  ClusterQueue.
+                items:
+                  properties:
+                    coveredResources:
+                      description: |-
+                        coveredResources is the list of resources covered by the flavors in this
+                        group.
+                        Examples: cpu, memory, vendor.com/gpu.
+                        The list cannot be empty and it can contain up to 64 resources. With a total
+                        of up to 256 covered resources across all resource groups in the ClusterQueue.
+                      items:
+                        description: ResourceName is the name identifying various
+                          resources in a ResourceList.
+                        type: string
+                      maxItems: 64
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    flavors:
+                      description: |-
+                        flavors is the list of flavors that provide the resources of this group.
+                        Typically, different flavors represent different hardware models
+                        (e.g., gpu models, cpu architectures) or pricing models (on-demand vs spot
+                        cpus).
+                        Each flavor MUST list all the resources listed for this group in the same
+                        order as the .resources field.
+                        The list cannot be empty and it can contain up to 64 flavors, with a max of
+                        256 total flavors across all resource groups in the ClusterQueue.
+                      items:
+                        properties:
+                          name:
+                            description: |-
+                              name of this flavor. The name should match the .metadata.name of a
+                              ResourceFlavor. If a matching ResourceFlavor does not exist, the
+                              ClusterQueue will have an Active condition set to False.
+                            maxLength: 253
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          resources:
+                            description: |-
+                              resources is the list of quotas for this flavor per resource.
+                              There could be up to 64 resources.
+                            items:
+                              properties:
+                                borrowingLimit:
+                                  anyOf:
+                                  - type: integer
+                                  - type: string
+                                  description: |-
+                                    borrowingLimit is the maximum amount of quota for the [flavor, resource]
+                                    combination that this ClusterQueue is allowed to borrow from the unused
+                                    quota of other ClusterQueues in the same cohort.
+                                    In total, at a given time, Workloads in a ClusterQueue can consume a
+                                    quantity of quota equal to nominalQuota+borrowingLimit, assuming the other
+                                    ClusterQueues in the cohort have enough unused quota.
+                                    If null, it means that there is no borrowing limit.
+                                    If not null, it must be non-negative.
+                                    borrowingLimit must be null if spec.cohortName is empty.
+                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                  x-kubernetes-int-or-string: true
+                                lendingLimit:
+                                  anyOf:
+                                  - type: integer
+                                  - type: string
+                                  description: |-
+                                    lendingLimit is the maximum amount of unused quota for the [flavor, resource]
+                                    combination that this ClusterQueue can lend to other ClusterQueues in the same cohort.
+                                    In total, at a given time, ClusterQueue reserves for its exclusive use
+                                    a quantity of quota equals to nominalQuota - lendingLimit.
+                                    If null, it means that there is no lending limit, meaning that
+                                    all the nominalQuota can be borrowed by other clusterQueues in the cohort.
+                                    If not null, it must be non-negative.
+                                    lendingLimit must be null if spec.cohortName is empty.
+                                    This field is in beta stage and is enabled by default.
+                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                  x-kubernetes-int-or-string: true
+                                name:
+                                  description: name of this resource.
+                                  type: string
+                                nominalQuota:
+                                  anyOf:
+                                  - type: integer
+                                  - type: string
+                                  description: |-
+                                    nominalQuota is the quantity of this resource that is available for
+                                    Workloads admitted by this ClusterQueue at a point in time.
+                                    The nominalQuota must be non-negative.
+                                    nominalQuota should represent the resources in the cluster available for
+                                    running jobs (after discounting resources consumed by system components
+                                    and pods not managed by kueue). In an autoscaled cluster, nominalQuota
+                                    should account for resources that can be provided by a component such as
+                                    Kubernetes cluster-autoscaler.
+
+                                    If the ClusterQueue belongs to a cohort, the sum of the quotas for each
+                                    (flavor, resource) combination defines the maximum quantity that can be
+                                    allocated by a ClusterQueue in the cohort.
+                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                  x-kubernetes-int-or-string: true
+                              required:
+                              - name
+                              - nominalQuota
+                              type: object
+                            maxItems: 64
+                            minItems: 1
+                            type: array
+                            x-kubernetes-list-map-keys:
+                            - name
+                            x-kubernetes-list-type: map
+                        required:
+                        - name
+                        - resources
+                        type: object
+                      maxItems: 64
+                      minItems: 1
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - name
+                      x-kubernetes-list-type: map
+                  required:
+                  - coveredResources
+                  - flavors
+                  type: object
+                  x-kubernetes-validations:
+                  - message: flavors must have the same number of resources as the
+                      coveredResources
+                    rule: self.flavors.all(x, size(x.resources) == size(self.coveredResources))
+                maxItems: 16
+                type: array
+                x-kubernetes-list-type: atomic
+              site:
+                minLength: 1
+                type: string
+            required:
+            - account
+            - site
+            type: object
+        type: object
+        x-kubernetes-validations:
+        - message: metadata.name must be <site>-<account>
+          rule: self.metadata.name == self.spec.site + '-' + self.spec.account
+    served: true
+    storage: true
+    subresources: {}

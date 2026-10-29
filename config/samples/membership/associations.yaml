@@ -1,0 +1,15 @@
+# Written by whatever runs sacctmgr on the site, for example a CronJob holding
+# a read-only Slurm account:
+#   sacctmgr --parsable2 --noheader show assoc format=cluster,account,user
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hpc-a-associations
+  namespace: interlink-membership
+data:
+  associations: |
+    hpc-a|proj42|
+    hpc-a|proj42|alice
+    hpc-a|proj42|bob
+    hpc-a|proj99|
+    hpc-a|proj99|alice

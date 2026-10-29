@@ -1,0 +1,15 @@
+apiVersion: interlink.eu/v1alpha1
+kind: ProjectQuota
+metadata:
+  name: hpc-a-proj42
+spec:
+  site: hpc-a
+  account: proj42
+  resourceGroups:
+  - coveredResources: [cpu, memory, nvidia.com/gpu]
+    flavors:
+    - name: hpc-a-gpu
+      resources:
+      - {name: cpu, nominalQuota: 512}
+      - {name: memory, nominalQuota: 4Ti}
+      - {name: nvidia.com/gpu, nominalQuota: 64}

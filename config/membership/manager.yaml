@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: interlink-membership-hpc-a
+  namespace: interlink-membership
+  labels:
+    app: interlink-membership
+    interlink.eu/site: hpc-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: interlink-membership
+      interlink.eu/site: hpc-a
+  template:
+    metadata:
+      labels:
+        app: interlink-membership
+        interlink.eu/site: hpc-a
+    spec:
+      serviceAccountName: interlink-membership
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: membership
+        image: interlink-dispatch:latest
+        command: [/membership]
+        args:
+        - --site=hpc-a
+        - --namespace=interlink-membership
+        - --metrics-bind-address=:8080
+        - --health-probe-bind-address=:8081
+        - --leader-elect
+        ports:
+        - {name: metrics, containerPort: 8080}
+        - {name: probes, containerPort: 8081}
+        livenessProbe:
+          httpGet: {path: /healthz, port: probes}
+        readinessProbe:
+          httpGet: {path: /readyz, port: probes}
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {memory: 256Mi}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: [ALL]

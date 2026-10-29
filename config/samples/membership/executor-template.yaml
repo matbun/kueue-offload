@@ -1,6 +1,6 @@
-# The agent objects of one tenant namespace. The membership controller executes
+# The executor objects of one tenant namespace. The membership controller executes
 # this Go text/template once per namespace with .Namespace, .Site, .HPCUser,
-# .Accounts (sorted), .Image, .AgentService and .AgentPort, and applies every
+# .Accounts (sorted), .Image, .ExecutorService and .ExecutorPort, and applies every
 # document in that namespace. Functions: join, quote, toJson.
 #
 # The Secrets <site>-submit-key and <site>-tunnel-key and the ConfigMap
@@ -9,47 +9,47 @@
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: hpc-a-agent-template
-  namespace: interlink-membership
+  name: hpc-a-executor-template
+  namespace: kueue-offload-membership
 data:
   template.yaml: |
     apiVersion: v1
     kind: ServiceAccount
     metadata:
-      name: {{ .AgentService }}
+      name: {{ .ExecutorService }}
     ---
     apiVersion: rbac.authorization.k8s.io/v1
     kind: RoleBinding
     metadata:
-      name: {{ .AgentService }}
+      name: {{ .ExecutorService }}
     roleRef:
       apiGroup: rbac.authorization.k8s.io
       kind: ClusterRole
-      name: interlink-agent
+      name: kueue-offload-executor
     subjects:
     - kind: ServiceAccount
-      name: {{ .AgentService }}
+      name: {{ .ExecutorService }}
       namespace: {{ .Namespace }}
     ---
     apiVersion: v1
     kind: ConfigMap
     metadata:
-      name: {{ .AgentService }}
+      name: {{ .ExecutorService }}
     data:
       SlurmConfig.yaml: |
-        SidecarPort: "{{ .AgentPort }}"
+        SidecarPort: "{{ .ExecutorPort }}"
         DataRootFolder: /scratch/{{ .HPCUser }}/.interlink/
         SocketDirRoot: /scratch/{{ .HPCUser }}/.interlink/sockets
         SbatchPath: /usr/local/bin/ssh-shim sbatch
         SqueuePath: /usr/local/bin/ssh-shim squeue
         ScancelPath: /usr/local/bin/ssh-shim scancel
         ContainerRuntime: singularity
-        Dispatch:
+        Executor:
           Enabled: true
           Auth:
             Mode: tokenreview
-            Audience: interlink-agent
-            AllowedServiceAccounts: ["system:serviceaccount:interlink-dispatch:interlink-dispatch"]
+            Audience: kueue-offload-executor
+            AllowedServiceAccounts: ["system:serviceaccount:kueue-offload:kueue-offload"]
         Sites:
           {{ .Site }}:
             LoginHost: login.hpc-a.example.org
@@ -61,7 +61,7 @@ data:
           Enabled: true
           AlwaysShadow: true
           Image: ghcr.io/interlink-hq/interlink/ssh-tunnel:0.6.3-pre2
-          AgentURL: http://{{ .AgentService }}:{{ .AgentPort }}
+          ExecutorURL: http://{{ .ExecutorService }}:{{ .ExecutorPort }}
           KeySecret: {{ .Site }}-tunnel-key
           KeySecretKey: ssh-privatekey
           KnownHostsConfigMap: {{ .Site }}-known-hosts
@@ -72,59 +72,59 @@ data:
     apiVersion: apps/v1
     kind: Deployment
     metadata:
-      name: {{ .AgentService }}
+      name: {{ .ExecutorService }}
     spec:
       replicas: 1
       selector:
-        matchLabels: {app: {{ .AgentService }}}
+        matchLabels: {app: {{ .ExecutorService }}}
       template:
         metadata:
-          labels: {app: {{ .AgentService }}}
+          labels: {app: {{ .ExecutorService }}}
           annotations:
-            # A changed membership rolls the agent, which reads its config once.
+            # A changed membership rolls the executor, which reads its config once.
             hpc.interlink.eu/accounts: {{ join "," .Accounts | quote }}
         spec:
-          serviceAccountName: {{ .AgentService }}
+          serviceAccountName: {{ .ExecutorService }}
           containers:
-          - name: agent
+          - name: executor
             image: {{ .Image }}
             env:
             - {name: SLURMCONFIGPATH, value: /etc/interlink/SlurmConfig.yaml}
-            - {name: AGENT_IMAGE, value: {{ quote .Image }}}
+            - {name: EXECUTOR_IMAGE, value: {{ quote .Image }}}
             ports:
-            - {containerPort: {{ .AgentPort }}}
+            - {containerPort: {{ .ExecutorPort }}}
             readinessProbe:
-              httpGet: {path: /healthz, port: {{ .AgentPort }}}
+              httpGet: {path: /healthz, port: {{ .ExecutorPort }}}
             volumeMounts:
             - {name: config, mountPath: /etc/interlink}
             - {name: submit-key, mountPath: /etc/interlink/keys/{{ .Site }}, readOnly: true}
           volumes:
           - name: config
-            configMap: {name: {{ .AgentService }}}
+            configMap: {name: {{ .ExecutorService }}}
           - name: submit-key
             secret: {secretName: {{ .Site }}-submit-key, defaultMode: 0400}
     ---
     apiVersion: v1
     kind: Service
     metadata:
-      name: {{ .AgentService }}
+      name: {{ .ExecutorService }}
     spec:
-      selector: {app: {{ .AgentService }}}
+      selector: {app: {{ .ExecutorService }}}
       ports:
-      - {port: {{ .AgentPort }}, targetPort: {{ .AgentPort }}}
+      - {port: {{ .ExecutorPort }}, targetPort: {{ .ExecutorPort }}}
     ---
     apiVersion: networking.k8s.io/v1
     kind: NetworkPolicy
     metadata:
-      name: {{ .AgentService }}
+      name: {{ .ExecutorService }}
     spec:
-      podSelector: {matchLabels: {app: {{ .AgentService }}}}
+      podSelector: {matchLabels: {app: {{ .ExecutorService }}}}
       policyTypes: [Ingress]
       ingress:
       - from:
-        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: interlink-dispatch}}
-          podSelector: {matchLabels: {app: interlink-dispatch}}
-        ports: [{port: {{ .AgentPort }}}]
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kueue-offload}}
+          podSelector: {matchLabels: {app: kueue-offload}}
+        ports: [{port: {{ .ExecutorPort }}}]
       - from:
         - podSelector: {matchLabels: {interlink.eu/shadow: "true"}}
-        ports: [{port: {{ .AgentPort }}}]
+        ports: [{port: {{ .ExecutorPort }}}]

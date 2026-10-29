@@ -46,10 +46,10 @@ func deploymentAvailable(d *appsv1.Deployment) bool {
 	return false
 }
 
-// checkCredentials records on the namespace whether an agent Deployment of
+// checkCredentials records on the namespace whether an executor Deployment of
 // the site cannot start because a Secret it references is missing (D10). It
 // reads Deployments, their pods and the pods' events, never a Secret. It
-// reports whether any agent Deployment is not available.
+// reports whether any executor Deployment is not available.
 func (r *Reconciler) checkCredentials(ctx context.Context, s site, nsName string) (bool, error) {
 	list := &appsv1.DeploymentList{}
 	if err := r.Client.List(ctx, list, client.InNamespace(nsName), client.MatchingLabels(managedLabels(s.name))); err != nil {
@@ -79,21 +79,21 @@ func (r *Reconciler) checkCredentials(ctx context.Context, s site, nsName string
 		}
 		return unavailable, err
 	}
-	key := AgentAnnotation(s.name)
+	key := ExecutorAnnotation(s.name)
 	_, has := ns.Annotations[key]
 	switch {
 	case len(missing) > 0 && ns.Annotations[key] != MissingCredentials:
 		if err := r.patchNamespace(ctx, nsName, nil, map[string]any{key: MissingCredentials}); err != nil {
 			return unavailable, err
 		}
-		r.Recorder.Eventf(ns, nil, corev1.EventTypeWarning, EventMissingCredentials, "CheckAgent",
-			"agent of site %s cannot start: %s", s.name, strings.Join(missing, "; "))
+		r.Recorder.Eventf(ns, nil, corev1.EventTypeWarning, EventMissingCredentials, "CheckExecutor",
+			"executor of site %s cannot start: %s", s.name, strings.Join(missing, "; "))
 	case len(missing) == 0 && has:
 		if err := r.patchNamespace(ctx, nsName, nil, map[string]any{key: nil}); err != nil {
 			return unavailable, err
 		}
-		r.Recorder.Eventf(ns, nil, corev1.EventTypeNormal, EventCredentialsPresent, "CheckAgent",
-			"agent of site %s no longer misses credentials", s.name)
+		r.Recorder.Eventf(ns, nil, corev1.EventTypeNormal, EventCredentialsPresent, "CheckExecutor",
+			"executor of site %s no longer misses credentials", s.name)
 	}
 	return unavailable, nil
 }

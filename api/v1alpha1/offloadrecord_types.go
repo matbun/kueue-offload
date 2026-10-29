@@ -4,28 +4,28 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// WorkloadReference names the Kueue Workload a SubmitRecord belongs to.
+// WorkloadReference names the Kueue Workload a OffloadRecord belongs to.
 type WorkloadReference struct {
 	Namespace string `json:"namespace"`
 	Name      string `json:"name"`
 }
 
-// SubmitRecordSpec is fixed when the record is created, before the first
+// OffloadRecordSpec is fixed when the record is created, before the first
 // submission.
-type SubmitRecordSpec struct {
+type OffloadRecordSpec struct {
 	Workload WorkloadReference `json:"workload"`
 	Site     string            `json:"site"`
 	Account  string            `json:"account,omitempty"`
-	// agentEndpoint is the base URL of the agent the job was submitted to.
-	AgentEndpoint string `json:"agentEndpoint"`
+	// executorEndpoint is the base URL of the executor the job was submitted to.
+	ExecutorEndpoint string `json:"executorEndpoint"`
 }
 
-// SubmitRecordStatus is the dispatcher's view of the job.
-type SubmitRecordStatus struct {
+// OffloadRecordStatus is the offload controller's view of the job.
+type OffloadRecordStatus struct {
 	// jobID is the Slurm job ID. Empty when no job is held for the Workload.
 	// +optional
 	JobID string `json:"jobID,omitempty"`
-	// state is the last state the agent reported, or the dispatcher's own
+	// state is the last state the executor reported, or the offload controller's own
 	// outcome (submitted, rejected, lost).
 	// +optional
 	State string `json:"state,omitempty"`
@@ -34,12 +34,12 @@ type SubmitRecordStatus struct {
 	// +optional
 	NodeName string `json:"nodeName,omitempty"`
 	// retries counts resubmissions after the job was cancelled on the site or
-	// the agent was lost.
+	// the executor was lost.
 	// +optional
 	Retries int32 `json:"retries,omitempty"`
 	// +optional
 	LastPoll *metav1.Time `json:"lastPoll,omitempty"`
-	// firstUnreachable is when the agent stopped answering. Unset while it
+	// firstUnreachable is when the executor stopped answering. Unset while it
 	// answers.
 	// +optional
 	FirstUnreachable *metav1.Time `json:"firstUnreachable,omitempty"`
@@ -54,25 +54,25 @@ type SubmitRecordStatus struct {
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=`.status.nodeName`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// SubmitRecord is the dispatcher's durable record of a submission. Its name is
-// the Workload UID, so a restarted dispatcher does not submit twice.
-type SubmitRecord struct {
+// OffloadRecord is the offload controller's durable record of a submission. Its name is
+// the Workload UID, so a restarted offload controller does not submit twice.
+type OffloadRecord struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   SubmitRecordSpec   `json:"spec,omitempty"`
-	Status SubmitRecordStatus `json:"status,omitempty"`
+	Spec   OffloadRecordSpec   `json:"spec,omitempty"`
+	Status OffloadRecordStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 
-// SubmitRecordList is a list of SubmitRecord.
-type SubmitRecordList struct {
+// OffloadRecordList is a list of OffloadRecord.
+type OffloadRecordList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []SubmitRecord `json:"items"`
+	Items           []OffloadRecord `json:"items"`
 }
 
 func init() {
-	SchemeBuilder.Register(&SubmitRecord{}, &SubmitRecordList{})
+	SchemeBuilder.Register(&OffloadRecord{}, &OffloadRecordList{})
 }

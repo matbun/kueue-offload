@@ -2,7 +2,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: interlink-membership
+  name: kueue-offload-membership
 rules:
 - apiGroups:
   - ""
@@ -66,8 +66,8 @@ rules:
   - interlink.eu
   resources:
   - identitymaps
+  - offloadconfigs
   - projectquotas
-  - siteconfigs
   verbs:
   - get
   - list
@@ -112,7 +112,7 @@ rules:
 - apiGroups:
   - rbac.authorization.k8s.io
   resourceNames:
-  - interlink-agent
+  - kueue-offload-executor
   - system:auth-delegator
   resources:
   - clusterroles
@@ -122,8 +122,8 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: interlink-membership
-  namespace: interlink-membership
+  name: kueue-offload-membership
+  namespace: kueue-offload-membership
 rules:
 - apiGroups:
   - ""

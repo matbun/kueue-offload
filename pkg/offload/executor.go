@@ -1,4 +1,4 @@
-package dispatcher
+package offload
 
 import (
 	"bytes"
@@ -14,29 +14,29 @@ import (
 	"sync"
 	"time"
 
-	"github.com/interlink-hq/interlink-dispatch/pkg/agentapi"
+	"github.com/matbun/kueue-offload/pkg/executorapi"
 )
 
-// AgentError is a non-2xx answer from an agent.
-type AgentError struct {
+// ExecutorError is a non-2xx answer from an executor.
+type ExecutorError struct {
 	Code      int
 	Permanent bool
 	Message   string
 }
 
-func (e *AgentError) Error() string {
-	return fmt.Sprintf("agent answered %d: %s", e.Code, e.Message)
+func (e *ExecutorError) Error() string {
+	return fmt.Sprintf("executor answered %d: %s", e.Code, e.Message)
 }
 
-// IsPermanent reports whether err is an agent answer that will never change.
+// IsPermanent reports whether err is an executor answer that will never change.
 func IsPermanent(err error) bool {
-	var ae *AgentError
+	var ae *ExecutorError
 	return errors.As(err, &ae) && ae.Permanent
 }
 
-// IsNotFound reports whether err is the agent saying it has no record.
+// IsNotFound reports whether err is the executor saying it has no record.
 func IsNotFound(err error) bool {
-	var ae *AgentError
+	var ae *ExecutorError
 	return errors.As(err, &ae) && ae.Code == http.StatusNotFound
 }
 
@@ -74,15 +74,15 @@ func (t *TokenSource) Token() (string, error) {
 	return tok, nil
 }
 
-// AgentClient speaks the agent HTTP API.
-type AgentClient struct {
+// ExecutorClient speaks the executor HTTP API.
+type ExecutorClient struct {
 	HTTP  *http.Client
 	Token *TokenSource
 }
 
-// Submit sends POST /submit. created is false when the agent answered 200,
+// Submit sends POST /submit. created is false when the executor answered 200,
 // meaning it already had a job for the Workload.
-func (a *AgentClient) Submit(ctx context.Context, endpoint string, req *agentapi.SubmitRequest) (resp *agentapi.SubmitResponse, created bool, err error) {
+func (a *ExecutorClient) Submit(ctx context.Context, endpoint string, req *executorapi.SubmitRequest) (resp *executorapi.SubmitResponse, created bool, err error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, false, err
@@ -92,28 +92,28 @@ func (a *AgentClient) Submit(ctx context.Context, endpoint string, req *agentapi
 		return nil, false, err
 	}
 	if code != http.StatusOK && code != http.StatusCreated {
-		return nil, false, agentError(code, data)
+		return nil, false, executorError(code, data)
 	}
-	resp = &agentapi.SubmitResponse{}
+	resp = &executorapi.SubmitResponse{}
 	if err := json.Unmarshal(data, resp); err != nil {
 		return nil, false, fmt.Errorf("decoding submit answer: %w", err)
 	}
 	if resp.JobID == "" {
-		return nil, false, fmt.Errorf("agent answered %d without a jobID", code)
+		return nil, false, fmt.Errorf("executor answered %d without a jobID", code)
 	}
 	return resp, code == http.StatusCreated, nil
 }
 
 // GetJob sends GET /jobs/{uid}.
-func (a *AgentClient) GetJob(ctx context.Context, endpoint, uid string) (*agentapi.JobStatus, error) {
+func (a *ExecutorClient) GetJob(ctx context.Context, endpoint, uid string) (*executorapi.JobStatus, error) {
 	code, data, err := a.do(ctx, http.MethodGet, endpoint+"/jobs/"+url.PathEscape(uid), uid, nil)
 	if err != nil {
 		return nil, err
 	}
 	if code != http.StatusOK {
-		return nil, agentError(code, data)
+		return nil, executorError(code, data)
 	}
-	st := &agentapi.JobStatus{}
+	st := &executorapi.JobStatus{}
 	if err := json.Unmarshal(data, st); err != nil {
 		return nil, fmt.Errorf("decoding job status: %w", err)
 	}
@@ -121,7 +121,7 @@ func (a *AgentClient) GetJob(ctx context.Context, endpoint, uid string) (*agenta
 }
 
 // DeleteJob sends DELETE /jobs/{uid}. A 404 counts as done.
-func (a *AgentClient) DeleteJob(ctx context.Context, endpoint, uid string) error {
+func (a *ExecutorClient) DeleteJob(ctx context.Context, endpoint, uid string) error {
 	code, data, err := a.do(ctx, http.MethodDelete, endpoint+"/jobs/"+url.PathEscape(uid), uid, nil)
 	if err != nil {
 		return err
@@ -129,10 +129,10 @@ func (a *AgentClient) DeleteJob(ctx context.Context, endpoint, uid string) error
 	if code == http.StatusNoContent || code == http.StatusOK || code == http.StatusNotFound {
 		return nil
 	}
-	return agentError(code, data)
+	return executorError(code, data)
 }
 
-func (a *AgentClient) do(ctx context.Context, method, u, uid string, body []byte) (int, []byte, error) {
+func (a *ExecutorClient) do(ctx context.Context, method, u, uid string, body []byte) (int, []byte, error) {
 	tok, err := a.Token.Token()
 	if err != nil {
 		return 0, nil, err
@@ -146,7 +146,7 @@ func (a *AgentClient) do(ctx context.Context, method, u, uid string, body []byte
 		return 0, nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
-	req.Header.Set(agentapi.SessionHeader, uid)
+	req.Header.Set(executorapi.SessionHeader, uid)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -162,11 +162,11 @@ func (a *AgentClient) do(ctx context.Context, method, u, uid string, body []byte
 	return resp.StatusCode, data, nil
 }
 
-func agentError(code int, data []byte) error {
-	e := &agentapi.ErrorResponse{}
+func executorError(code int, data []byte) error {
+	e := &executorapi.ErrorResponse{}
 	if json.Unmarshal(data, e) != nil || e.Message == "" {
 		e.Message = strings.TrimSpace(string(data))
 	}
 	// Only a 4xx can be permanent: a 5xx is transient whatever its body says.
-	return &AgentError{Code: code, Permanent: e.Permanent && code >= 400 && code < 500, Message: e.Message}
+	return &ExecutorError{Code: code, Permanent: e.Permanent && code >= 400 && code < 500, Message: e.Message}
 }

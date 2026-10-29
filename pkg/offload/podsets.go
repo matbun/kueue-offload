@@ -1,24 +1,25 @@
-package dispatcher
+package offload
 
 import (
 	"fmt"
+	"github.com/matbun/kueue-offload/api/v1alpha1"
 	"sort"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
-	"github.com/interlink-hq/interlink-dispatch/pkg/agentapi"
+	"github.com/matbun/kueue-offload/pkg/executorapi"
 )
 
 // forwardedAnnotationPrefixes are the owner annotations merged into every
 // PodSet template (design D5).
 var forwardedAnnotationPrefixes = []string{"slurm-job.vk.io/", "interlink.eu/"}
 
-// buildPodSets turns the Workload's PodSets into the agent's form, with the
+// buildPodSets turns the Workload's PodSets into the executor's form, with the
 // owner's annotations merged in. An error means the Workload can never be
 // submitted.
-func buildPodSets(wl *kueue.Workload, ownerAnnotations map[string]string, s site) ([]agentapi.PodSet, error) {
+func buildPodSets(wl *kueue.Workload, ownerAnnotations map[string]string, s site) ([]executorapi.PodSet, error) {
 	assignments := map[kueue.PodSetReference]*kueue.PodSetAssignment{}
 	if wl.Status.Admission != nil {
 		for i := range wl.Status.Admission.PodSetAssignments {
@@ -26,27 +27,28 @@ func buildPodSets(wl *kueue.Workload, ownerAnnotations map[string]string, s site
 			assignments[a.Name] = a
 		}
 	}
-	out := make([]agentapi.PodSet, 0, len(wl.Spec.PodSets))
+	out := make([]executorapi.PodSet, 0, len(wl.Spec.PodSets))
 	for _, ps := range wl.Spec.PodSets {
 		count := ps.Count
-		partition := ""
+		var target v1alpha1.FlavorTarget
 		if a := assignments[ps.Name]; a != nil {
 			if a.Count != nil {
 				count = *a.Count
 			}
-			p, err := partitionFor(a, s)
+			t, err := targetFor(a, s)
 			if err != nil {
 				return nil, fmt.Errorf("podSet %s: %w", ps.Name, err)
 			}
-			partition = p
+			target = t
 		}
 		tmpl := ps.Template.DeepCopy()
 		mergeOwnerAnnotations(tmpl, ownerAnnotations)
 		secrets, configMaps := references(&tmpl.Spec)
-		out = append(out, agentapi.PodSet{
+		out = append(out, executorapi.PodSet{
 			Name:          string(ps.Name),
 			Count:         count,
-			Partition:     partition,
+			Partition:     target.Partition,
+			QOS:           target.QOS,
 			Template:      *tmpl,
 			SecretRefs:    secrets,
 			ConfigMapRefs: configMaps,
@@ -55,23 +57,27 @@ func buildPodSets(wl *kueue.Workload, ownerAnnotations map[string]string, s site
 	return out, nil
 }
 
-// partitionFor maps the flavors admitted for a PodSet to one partition.
-func partitionFor(a *kueue.PodSetAssignment, s site) (string, error) {
-	partitions := map[string]bool{}
+// targetFor maps the flavors admitted for a PodSet's resources to one Slurm queue.
+func targetFor(a *kueue.PodSetAssignment, s site) (v1alpha1.FlavorTarget, error) {
+	targets := map[v1alpha1.FlavorTarget]bool{}
 	for _, f := range a.Flavors {
-		if p := s.flavorPartitions[string(f)]; p != "" {
-			partitions[p] = true
+		if t, ok := s.flavors[string(f)]; ok && t != (v1alpha1.FlavorTarget{}) {
+			targets[t] = true
 		}
 	}
-	switch len(partitions) {
+	switch len(targets) {
 	case 0:
-		return "", nil
+		return v1alpha1.FlavorTarget{}, nil
 	case 1:
-		for p := range partitions {
-			return p, nil
+		for t := range targets {
+			return t, nil
 		}
 	}
-	return "", fmt.Errorf("admitted flavors map to more than one partition: %s", strings.Join(sortedKeys(partitions), ", "))
+	names := map[string]bool{}
+	for t := range targets {
+		names["partition "+t.Partition+" qos "+t.QOS] = true
+	}
+	return v1alpha1.FlavorTarget{}, fmt.Errorf("admitted flavors map to more than one Slurm queue: %s", strings.Join(sortedKeys(names), ", "))
 }
 
 func mergeOwnerAnnotations(tmpl *corev1.PodTemplateSpec, ownerAnnotations map[string]string) {

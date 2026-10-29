@@ -2,7 +2,7 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: interlink-dispatch
+  name: kueue-offload
 rules:
 - apiGroups:
   - ""
@@ -40,7 +40,7 @@ rules:
 - apiGroups:
   - interlink.eu
   resources:
-  - siteconfigs
+  - offloadconfigs
   verbs:
   - get
   - list
@@ -48,7 +48,7 @@ rules:
 - apiGroups:
   - interlink.eu
   resources:
-  - submitrecords
+  - offloadrecords
   verbs:
   - create
   - delete
@@ -60,7 +60,7 @@ rules:
 - apiGroups:
   - interlink.eu
   resources:
-  - submitrecords/status
+  - offloadrecords/status
   verbs:
   - get
   - patch
@@ -124,8 +124,8 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: interlink-dispatch
-  namespace: interlink-dispatch
+  name: kueue-offload
+  namespace: kueue-offload
 rules:
 - apiGroups:
   - coordination.k8s.io

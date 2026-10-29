@@ -1,4 +1,4 @@
-IMG ?= interlink-dispatch:latest
+IMG ?= kueue-offload:latest
 GO ?= go
 CONTROLLER_GEN ?= $(shell command -v controller-gen 2>/dev/null || echo $(HOME)/go/bin/controller-gen)
 
@@ -20,8 +20,8 @@ generate:
 
 manifests:
 	$(CONTROLLER_GEN) crd paths=./api/... output:crd:artifacts:config=config/crd/bases
-	$(CONTROLLER_GEN) rbac:roleName=interlink-dispatch paths=./pkg/dispatcher/... output:rbac:artifacts:config=config/rbac
-	$(CONTROLLER_GEN) rbac:roleName=interlink-membership paths=./pkg/membership/... output:rbac:artifacts:config=config/rbac/membership
+	$(CONTROLLER_GEN) rbac:roleName=kueue-offload paths=./pkg/offload/... output:rbac:artifacts:config=config/rbac
+	$(CONTROLLER_GEN) rbac:roleName=kueue-offload-membership paths=./pkg/membership/... output:rbac:artifacts:config=config/rbac/membership
 
 docker-build:
 	docker build -t $(IMG) .

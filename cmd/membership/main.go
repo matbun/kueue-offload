@@ -1,5 +1,5 @@
 // Command membership is the membership sync controller: it turns the Slurm
-// associations of one site into Kueue queues, namespace labels and agents.
+// associations of one site into Kueue queues, namespace labels and executors.
 package main
 
 import (
@@ -20,8 +20,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
-	"github.com/interlink-hq/interlink-dispatch/api/v1alpha1"
-	"github.com/interlink-hq/interlink-dispatch/pkg/membership"
+	"github.com/matbun/kueue-offload/api/v1alpha1"
+	"github.com/matbun/kueue-offload/pkg/membership"
 )
 
 func main() {
@@ -30,8 +30,8 @@ func main() {
 		metricsAddr, probeAddr string
 		leaderElect            bool
 	)
-	flag.StringVar(&site, "site", "", "name of the SiteConfig whose memberships this controller keeps")
-	flag.StringVar(&namespace, "namespace", "interlink-membership", "the controller's namespace, which holds the associations and the agent template")
+	flag.StringVar(&site, "site", "", "name of the OffloadConfig whose memberships this controller keeps")
+	flag.StringVar(&namespace, "namespace", "kueue-offload-membership", "the controller's namespace, which holds the associations and the executor template")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "metrics endpoint address, 0 disables it")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe address")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
@@ -57,7 +57,7 @@ func main() {
 		Metrics:                 metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress:  probeAddr,
 		LeaderElection:          leaderElect,
-		LeaderElectionID:        "interlink-membership-" + site,
+		LeaderElectionID:        "kueue-offload-membership-" + site,
 		LeaderElectionNamespace: namespace,
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
 			&corev1.ConfigMap{}:  {Namespaces: map[string]cache.Config{namespace: {}}},
@@ -73,7 +73,7 @@ func main() {
 	r := &membership.Reconciler{
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),
-		Recorder:  mgr.GetEventRecorder("interlink-membership"),
+		Recorder:  mgr.GetEventRecorder("kueue-offload-membership"),
 		Site:      site,
 		Namespace: namespace,
 	}

@@ -1,4 +1,4 @@
-// Package membership keeps Kueue objects, namespace labels and agents in step
+// Package membership keeps Kueue objects, namespace labels and executors in step
 // with the Slurm associations of one site.
 package membership
 
@@ -8,11 +8,11 @@ import (
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
-	"github.com/interlink-hq/interlink-dispatch/api/v1alpha1"
+	"github.com/matbun/kueue-offload/api/v1alpha1"
 )
 
 // FieldManager owns every object and label the controller writes.
-const FieldManager = "interlink-membership"
+const FieldManager = "kueue-offload-membership"
 
 // Labels and annotations the controller writes.
 const (
@@ -27,7 +27,7 @@ const (
 	SiteLabel    = labelPrefix + "site"
 	AccountLabel = labelPrefix + "account"
 
-	// MissingCredentials is the value of the agent annotation (D10).
+	// MissingCredentials is the value of the executor annotation (D10).
 	MissingCredentials = "missing credentials"
 )
 
@@ -38,8 +38,8 @@ func ProjectLabel(site, account string) string { return labelPrefix + site + "-"
 // controller granted, so that it removes only labels it set.
 func AccountsAnnotation(site string) string { return labelPrefix + site + "-accounts" }
 
-// AgentAnnotation reports on a namespace that the site's agent cannot start.
-func AgentAnnotation(site string) string { return labelPrefix + site + "-agent" }
+// ExecutorAnnotation reports on a namespace that the site's executor cannot start.
+func ExecutorAnnotation(site string) string { return labelPrefix + site + "-executor" }
 
 // Event reasons.
 const (
@@ -50,45 +50,45 @@ const (
 	EventCredentialsPresent = "CredentialsPresent"
 )
 
-// site is a SiteConfig with its membership defaults applied.
+// site is a OffloadConfig with its membership defaults applied.
 type site struct {
-	name         string
-	slurmCluster string
-	cohort       string
-	check        string
-	queuePrefix  string
-	interval     time.Duration
-	agentService string
-	agentPort    int32
-	agentImage   string
-	tokenReview  bool
-	associations v1alpha1.ConfigMapKeyRef
-	template     *v1alpha1.ConfigMapKeyRef
-	defaultQuota []kueue.ResourceGroup
+	name            string
+	slurmCluster    string
+	cohort          string
+	check           string
+	queuePrefix     string
+	interval        time.Duration
+	executorService string
+	executorPort    int32
+	executorImage   string
+	tokenReview     bool
+	associations    v1alpha1.ConfigMapKeyRef
+	template        *v1alpha1.ConfigMapKeyRef
+	defaultQuota    []kueue.ResourceGroup
 }
 
-func resolveSite(sc *v1alpha1.SiteConfig) (site, error) {
+func resolveSite(sc *v1alpha1.OffloadConfig) (site, error) {
 	m := sc.Spec.Membership
 	if m == nil {
-		return site{}, fmt.Errorf("SiteConfig %s has no membership block", sc.Name)
+		return site{}, fmt.Errorf("OffloadConfig %s has no membership block", sc.Name)
 	}
 	s := site{
-		name:         sc.Name,
-		slurmCluster: m.SlurmCluster,
-		cohort:       m.Cohort,
-		check:        m.AdmissionCheck,
-		queuePrefix:  sc.Name + "-",
-		interval:     15 * time.Minute,
-		agentService: sc.Spec.AgentService,
-		agentPort:    sc.Spec.AgentPort,
-		agentImage:   m.AgentImage,
-		tokenReview:  m.AgentTokenReview,
-		associations: m.Associations,
-		template:     m.AgentTemplate,
-		defaultQuota: m.DefaultProjectQuota,
+		name:            sc.Name,
+		slurmCluster:    m.SlurmCluster,
+		cohort:          m.Cohort,
+		check:           m.AdmissionCheck,
+		queuePrefix:     sc.Name + "-",
+		interval:        15 * time.Minute,
+		executorService: sc.Spec.ExecutorService,
+		executorPort:    sc.Spec.ExecutorPort,
+		executorImage:   m.ExecutorImage,
+		tokenReview:     m.ExecutorTokenReview,
+		associations:    m.Associations,
+		template:        m.ExecutorTemplate,
+		defaultQuota:    m.DefaultProjectQuota,
 	}
 	if s.slurmCluster == "" {
-		return site{}, fmt.Errorf("SiteConfig %s: membership.slurmCluster is empty", sc.Name)
+		return site{}, fmt.Errorf("OffloadConfig %s: membership.slurmCluster is empty", sc.Name)
 	}
 	if s.cohort == "" {
 		s.cohort = sc.Name
@@ -96,7 +96,7 @@ func resolveSite(sc *v1alpha1.SiteConfig) (site, error) {
 	if s.check == "" {
 		s.check = sc.Name
 	}
-	// The dispatcher derives the account from the ClusterQueue name with the
+	// The offload controller derives the account from the ClusterQueue name with the
 	// same rule, so queues are named with it.
 	if p := sc.Spec.AccountRule.StripPrefix; p != nil {
 		s.queuePrefix = *p
@@ -104,11 +104,11 @@ func resolveSite(sc *v1alpha1.SiteConfig) (site, error) {
 	if d := m.SyncInterval; d != nil && d.Duration > 0 {
 		s.interval = d.Duration
 	}
-	if s.agentService == "" {
-		s.agentService = "interlink-agent"
+	if s.executorService == "" {
+		s.executorService = "kueue-offload-executor"
 	}
-	if s.agentPort == 0 {
-		s.agentPort = 8000
+	if s.executorPort == 0 {
+		s.executorPort = 8000
 	}
 	return s, nil
 }

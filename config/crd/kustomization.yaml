@@ -1,5 +1,5 @@
 resources:
-- bases/interlink.eu_siteconfigs.yaml
-- bases/interlink.eu_submitrecords.yaml
+- bases/interlink.eu_offloadconfigs.yaml
+- bases/interlink.eu_offloadrecords.yaml
 - bases/interlink.eu_identitymaps.yaml
 - bases/interlink.eu_projectquotas.yaml

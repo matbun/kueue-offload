@@ -24,10 +24,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
-	"github.com/interlink-hq/interlink-dispatch/api/v1alpha1"
+	"github.com/matbun/kueue-offload/api/v1alpha1"
 )
 
-// unavailableRecheck bounds the requeue while an agent Deployment is not
+// unavailableRecheck bounds the requeue while an executor Deployment is not
 // available, so that a missing credential is reported soon.
 const unavailableRecheck = time.Minute
 
@@ -35,10 +35,10 @@ const unavailableRecheck = time.Minute
 type Reconciler struct {
 	// Client reads from the cache and writes to the API server.
 	Client client.Client
-	// APIReader lists the pods and events of agents that are not available.
+	// APIReader lists the pods and events of executors that are not available.
 	APIReader client.Reader
 	Recorder  events.EventRecorder
-	// Site is the SiteConfig name.
+	// Site is the OffloadConfig name.
 	Site string
 	// Namespace is the controller's own namespace, the only one it reads
 	// ConfigMaps from.
@@ -67,16 +67,16 @@ func (r *Reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
 // when the next pass is due.
 func (r *Reconciler) Sync(ctx context.Context) (time.Duration, error) {
 	logger := log.FromContext(ctx).WithValues("site", r.Site)
-	sc := &v1alpha1.SiteConfig{}
+	sc := &v1alpha1.OffloadConfig{}
 	if err := r.Client.Get(ctx, types.NamespacedName{Name: r.Site}, sc); err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.Info("SiteConfig not found")
+			logger.Info("OffloadConfig not found")
 			return 0, nil
 		}
 		return 0, err
 	}
 	if sc.Spec.Membership == nil {
-		logger.Info("SiteConfig has no membership block")
+		logger.Info("OffloadConfig has no membership block")
 		return 0, nil
 	}
 	s, err := resolveSite(sc)
@@ -120,8 +120,8 @@ func (r *Reconciler) Sync(ctx context.Context) (time.Duration, error) {
 			tmpl, err = ParseTemplate(text)
 		}
 		if err != nil {
-			r.warn(sc, EventTemplateRefused, "agent template: "+err.Error())
-			errs = append(errs, fmt.Errorf("agent template: %w", err))
+			r.warn(sc, EventTemplateRefused, "executor template: "+err.Error())
+			errs = append(errs, fmt.Errorf("executor template: %w", err))
 		}
 	}
 
@@ -153,13 +153,13 @@ func (r *Reconciler) Sync(ctx context.Context) (time.Duration, error) {
 			}
 		}
 		if tmpl != nil {
-			if err := r.applyAgent(ctx, sc, s, tmpl, t); err != nil {
+			if err := r.applyExecutor(ctx, sc, s, tmpl, t); err != nil {
 				errs = append(errs, err)
 			}
 		}
 		u, err := r.checkCredentials(ctx, s, ns)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("agent of namespace %s: %w", ns, err))
+			errs = append(errs, fmt.Errorf("executor of namespace %s: %w", ns, err))
 		}
 		unavailable = unavailable || u
 	}
@@ -343,24 +343,24 @@ func (r *Reconciler) patchNamespace(ctx context.Context, name string, labels, an
 	return r.Client.Patch(ctx, target, client.RawPatch(types.MergePatchType, body), client.FieldOwner(FieldManager))
 }
 
-// applyAgent renders the agent objects of one tenant and applies them. A
+// applyExecutor renders the executor objects of one tenant and applies them. A
 // rendered set with any refused object is not applied at all.
-func (r *Reconciler) applyAgent(ctx context.Context, sc *v1alpha1.SiteConfig, s site, tmpl *template.Template, t *tenant) error {
+func (r *Reconciler) applyExecutor(ctx context.Context, sc *v1alpha1.OffloadConfig, s site, tmpl *template.Template, t *tenant) error {
 	objs, err := renderObjects(tmpl, TemplateData{
-		Namespace:    t.Namespace,
-		Site:         s.name,
-		HPCUser:      t.HPCUser,
-		Accounts:     append([]string(nil), t.Accounts...),
-		Image:        s.agentImage,
-		AgentService: s.agentService,
-		AgentPort:    s.agentPort,
+		Namespace:       t.Namespace,
+		Site:            s.name,
+		HPCUser:         t.HPCUser,
+		Accounts:        append([]string(nil), t.Accounts...),
+		Image:           s.executorImage,
+		ExecutorService: s.executorService,
+		ExecutorPort:    s.executorPort,
 	})
 	if err == nil {
 		err = r.prepareObjects(objs, s, t.Namespace)
 	}
 	if err != nil {
 		r.warn(sc, EventTemplateRefused, fmt.Sprintf("namespace %s: %v", t.Namespace, err))
-		return fmt.Errorf("agent objects of namespace %s: %w", t.Namespace, err)
+		return fmt.Errorf("executor objects of namespace %s: %w", t.Namespace, err)
 	}
 	var subjects []rbacv1.Subject
 	for _, u := range objs {
@@ -375,7 +375,7 @@ func (r *Reconciler) applyAgent(ctx context.Context, sc *v1alpha1.SiteConfig, s 
 		return nil
 	}
 	if len(subjects) == 0 {
-		log.FromContext(ctx).Info("agentTokenReview is set but the template renders no ServiceAccount", "namespace", t.Namespace)
+		log.FromContext(ctx).Info("executorTokenReview is set but the template renders no ServiceAccount", "namespace", t.Namespace)
 		return nil
 	}
 	crb := &rbacv1.ClusterRoleBinding{
@@ -392,7 +392,7 @@ func (r *Reconciler) applyAgent(ctx context.Context, sc *v1alpha1.SiteConfig, s 
 // tokenReviewBinding names the per-tenant system:auth-delegator binding. Dots
 // cannot occur in site or namespace names, so names of different tenants
 // never collide.
-func tokenReviewBinding(site, ns string) string { return "interlink-agent." + site + "." + ns }
+func tokenReviewBinding(site, ns string) string { return "kueue-offload-executor." + site + "." + ns }
 
 // prepareObjects refuses Secrets, cluster-scoped objects and objects in
 // another namespace, and labels the rest.
@@ -427,7 +427,7 @@ func (r *Reconciler) prepareObjects(objs []*unstructured.Unstructured, s site, n
 }
 
 // revoke removes the memberships that disappeared: the label and the
-// LocalQueue. Namespaces and agents stay.
+// LocalQueue. Namespaces and executors stay.
 func (r *Reconciler) revoke(ctx context.Context, s site, p plan) error {
 	var errs []error
 	nss := &corev1.NamespaceList{}

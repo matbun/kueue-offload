@@ -1,10 +1,10 @@
-# The agent's permissions in its tenant namespace. The membership controller
-# binds the agent's ServiceAccount to this ClusterRole with a RoleBinding in
+# The executor's permissions in its tenant namespace. The membership controller
+# binds the executor's ServiceAccount to this ClusterRole with a RoleBinding in
 # that namespace only.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: interlink-agent
+  name: kueue-offload-executor
 rules:
 - apiGroups: [""]
   resources: [secrets, configmaps]
@@ -20,11 +20,11 @@ rules:
 - apiGroups: [""]
   resources: [pods]
   verbs: [get, list, watch, patch]
-# Pipeline steps carry a ServiceAccount token, minted by the agent.
+# Pipeline steps carry a ServiceAccount token, minted by the executor.
 - apiGroups: [""]
   resources: [serviceaccounts/token]
   verbs: [create]
-# Stage-in and stage-out run as Jobs in the agent's namespace.
+# Stage-in and stage-out run as Jobs in the executor's namespace.
 - apiGroups: [batch]
   resources: [jobs]
   verbs: [create, get, list, watch, delete]

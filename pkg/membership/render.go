@@ -16,7 +16,7 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// TemplateData is what the agent template is executed with, once per tenant
+// TemplateData is what the executor template is executed with, once per tenant
 // namespace.
 type TemplateData struct {
 	Namespace string
@@ -24,11 +24,11 @@ type TemplateData struct {
 	HPCUser   string
 	// Accounts are the tenant's accounts on the site, sorted.
 	Accounts []string
-	// Image is membership.agentImage of the SiteConfig.
+	// Image is membership.executorImage of the OffloadConfig.
 	Image string
-	// AgentService and AgentPort are where the dispatcher calls the agent.
-	AgentService string
-	AgentPort    int32
+	// ExecutorService and ExecutorPort are where the offload controller calls the executor.
+	ExecutorService string
+	ExecutorPort    int32
 }
 
 var templateFuncs = template.FuncMap{
@@ -40,9 +40,9 @@ var templateFuncs = template.FuncMap{
 	},
 }
 
-// ParseTemplate parses an agent template. Missing map keys are errors.
+// ParseTemplate parses an executor template. Missing map keys are errors.
 func ParseTemplate(text string) (*template.Template, error) {
-	return template.New("agent").Option("missingkey=error").Funcs(templateFuncs).Parse(text)
+	return template.New("executor").Option("missingkey=error").Funcs(templateFuncs).Parse(text)
 }
 
 // renderObjects executes the template and splits its output into objects.

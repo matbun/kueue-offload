@@ -1,4 +1,4 @@
-package dispatcher
+package offload
 
 import (
 	"context"
@@ -15,7 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
-	"github.com/interlink-hq/interlink-dispatch/pkg/agentapi"
+	"github.com/matbun/kueue-offload/pkg/executorapi"
 )
 
 var groupPods = []string{"train-0", "train-1"}
@@ -25,11 +25,11 @@ func TestPodGroupSubmitsOnce(t *testing.T) {
 	e.reconcile()
 	e.reconcile()
 	e.reconcile()
-	if s, _, _ := e.agent.counts(); s != 1 {
+	if s, _, _ := e.executor.counts(); s != 1 {
 		t.Fatalf("submits = %d, want 1", s)
 	}
-	req := e.agent.submits[0]
-	if req.Owner != (agentapi.OwnerReference{APIVersion: "v1", Kind: "Pod", Name: podGroup, UID: "0b6c-pod-0"}) {
+	req := e.executor.submits[0]
+	if req.Owner != (executorapi.OwnerReference{APIVersion: "v1", Kind: "Pod", Name: podGroup, UID: "0b6c-pod-0"}) {
 		t.Errorf("owner = %+v, want the group name and the first pod's UID", req.Owner)
 	}
 	if len(req.PodSets) != 1 || req.PodSets[0].Name != podSetKey || req.PodSets[0].Count != 2 {
@@ -55,25 +55,25 @@ func TestPodGroupSubmitsOnce(t *testing.T) {
 func TestPodOwnersTerminalPhase(t *testing.T) {
 	cases := []struct {
 		name    string
-		job     agentapi.JobStatus
+		job     executorapi.JobStatus
 		phase   corev1.PodPhase
 		message string
 	}{
-		{"completed", agentapi.JobStatus{State: agentapi.StateCompleted}, corev1.PodSucceeded, "Slurm job 123 completed"},
-		{"failed", agentapi.JobStatus{State: agentapi.StateFailed, Message: "rank 1 exited 3"}, corev1.PodFailed, "Slurm job 123 failed: rank 1 exited 3"},
+		{"completed", executorapi.JobStatus{State: executorapi.StateCompleted}, corev1.PodSucceeded, "Slurm job 123 completed"},
+		{"failed", executorapi.JobStatus{State: executorapi.StateFailed, Message: "rank 1 exited 3"}, corev1.PodFailed, "Slurm job 123 failed: rank 1 exited 3"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t, podOwned(2))
 			e.reconcile()
-			tc.job.APIVersion, tc.job.JobID = agentapi.APIVersion, "123"
-			e.agent.set(func(a *fakeAgent) { a.job = tc.job })
+			tc.job.APIVersion, tc.job.JobID = executorapi.APIVersion, "123"
+			e.executor.set(func(a *fakeExecutor) { a.job = tc.job })
 			e.reconcile()
 			for _, name := range groupPods {
 				p := e.pod(name)
-				if p.Status.Phase != tc.phase || p.Status.Reason != ReasonDispatch || p.Status.Message != tc.message {
+				if p.Status.Phase != tc.phase || p.Status.Reason != ReasonOffload || p.Status.Message != tc.message {
 					t.Errorf("pod %s = %s %s %q, want %s %s %q", name, p.Status.Phase, p.Status.Reason, p.Status.Message,
-						tc.phase, ReasonDispatch, tc.message)
+						tc.phase, ReasonOffload, tc.message)
 				}
 				if p.Spec.NodeName != "" || len(p.Spec.SchedulingGates) != 1 {
 					t.Errorf("pod %s spec changed: node %q, gates %v", name, p.Spec.NodeName, p.Spec.SchedulingGates)
@@ -108,7 +108,7 @@ func TestTerminalPodNotPatchedAgain(t *testing.T) {
 		}
 	})
 	e.reconcile()
-	e.agent.set(func(a *fakeAgent) { a.job.State, a.job.Message = agentapi.StateFailed, "rank 1 exited 3" })
+	e.executor.set(func(a *fakeExecutor) { a.job.State, a.job.Message = executorapi.StateFailed, "rank 1 exited 3" })
 	e.reconcile()
 	if !reflect.DeepEqual(patched, []string{"train-1"}) {
 		t.Errorf("patched pods %v, want only train-1", patched)
@@ -127,12 +127,12 @@ func TestDeletedOwnerPodSkipped(t *testing.T) {
 	if err := e.c.Delete(context.Background(), e.pod("train-1")); err != nil {
 		t.Fatal(err)
 	}
-	e.agent.set(func(a *fakeAgent) { a.job.State = agentapi.StateCompleted })
+	e.executor.set(func(a *fakeExecutor) { a.job.State = executorapi.StateCompleted })
 	e.reconcile() // fails the test on a reconcile error
 	if p := e.pod("train-0"); p.Status.Phase != corev1.PodSucceeded {
 		t.Errorf("train-0 = %s, want Succeeded", p.Status.Phase)
 	}
-	if rec := e.record(); rec.Status.State != agentapi.StateCompleted {
+	if rec := e.record(); rec.Status.State != executorapi.StateCompleted {
 		t.Errorf("record state = %q", rec.Status.State)
 	}
 }
@@ -140,29 +140,29 @@ func TestDeletedOwnerPodSkipped(t *testing.T) {
 func TestSinglePodOwner(t *testing.T) {
 	e := newEnv(t, podOwned(1))
 	e.reconcile()
-	if s, _, _ := e.agent.counts(); s != 1 {
+	if s, _, _ := e.executor.counts(); s != 1 {
 		t.Fatalf("submits = %d, want 1", s)
 	}
-	req := e.agent.submits[0]
-	if req.Owner != (agentapi.OwnerReference{APIVersion: "v1", Kind: "Pod", Name: "train-0", UID: "0b6c-pod-0"}) {
+	req := e.executor.submits[0]
+	if req.Owner != (executorapi.OwnerReference{APIVersion: "v1", Kind: "Pod", Name: "train-0", UID: "0b6c-pod-0"}) {
 		t.Errorf("owner = %+v, want the pod", req.Owner)
 	}
 	if req.PodSets[0].Count != 1 {
 		t.Errorf("count = %d, want 1", req.PodSets[0].Count)
 	}
-	e.agent.set(func(a *fakeAgent) { a.job.State = agentapi.StateCompleted })
+	e.executor.set(func(a *fakeExecutor) { a.job.State = executorapi.StateCompleted })
 	e.reconcile()
-	if p := e.pod("train-0"); p.Status.Phase != corev1.PodSucceeded || p.Status.Reason != ReasonDispatch {
-		t.Errorf("pod = %s %s, want Succeeded %s", p.Status.Phase, p.Status.Reason, ReasonDispatch)
+	if p := e.pod("train-0"); p.Status.Phase != corev1.PodSucceeded || p.Status.Reason != ReasonOffload {
+		t.Errorf("pod = %s %s, want Succeeded %s", p.Status.Phase, p.Status.Reason, ReasonOffload)
 	}
 }
 
 func TestPodOwnersRejectedOnPermanentError(t *testing.T) {
 	e := newEnv(t, podOwned(2))
 	const msg = "sbatch: error: Invalid account or account/partition combination specified"
-	e.agent.set(func(a *fakeAgent) {
+	e.executor.set(func(a *fakeExecutor) {
 		a.submitCode = http.StatusBadRequest
-		a.submitBody = agentapi.ErrorResponse{APIVersion: agentapi.APIVersion, Permanent: true, Message: msg}
+		a.submitBody = executorapi.ErrorResponse{APIVersion: executorapi.APIVersion, Permanent: true, Message: msg}
 	})
 	e.reconcile()
 	if st := e.check("hpc-a"); st.State != kueue.CheckStateRejected || st.Message != msg {
@@ -201,7 +201,7 @@ func TestUnknownOwnerKindRejected(t *testing.T) {
 			if st.State != kueue.CheckStateRejected || !strings.Contains(st.Message, "TrainJob and v1 Pod") || !strings.Contains(st.Message, tc.want) {
 				t.Errorf("check = %s %q, want Rejected naming %q", st.State, st.Message, tc.want)
 			}
-			if s, _, _ := e.agent.counts(); s != 0 {
+			if s, _, _ := e.executor.counts(); s != 0 {
 				t.Errorf("submitted a workload with %s", tc.want)
 			}
 			if p := e.pod("train-0"); p.Status.Phase != corev1.PodPending {
@@ -231,23 +231,23 @@ func TestPodOwnersContainerStatuses(t *testing.T) {
 	cases := []struct {
 		name  string
 		state string
-		ranks []agentapi.RankStatus
+		ranks []executorapi.RankStatus
 		want  map[string]int32
 	}{
-		{"completed without ranks", agentapi.StateCompleted, nil, map[string]int32{"train": 0, "wait": 0}},
-		{"failed without ranks", agentapi.StateFailed, nil, map[string]int32{"train": 1, "wait": 1}},
-		{"failed with exit codes", agentapi.StateFailed,
-			[]agentapi.RankStatus{{Rank: 0, Containers: []corev1.ContainerStatus{terminated("train", 3)}}, {Rank: 1, Containers: []corev1.ContainerStatus{terminated("wait", 9)}}},
+		{"completed without ranks", executorapi.StateCompleted, nil, map[string]int32{"train": 0, "wait": 0}},
+		{"failed without ranks", executorapi.StateFailed, nil, map[string]int32{"train": 1, "wait": 1}},
+		{"failed with exit codes", executorapi.StateFailed,
+			[]executorapi.RankStatus{{Rank: 0, Containers: []corev1.ContainerStatus{terminated("train", 3)}}, {Rank: 1, Containers: []corev1.ContainerStatus{terminated("wait", 9)}}},
 			map[string]int32{"train": 3, "wait": 1}},
-		{"completed with exit codes", agentapi.StateCompleted,
-			[]agentapi.RankStatus{{Rank: 0, Containers: []corev1.ContainerStatus{terminated("train", 0), terminated("wait", 0)}}},
+		{"completed with exit codes", executorapi.StateCompleted,
+			[]executorapi.RankStatus{{Rank: 0, Containers: []corev1.ContainerStatus{terminated("train", 0), terminated("wait", 0)}}},
 			map[string]int32{"train": 0, "wait": 0}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t, podOwned(2), argoShaped)
 			e.reconcile()
-			e.agent.set(func(a *fakeAgent) {
+			e.executor.set(func(a *fakeExecutor) {
 				a.job.State, a.job.Ranks, a.job.StartTime, a.job.CompletionTime = tc.state, tc.ranks, &start, &end
 			})
 			e.reconcile()

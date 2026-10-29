@@ -1,4 +1,4 @@
-package dispatcher
+package offload
 
 import (
 	"context"
@@ -15,12 +15,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
-	"github.com/interlink-hq/interlink-dispatch/pkg/agentapi"
+	"github.com/matbun/kueue-offload/pkg/executorapi"
 )
 
 // Reasons written on the owner's conditions and on the owner pods.
 const (
-	ReasonDispatch = "InterlinkDispatch"
+	ReasonOffload  = "KueueOffload"
 	ReasonRejected = "Rejected"
 )
 
@@ -35,7 +35,7 @@ type workloadOwner struct {
 	pods []metav1.OwnerReference
 }
 
-// ownerKind is a controller owner the dispatcher finishes through its status.
+// ownerKind is a controller owner the offload controller finishes through its status.
 type ownerKind struct {
 	gvk schema.GroupVersionKind
 	// complete and failed are the condition types Kueue's integration reads.
@@ -61,7 +61,7 @@ func kindOf(ref *metav1.OwnerReference) (ownerKind, bool) {
 }
 
 // ownerOf returns the Workload's owner, or nil and a message saying why the
-// dispatcher cannot handle it.
+// offload controller cannot handle it.
 func ownerOf(wl *kueue.Workload) (*workloadOwner, string) {
 	c := metav1.GetControllerOf(wl)
 	if c != nil {
@@ -97,15 +97,15 @@ func unsupportedOwner(ref *metav1.OwnerReference) string {
 	if ref != nil {
 		what = fmt.Sprintf("owner %s %s", ref.APIVersion, ref.Kind)
 	}
-	return "interlink-dispatch handles only batch/v1 Job, jobset.x-k8s.io/v1alpha2 JobSet, " +
+	return "kueue-offload handles only batch/v1 Job, jobset.x-k8s.io/v1alpha2 JobSet, " +
 		"trainer.kubeflow.org/v1alpha1 TrainJob and v1 Pod workloads, this one has " + what
 }
 
-// readOwner returns the owner the agent is told about and the annotations
+// readOwner returns the owner the executor is told about and the annotations
 // forwarded from it (design D5): the controller, or the first owner pod that
 // still exists, named after its pod group. A nil reference means the owner is
 // gone.
-func readOwner(ctx context.Context, r client.Reader, namespace string, o *workloadOwner) (*agentapi.OwnerReference, map[string]string, error) {
+func readOwner(ctx context.Context, r client.Reader, namespace string, o *workloadOwner) (*executorapi.OwnerReference, map[string]string, error) {
 	if o.ref != nil {
 		k, _ := kindOf(o.ref)
 		obj := &unstructured.Unstructured{}
@@ -116,7 +116,7 @@ func readOwner(ctx context.Context, r client.Reader, namespace string, o *worklo
 		if obj.GetUID() != o.ref.UID {
 			return nil, nil, nil
 		}
-		ref := &agentapi.OwnerReference{APIVersion: o.ref.APIVersion, Kind: o.ref.Kind, Name: o.ref.Name, UID: string(o.ref.UID)}
+		ref := &executorapi.OwnerReference{APIVersion: o.ref.APIVersion, Kind: o.ref.Kind, Name: o.ref.Name, UID: string(o.ref.UID)}
 		return ref, obj.GetAnnotations(), nil
 	}
 	for _, p := range o.pods {
@@ -134,7 +134,7 @@ func readOwner(ctx context.Context, r client.Reader, namespace string, o *worklo
 		if g := pod.Labels[podGroupNameLabel]; g != "" {
 			name = g
 		}
-		return &agentapi.OwnerReference{APIVersion: "v1", Kind: "Pod", Name: name, UID: string(pod.UID)}, pod.Annotations, nil
+		return &executorapi.OwnerReference{APIVersion: "v1", Kind: "Pod", Name: name, UID: string(pod.UID)}, pod.Annotations, nil
 	}
 	return nil, nil, nil
 }
@@ -159,7 +159,7 @@ type jobOutcome struct {
 	message        string
 	startTime      *metav1.Time
 	completionTime *metav1.Time
-	// exitCodes by container name, from the head rank; nil when the agent
+	// exitCodes by container name, from the head rank; nil when the executor
 	// reported none.
 	exitCodes map[string]int32
 }
@@ -329,7 +329,7 @@ func finishPods(ctx context.Context, c client.Client, r client.Reader, namespace
 }
 
 // terminatedStatuses gives each container a terminated state. Init containers
-// exit 0; the others take the agent's exit code for their name, or 0 for a
+// exit 0; the others take the executor's exit code for their name, or 0 for a
 // completed job and 1 for a failed one.
 func terminatedStatuses(containers []corev1.Container, o jobOutcome, now time.Time, init bool) []corev1.ContainerStatus {
 	if len(containers) == 0 {
@@ -368,8 +368,8 @@ func terminatedStatuses(containers []corev1.Container, o jobOutcome, now time.Ti
 	return out
 }
 
-// exitCodes reads the head rank's container exit codes from the agent.
-func exitCodes(st *agentapi.JobStatus) map[string]int32 {
+// exitCodes reads the head rank's container exit codes from the executor.
+func exitCodes(st *executorapi.JobStatus) map[string]int32 {
 	if len(st.Ranks) == 0 || len(st.Ranks[0].Containers) == 0 {
 		return nil
 	}

@@ -1,35 +1,35 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: interlink-membership-hpc-a
-  namespace: interlink-membership
+  name: kueue-offload-membership-hpc-a
+  namespace: kueue-offload-membership
   labels:
-    app: interlink-membership
+    app: kueue-offload-membership
     interlink.eu/site: hpc-a
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: interlink-membership
+      app: kueue-offload-membership
       interlink.eu/site: hpc-a
   template:
     metadata:
       labels:
-        app: interlink-membership
+        app: kueue-offload-membership
         interlink.eu/site: hpc-a
     spec:
-      serviceAccountName: interlink-membership
+      serviceAccountName: kueue-offload-membership
       securityContext:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       containers:
       - name: membership
-        image: interlink-dispatch:latest
+        image: kueue-offload:latest
         command: [/membership]
         args:
         - --site=hpc-a
-        - --namespace=interlink-membership
+        - --namespace=kueue-offload-membership
         - --metrics-bind-address=:8080
         - --health-probe-bind-address=:8081
         - --leader-elect

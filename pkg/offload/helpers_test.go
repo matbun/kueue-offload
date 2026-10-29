@@ -1,4 +1,4 @@
-package dispatcher
+package offload
 
 import (
 	"context"
@@ -29,27 +29,27 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
-	"github.com/interlink-hq/interlink-dispatch/api/v1alpha1"
-	"github.com/interlink-hq/interlink-dispatch/pkg/agentapi"
+	"github.com/matbun/kueue-offload/api/v1alpha1"
+	"github.com/matbun/kueue-offload/pkg/executorapi"
 )
 
 const (
 	testSite  = "hpc-a"
 	testNS    = "alice"
-	testDNS   = "interlink-dispatch"
+	testDNS   = "kueue-offload"
 	wlName    = "job-train-5d565"
 	wlUID     = types.UID("0b6c-wl")
 	jobUID    = types.UID("0b6c-job")
 	testToken = "token-1"
 )
 
-// fakeAgent is an httptest agent that records every call.
-type fakeAgent struct {
+// fakeExecutor is an httptest executor that records every call.
+type fakeExecutor struct {
 	t   *testing.T
 	srv *httptest.Server
 
 	mu         sync.Mutex
-	submits    []agentapi.SubmitRequest
+	submits    []executorapi.SubmitRequest
 	submitHdrs []http.Header
 	deletes    []string
 	gets       int
@@ -57,20 +57,20 @@ type fakeAgent struct {
 	submitCode int
 	submitBody any
 	jobCode    int
-	job        agentapi.JobStatus
+	job        executorapi.JobStatus
 }
 
-func newFakeAgent(t *testing.T) *fakeAgent {
-	a := &fakeAgent{t: t, submitCode: http.StatusCreated, jobCode: http.StatusOK,
-		submitBody: agentapi.SubmitResponse{APIVersion: agentapi.APIVersion, JobID: "123", Accepted: true},
-		job:        agentapi.JobStatus{APIVersion: agentapi.APIVersion, JobID: "123", State: agentapi.StateQueued, Reason: "Priority"},
+func newFakeExecutor(t *testing.T) *fakeExecutor {
+	a := &fakeExecutor{t: t, submitCode: http.StatusCreated, jobCode: http.StatusOK,
+		submitBody: executorapi.SubmitResponse{APIVersion: executorapi.APIVersion, JobID: "123", Accepted: true},
+		job:        executorapi.JobStatus{APIVersion: executorapi.APIVersion, JobID: "123", State: executorapi.StateQueued, Reason: "Priority"},
 	}
 	a.srv = httptest.NewServer(http.HandlerFunc(a.serve))
 	t.Cleanup(a.srv.Close)
 	return a
 }
 
-func (a *fakeAgent) serve(w http.ResponseWriter, r *http.Request) {
+func (a *fakeExecutor) serve(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	reply := func(code int, body any) {
@@ -80,7 +80,7 @@ func (a *fakeAgent) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/submit":
-		var req agentapi.SubmitRequest
+		var req executorapi.SubmitRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			a.t.Errorf("decoding submit: %v", err)
 		}
@@ -93,23 +93,23 @@ func (a *fakeAgent) serve(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/jobs/") && r.Method == http.MethodGet:
 		a.gets++
 		if a.jobCode != http.StatusOK {
-			reply(a.jobCode, agentapi.ErrorResponse{Permanent: a.jobCode == http.StatusNotFound, Message: "no job"})
+			reply(a.jobCode, executorapi.ErrorResponse{Permanent: a.jobCode == http.StatusNotFound, Message: "no job"})
 			return
 		}
 		reply(http.StatusOK, a.job)
 	default:
-		a.t.Errorf("unexpected agent call %s %s", r.Method, r.URL.Path)
+		a.t.Errorf("unexpected executor call %s %s", r.Method, r.URL.Path)
 		w.WriteHeader(http.StatusNotFound)
 	}
 }
 
-func (a *fakeAgent) counts() (submits, deletes, gets int) {
+func (a *fakeExecutor) counts() (submits, deletes, gets int) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return len(a.submits), len(a.deletes), a.gets
 }
 
-func (a *fakeAgent) set(f func(a *fakeAgent)) {
+func (a *fakeExecutor) set(f func(a *fakeExecutor)) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	f(a)
@@ -145,13 +145,13 @@ func (w *recordingChecks) WriteCheck(ctx context.Context, wl *kueue.Workload, st
 }
 
 type env struct {
-	t      *testing.T
-	c      client.Client
-	agent  *fakeAgent
-	checks *recordingChecks
-	events *events.FakeRecorder
-	r      *WorkloadReconciler
-	now    time.Time
+	t        *testing.T
+	c        client.Client
+	executor *fakeExecutor
+	checks   *recordingChecks
+	events   *events.FakeRecorder
+	r        *WorkloadReconciler
+	now      time.Time
 }
 
 func testScheme(t *testing.T) *runtime.Scheme {
@@ -164,14 +164,18 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	return s
 }
 
-func siteConfig() *v1alpha1.SiteConfig {
-	return &v1alpha1.SiteConfig{
+func offloadConfig() *v1alpha1.OffloadConfig {
+	return &v1alpha1.OffloadConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: testSite},
-		Spec: v1alpha1.SiteConfigSpec{
-			PollInterval:     &metav1.Duration{Duration: 15 * time.Second},
-			AgentLostTimeout: &metav1.Duration{Duration: 10 * time.Minute},
-			MaxRetries:       ptr.To[int32](2),
-			FlavorPartitions: map[string]string{"hpc-a-gpu": "gpu", "hpc-a-cpu": "cpu"},
+		Spec: v1alpha1.OffloadConfigSpec{
+			PollInterval:        &metav1.Duration{Duration: 15 * time.Second},
+			ExecutorLostTimeout: &metav1.Duration{Duration: 10 * time.Minute},
+			MaxRetries:          ptr.To[int32](2),
+			Flavors: map[string]v1alpha1.FlavorTarget{
+				"hpc-a-gpu":   {Partition: "gpu"},
+				"hpc-a-cpu":   {Partition: "cpu"},
+				"hpc-a-debug": {Partition: "gpu", QOS: "debug"},
+			},
 		},
 	}
 }
@@ -181,7 +185,7 @@ func admissionCheck(name, controller, site string) *kueue.AdmissionCheck {
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: kueue.AdmissionCheckSpec{
 			ControllerName: controller,
-			Parameters:     &kueue.AdmissionCheckParametersReference{APIGroup: "interlink.eu", Kind: "SiteConfig", Name: site},
+			Parameters:     &kueue.AdmissionCheckParametersReference{APIGroup: "interlink.eu", Kind: "OffloadConfig", Name: site},
 		},
 	}
 }
@@ -340,7 +344,7 @@ func newUnstructured(k ownerKind) *unstructured.Unstructured {
 const customUID = types.UID("0b6c-custom")
 
 // customOwned makes the Workload owned by a JobSet or a TrainJob named train,
-// stored unstructured as the dispatcher reads it.
+// stored unstructured as the offload controller reads it.
 func customOwned(k ownerKind) envOption {
 	return func(objs *[]client.Object, _ *interceptor.Funcs) {
 		u := newUnstructured(k)
@@ -373,11 +377,11 @@ func (e *env) custom(k ownerKind) *unstructured.Unstructured {
 
 func newEnv(t *testing.T, opts ...envOption) *env {
 	t.Helper()
-	agent := newFakeAgent(t)
+	executor := newFakeExecutor(t)
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNS,
-		Annotations: map[string]string{AgentEndpointAnnotation: agent.srv.URL}}}
+		Annotations: map[string]string{ExecutorEndpointAnnotation: executor.srv.URL}}}
 	objs := []client.Object{
-		siteConfig(), admissionCheck("hpc-a", ControllerName, testSite),
+		offloadConfig(), admissionCheck("hpc-a", ControllerName, testSite),
 		admissionCheck("other-check", "example.org/other", "x"),
 		clusterQueue(), ns, ownerJob(), workload(),
 	}
@@ -386,7 +390,7 @@ func newEnv(t *testing.T, opts ...envOption) *env {
 		o(&objs, &funcs)
 	}
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objs...).
-		WithStatusSubresource(&kueue.Workload{}, &kueue.AdmissionCheck{}, &v1alpha1.SubmitRecord{}, &batchv1.Job{}, &corev1.Pod{},
+		WithStatusSubresource(&kueue.Workload{}, &kueue.AdmissionCheck{}, &v1alpha1.OffloadRecord{}, &batchv1.Job{}, &corev1.Pod{},
 			newUnstructured(jobSetKind), newUnstructured(trainJobKind)).
 		WithInterceptorFuncs(funcs).Build()
 
@@ -394,11 +398,11 @@ func newEnv(t *testing.T, opts ...envOption) *env {
 	if err := os.WriteFile(tokenFile, []byte(testToken+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	e := &env{t: t, c: c, agent: agent, checks: &recordingChecks{c: c}, events: events.NewFakeRecorder(100),
+	e := &env{t: t, c: c, executor: executor, checks: &recordingChecks{c: c}, events: events.NewFakeRecorder(100),
 		now: time.Date(2026, 10, 29, 10, 0, 0, 0, time.UTC)}
 	e.r = &WorkloadReconciler{
 		Client: c, APIReader: c, Checks: e.checks,
-		Agent:     &AgentClient{HTTP: &http.Client{Timeout: 5 * time.Second}, Token: &TokenSource{Path: tokenFile}},
+		Executor:  &ExecutorClient{HTTP: &http.Client{Timeout: 5 * time.Second}, Token: &TokenSource{Path: tokenFile}},
 		Recorder:  e.events,
 		Site:      testSite,
 		Namespace: testDNS,
@@ -452,9 +456,9 @@ func (e *env) pod(name string) *corev1.Pod {
 	return p
 }
 
-func (e *env) record() *v1alpha1.SubmitRecord {
+func (e *env) record() *v1alpha1.OffloadRecord {
 	e.t.Helper()
-	rec := &v1alpha1.SubmitRecord{}
+	rec := &v1alpha1.OffloadRecord{}
 	if err := e.c.Get(context.Background(), types.NamespacedName{Namespace: testDNS, Name: string(wlUID)}, rec); err != nil {
 		e.t.Fatalf("record: %v", err)
 	}
@@ -471,7 +475,7 @@ func (e *env) mutateWorkload(f func(wl *kueue.Workload)) {
 	}
 }
 
-func (e *env) mutateRecord(f func(rec *v1alpha1.SubmitRecord)) {
+func (e *env) mutateRecord(f func(rec *v1alpha1.OffloadRecord)) {
 	e.t.Helper()
 	rec := e.record()
 	f(rec)

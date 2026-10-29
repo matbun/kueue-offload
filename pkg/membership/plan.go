@@ -7,7 +7,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/validation"
 
-	"github.com/interlink-hq/interlink-dispatch/api/v1alpha1"
+	"github.com/matbun/kueue-offload/api/v1alpha1"
 )
 
 // Association is one row of sacctmgr show assoc format=cluster,account,user.
@@ -118,7 +118,7 @@ func buildPlan(s site, rows []Association, entries []v1alpha1.IdentityEntry, own
 			nsOf[e.HPCUser] = append(nsOf[e.HPCUser], ns)
 		}
 	}
-	// One agent per site holds one HPC user (D8), so a namespace mapped to
+	// One executor per site holds one HPC user (D8), so a namespace mapped to
 	// two users of the same site gets neither.
 	conflict := map[string]bool{}
 	for ns, users := range userOf {

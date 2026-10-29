@@ -26,12 +26,12 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/yaml"
 
-	"github.com/interlink-hq/interlink-dispatch/api/v1alpha1"
+	"github.com/matbun/kueue-offload/api/v1alpha1"
 )
 
 const (
 	testSite = "hpc-a"
-	ownNS    = "interlink-membership"
+	ownNS    = "kueue-offload-membership"
 )
 
 // fixture: alice in proj42 and proj99, bob in proj42, carol has no identity,
@@ -63,7 +63,7 @@ func testMapper(s *runtime.Scheme) meta.RESTMapper {
 		{Group: rbacv1.GroupName, Kind: "ClusterRole"}: true, {Group: rbacv1.GroupName, Kind: "ClusterRoleBinding"}: true,
 		{Group: kueue.GroupVersion.Group, Kind: "ClusterQueue"}: true, {Group: kueue.GroupVersion.Group, Kind: "Cohort"}: true,
 		{Group: kueue.GroupVersion.Group, Kind: "ResourceFlavor"}: true, {Group: kueue.GroupVersion.Group, Kind: "AdmissionCheck"}: true,
-		{Group: v1alpha1.GroupVersion.Group, Kind: "SiteConfig"}: true, {Group: v1alpha1.GroupVersion.Group, Kind: "IdentityMap"}: true,
+		{Group: v1alpha1.GroupVersion.Group, Kind: "OffloadConfig"}: true, {Group: v1alpha1.GroupVersion.Group, Kind: "IdentityMap"}: true,
 		{Group: v1alpha1.GroupVersion.Group, Kind: "ProjectQuota"}: true,
 	}
 	m := meta.NewDefaultRESTMapper(nil)
@@ -87,15 +87,15 @@ func quota(gpus int64) []kueue.ResourceGroup {
 	}}
 }
 
-func siteConfig() *v1alpha1.SiteConfig {
-	return &v1alpha1.SiteConfig{
+func offloadConfig() *v1alpha1.OffloadConfig {
+	return &v1alpha1.OffloadConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: testSite},
-		Spec: v1alpha1.SiteConfigSpec{Membership: &v1alpha1.Membership{
+		Spec: v1alpha1.OffloadConfigSpec{Membership: &v1alpha1.Membership{
 			SlurmCluster:        "hpc-a",
 			Associations:        v1alpha1.ConfigMapKeyRef{Namespace: ownNS, Name: "assoc", Key: "associations"},
-			AgentTemplate:       &v1alpha1.ConfigMapKeyRef{Namespace: ownNS, Name: "hpc-a-agent-template", Key: "template.yaml"},
-			AgentImage:          "agent:1",
-			AgentTokenReview:    true,
+			ExecutorTemplate:    &v1alpha1.ConfigMapKeyRef{Namespace: ownNS, Name: "hpc-a-executor-template", Key: "template.yaml"},
+			ExecutorImage:       "executor:1",
+			ExecutorTokenReview: true,
 			DefaultProjectQuota: quota(8),
 		}},
 	}
@@ -110,7 +110,7 @@ func assocConfigMap(text string) *corev1.ConfigMap {
 
 func templateConfigMap(text string) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: "hpc-a-agent-template", Namespace: ownNS},
+		ObjectMeta: metav1.ObjectMeta{Name: "hpc-a-executor-template", Namespace: ownNS},
 		Data:       map[string]string{"template.yaml": text},
 	}
 }
@@ -129,7 +129,7 @@ func defaultIdentities() *v1alpha1.IdentityMap {
 
 // sampleTemplate is the template shipped in config/samples.
 func sampleTemplate(t *testing.T) string {
-	data, err := os.ReadFile("../../config/samples/membership/agent-template.yaml")
+	data, err := os.ReadFile("../../config/samples/membership/executor-template.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +167,7 @@ func newEnv(t *testing.T, objs ...client.Object) *env {
 		}
 		base[k] = o
 	}
-	for _, o := range []client.Object{siteConfig(), assocConfigMap(fixture), templateConfigMap(sampleTemplate(t)), defaultIdentities(),
+	for _, o := range []client.Object{offloadConfig(), assocConfigMap(fixture), templateConfigMap(sampleTemplate(t)), defaultIdentities(),
 		&v1alpha1.ProjectQuota{ObjectMeta: metav1.ObjectMeta{Name: "hpc-a-proj42"},
 			Spec: v1alpha1.ProjectQuotaSpec{Site: testSite, Account: "proj42", ResourceGroups: quota(64)}}} {
 		add(o)
@@ -268,10 +268,10 @@ func (e *env) clusterQueues() map[string]kueue.ClusterQueue {
 	return out
 }
 
-func (e *env) agentConfigMap(ns string) *corev1.ConfigMap {
+func (e *env) executorConfigMap(ns string) *corev1.ConfigMap {
 	e.t.Helper()
 	cm := &corev1.ConfigMap{}
-	if !e.get(types.NamespacedName{Namespace: ns, Name: "interlink-agent"}, cm) {
+	if !e.get(types.NamespacedName{Namespace: ns, Name: "kueue-offload-executor"}, cm) {
 		return nil
 	}
 	return cm
@@ -290,8 +290,8 @@ func (e *env) setAssociations(text string) {
 func (e *env) setDeploymentAvailable(ns string, ok bool) {
 	e.t.Helper()
 	d := &appsv1.Deployment{}
-	if !e.get(types.NamespacedName{Namespace: ns, Name: "interlink-agent"}, d) {
-		e.t.Fatalf("agent Deployment missing in %s", ns)
+	if !e.get(types.NamespacedName{Namespace: ns, Name: "kueue-offload-executor"}, d) {
+		e.t.Fatalf("executor Deployment missing in %s", ns)
 	}
 	st := corev1.ConditionFalse
 	if ok {

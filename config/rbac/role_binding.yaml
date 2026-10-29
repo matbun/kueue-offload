@@ -1,26 +1,26 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: interlink-dispatch
+  name: kueue-offload
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: interlink-dispatch
+  name: kueue-offload
 subjects:
 - kind: ServiceAccount
-  name: interlink-dispatch
-  namespace: interlink-dispatch
+  name: kueue-offload
+  namespace: kueue-offload
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: interlink-dispatch
-  namespace: interlink-dispatch
+  name: kueue-offload
+  namespace: kueue-offload
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: interlink-dispatch
+  name: kueue-offload
 subjects:
 - kind: ServiceAccount
-  name: interlink-dispatch
-  namespace: interlink-dispatch
+  name: kueue-offload
+  namespace: kueue-offload

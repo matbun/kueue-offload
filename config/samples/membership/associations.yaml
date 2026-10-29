@@ -5,7 +5,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: hpc-a-associations
-  namespace: interlink-membership
+  namespace: kueue-offload-membership
 data:
   associations: |
     hpc-a|proj42|

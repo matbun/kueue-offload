@@ -1,4 +1,4 @@
-module github.com/interlink-hq/interlink-dispatch
+module github.com/matbun/kueue-offload
 
 go 1.26.0
 

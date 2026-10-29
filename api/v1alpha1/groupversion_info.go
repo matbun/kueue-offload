@@ -1,4 +1,4 @@
-// Package v1alpha1 contains the interlink.eu/v1alpha1 API types of the dispatcher.
+// Package v1alpha1 contains the interlink.eu/v1alpha1 API types of the offload controller.
 // +kubebuilder:object:generate=true
 // +groupName=interlink.eu
 package v1alpha1

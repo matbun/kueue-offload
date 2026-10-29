@@ -1,4 +1,4 @@
-package dispatcher
+package offload
 
 import (
 	"context"
@@ -9,8 +9,8 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 )
 
-// FieldManager owns the dispatcher's entry in status.admissionChecks.
-const FieldManager = "interlink-dispatch"
+// FieldManager owns the offload controller's entry in status.admissionChecks.
+const FieldManager = "kueue-offload"
 
 // CheckWriter writes the state of one admission check on a Workload.
 type CheckWriter interface {

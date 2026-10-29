@@ -4,14 +4,14 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.5
-  name: submitrecords.interlink.eu
+  name: offloadrecords.interlink.eu
 spec:
   group: interlink.eu
   names:
-    kind: SubmitRecord
-    listKind: SubmitRecordList
-    plural: submitrecords
-    singular: submitrecord
+    kind: OffloadRecord
+    listKind: OffloadRecordList
+    plural: offloadrecords
+    singular: offloadrecord
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
@@ -37,8 +37,8 @@ spec:
     schema:
       openAPIV3Schema:
         description: |-
-          SubmitRecord is the dispatcher's durable record of a submission. Its name is
-          the Workload UID, so a restarted dispatcher does not submit twice.
+          OffloadRecord is the offload controller's durable record of a submission. Its name is
+          the Workload UID, so a restarted offload controller does not submit twice.
         properties:
           apiVersion:
             description: |-
@@ -59,19 +59,19 @@ spec:
             type: object
           spec:
             description: |-
-              SubmitRecordSpec is fixed when the record is created, before the first
+              OffloadRecordSpec is fixed when the record is created, before the first
               submission.
             properties:
               account:
                 type: string
-              agentEndpoint:
-                description: agentEndpoint is the base URL of the agent the job was
-                  submitted to.
+              executorEndpoint:
+                description: executorEndpoint is the base URL of the executor the
+                  job was submitted to.
                 type: string
               site:
                 type: string
               workload:
-                description: WorkloadReference names the Kueue Workload a SubmitRecord
+                description: WorkloadReference names the Kueue Workload a OffloadRecord
                   belongs to.
                 properties:
                   name:
@@ -83,16 +83,17 @@ spec:
                 - namespace
                 type: object
             required:
-            - agentEndpoint
+            - executorEndpoint
             - site
             - workload
             type: object
           status:
-            description: SubmitRecordStatus is the dispatcher's view of the job.
+            description: OffloadRecordStatus is the offload controller's view of the
+              job.
             properties:
               firstUnreachable:
                 description: |-
-                  firstUnreachable is when the agent stopped answering. Unset while it
+                  firstUnreachable is when the executor stopped answering. Unset while it
                   answers.
                 format: date-time
                 type: string
@@ -110,12 +111,12 @@ spec:
               retries:
                 description: |-
                   retries counts resubmissions after the job was cancelled on the site or
-                  the agent was lost.
+                  the executor was lost.
                 format: int32
                 type: integer
               state:
                 description: |-
-                  state is the last state the agent reported, or the dispatcher's own
+                  state is the last state the executor reported, or the offload controller's own
                   outcome (submitted, rejected, lost).
                 type: string
             type: object

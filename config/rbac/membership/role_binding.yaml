@@ -1,26 +1,26 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: interlink-membership
+  name: kueue-offload-membership
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: interlink-membership
+  name: kueue-offload-membership
 subjects:
 - kind: ServiceAccount
-  name: interlink-membership
-  namespace: interlink-membership
+  name: kueue-offload-membership
+  namespace: kueue-offload-membership
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: interlink-membership
-  namespace: interlink-membership
+  name: kueue-offload-membership
+  namespace: kueue-offload-membership
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: interlink-membership
+  name: kueue-offload-membership
 subjects:
 - kind: ServiceAccount
-  name: interlink-membership
-  namespace: interlink-membership
+  name: kueue-offload-membership
+  namespace: kueue-offload-membership

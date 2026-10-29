@@ -10,16 +10,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-func (e *env) agentPod(ns, name string, waiting *corev1.ContainerStateWaiting) {
+func (e *env) executorPod(ns, name string, waiting *corev1.ContainerStateWaiting) {
 	e.t.Helper()
 	p := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: map[string]string{"app": "interlink-agent"}},
-		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "agent", Image: "agent:1"}}},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: map[string]string{"app": "kueue-offload-executor"}},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "executor", Image: "executor:1"}}},
 	}
 	if err := e.c.Create(context.Background(), p); err != nil {
 		e.t.Fatal(err)
 	}
-	p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "agent", State: corev1.ContainerState{Waiting: waiting}}}
+	p.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "executor", State: corev1.ContainerState{Waiting: waiting}}}
 	if err := e.c.Status().Update(context.Background(), p); err != nil {
 		e.t.Fatal(err)
 	}
@@ -51,33 +51,33 @@ func (e *env) eventsWith(reason string) []string {
 	return out
 }
 
-func TestMissingCredentialsFromAgentPods(t *testing.T) {
+func TestMissingCredentialsFromExecutorPods(t *testing.T) {
 	e := newEnv(t)
 	e.sync()
 	e.drainEvents()
 
 	// Not available and no pod yet: no evidence, no annotation.
-	if hasKey(e.namespace("alice").Annotations, AgentAnnotation(testSite)) {
+	if hasKey(e.namespace("alice").Annotations, ExecutorAnnotation(testSite)) {
 		t.Fatal("annotation set without evidence")
 	}
 
-	e.agentPod("alice", "interlink-agent-1", &corev1.ContainerStateWaiting{
+	e.executorPod("alice", "kueue-offload-executor-1", &corev1.ContainerStateWaiting{
 		Reason: "CreateContainerConfigError", Message: `secret "hpc-a-submit-key" not found`,
 	})
-	e.agentPod("bob", "interlink-agent-1", &corev1.ContainerStateWaiting{
-		Reason: "ImagePullBackOff", Message: `Back-off pulling image "agent:1"`,
+	e.executorPod("bob", "kueue-offload-executor-1", &corev1.ContainerStateWaiting{
+		Reason: "ImagePullBackOff", Message: `Back-off pulling image "executor:1"`,
 	})
 	if after := e.sync(); after != time.Minute {
-		t.Errorf("requeue after %v while agents are not available", after)
+		t.Errorf("requeue after %v while executors are not available", after)
 	}
-	if got := e.namespace("alice").Annotations[AgentAnnotation(testSite)]; got != MissingCredentials {
+	if got := e.namespace("alice").Annotations[ExecutorAnnotation(testSite)]; got != MissingCredentials {
 		t.Errorf("alice annotation %q, want %q", got, MissingCredentials)
 	}
-	if hasKey(e.namespace("bob").Annotations, AgentAnnotation(testSite)) {
+	if hasKey(e.namespace("bob").Annotations, ExecutorAnnotation(testSite)) {
 		t.Errorf("bob's image pull failure reported as missing credentials")
 	}
 	warn := e.eventsWith(EventMissingCredentials)
-	if len(warn) != 1 || !strings.Contains(warn[0], "hpc-a-submit-key") || !strings.Contains(warn[0], "Deployment interlink-agent") {
+	if len(warn) != 1 || !strings.Contains(warn[0], "hpc-a-submit-key") || !strings.Contains(warn[0], "Deployment kueue-offload-executor") {
 		t.Errorf("missing credentials events %v", warn)
 	}
 
@@ -89,8 +89,8 @@ func TestMissingCredentialsFromAgentPods(t *testing.T) {
 
 	e.setDeploymentAvailable("alice", true)
 	e.sync()
-	if hasKey(e.namespace("alice").Annotations, AgentAnnotation(testSite)) {
-		t.Errorf("annotation kept after the agent became available")
+	if hasKey(e.namespace("alice").Annotations, ExecutorAnnotation(testSite)) {
+		t.Errorf("annotation kept after the executor became available")
 	}
 	if ok := e.eventsWith(EventCredentialsPresent); len(ok) != 1 {
 		t.Errorf("credentials present events %v", ok)
@@ -116,12 +116,12 @@ func TestMissingCredentialsFromMountEvents(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newEnv(t)
 			e.sync()
-			e.agentPod("alice", "interlink-agent-1", &corev1.ContainerStateWaiting{Reason: "ContainerCreating"})
-			e.podEvent("alice", "interlink-agent-1", "FailedMount", tc.msg, e.r.now().Add(-tc.age))
+			e.executorPod("alice", "kueue-offload-executor-1", &corev1.ContainerStateWaiting{Reason: "ContainerCreating"})
+			e.podEvent("alice", "kueue-offload-executor-1", "FailedMount", tc.msg, e.r.now().Add(-tc.age))
 			// An event about another pod never counts.
 			e.podEvent("alice", "notebook-0", "FailedMount", `secret "other" not found`, e.r.now())
 			e.sync()
-			got := e.namespace("alice").Annotations[AgentAnnotation(testSite)] == MissingCredentials
+			got := e.namespace("alice").Annotations[ExecutorAnnotation(testSite)] == MissingCredentials
 			if got != tc.want {
 				t.Errorf("annotation set %v, want %v", got, tc.want)
 			}

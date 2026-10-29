@@ -56,7 +56,7 @@ func has(list []string, v string) bool {
 
 // TestMembershipRBAC fails when the membership controller's RBAC reaches what
 // the design forbids: anything on Secrets, ConfigMap reads outside its own
-// namespace, escalation, or binding roles other than the agent's.
+// namespace, escalation, or binding roles other than the executor's.
 func TestMembershipRBAC(t *testing.T) {
 	docs := readRBAC(t, "../../config/rbac/membership/*.yaml")
 	sawBind, sawConfigMapRead := false, false
@@ -101,8 +101,8 @@ func TestMembershipRBAC(t *testing.T) {
 			if has(r.Verbs, "bind") {
 				names := append([]string(nil), r.ResourceNames...)
 				sort.Strings(names)
-				if strings.Join(names, ",") != "interlink-agent,system:auth-delegator" || strings.Join(r.Resources, ",") != "clusterroles" {
-					t.Errorf("bind on %v %v, want clusterroles interlink-agent and system:auth-delegator only", r.Resources, r.ResourceNames)
+				if strings.Join(names, ",") != "kueue-offload-executor,system:auth-delegator" || strings.Join(r.Resources, ",") != "clusterroles" {
+					t.Errorf("bind on %v %v, want clusterroles kueue-offload-executor and system:auth-delegator only", r.Resources, r.ResourceNames)
 				}
 				sawBind = true
 			}
@@ -113,14 +113,14 @@ func TestMembershipRBAC(t *testing.T) {
 	}
 }
 
-// TestAgentClusterRole checks the role tenant RoleBindings point at: the agent
+// TestExecutorClusterRole checks the role tenant RoleBindings point at: the executor
 // reads Secrets and ConfigMaps of its namespace and never writes Secrets, mints
 // ServiceAccount tokens without managing ServiceAccounts, and runs its staging
 // Jobs.
-func TestAgentClusterRole(t *testing.T) {
-	docs := readRBAC(t, "../../config/rbac/agent/*.yaml")
-	if len(docs) != 1 || docs[0].Kind != "ClusterRole" || docs[0].Metadata.Name != "interlink-agent" {
-		t.Fatalf("agent role docs %+v", docs)
+func TestExecutorClusterRole(t *testing.T) {
+	docs := readRBAC(t, "../../config/rbac/executor/*.yaml")
+	if len(docs) != 1 || docs[0].Kind != "ClusterRole" || docs[0].Metadata.Name != "kueue-offload-executor" {
+		t.Fatalf("executor role docs %+v", docs)
 	}
 	read := map[string]bool{}
 	patchPods, mintTokens := false, false
@@ -136,7 +136,7 @@ func TestAgentClusterRole(t *testing.T) {
 			mintTokens = true
 		}
 		if has(r.Resources, "serviceaccounts") {
-			t.Errorf("agent may %v serviceaccounts", r.Verbs)
+			t.Errorf("executor may %v serviceaccounts", r.Verbs)
 		}
 		if has(r.Resources, "pods") && has(r.Verbs, "patch") {
 			patchPods = true
@@ -146,10 +146,10 @@ func TestAgentClusterRole(t *testing.T) {
 				t.Errorf("wildcard rule %v", r)
 			}
 			if res == "secrets" && (has(r.Verbs, "create") || has(r.Verbs, "update") || has(r.Verbs, "patch") || has(r.Verbs, "delete")) {
-				t.Errorf("agent may write secrets: %v", r.Verbs)
+				t.Errorf("executor may write secrets: %v", r.Verbs)
 			}
 			if res == "pods" && has(r.Verbs, "create") {
-				t.Errorf("agent may create pods")
+				t.Errorf("executor may create pods")
 			}
 			if has(r.Verbs, "get") {
 				read[res] = true
@@ -158,17 +158,17 @@ func TestAgentClusterRole(t *testing.T) {
 	}
 	for _, res := range []string{"secrets", "configmaps", "pods"} {
 		if !read[res] {
-			t.Errorf("agent cannot read %s", res)
+			t.Errorf("executor cannot read %s", res)
 		}
 	}
 	if !patchPods {
-		t.Errorf("agent cannot patch pods: a node change reaches the shadow only at the kubelet's next ConfigMap refresh")
+		t.Errorf("executor cannot patch pods: a node change reaches the shadow only at the kubelet's next ConfigMap refresh")
 	}
 	if !mintTokens {
-		t.Errorf("agent cannot create serviceaccounts/token: pipeline steps get no token")
+		t.Errorf("executor cannot create serviceaccounts/token: pipeline steps get no token")
 	}
 	sort.Strings(jobVerbs)
 	if got := strings.Join(jobVerbs, ","); got != "create,delete,get,list,watch" {
-		t.Errorf("agent verbs on batch jobs = %s, want create,delete,get,list,watch", got)
+		t.Errorf("executor verbs on batch jobs = %s, want create,delete,get,list,watch", got)
 	}
 }

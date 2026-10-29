@@ -1,4 +1,4 @@
-package dispatcher
+package offload
 
 import (
 	"context"
@@ -18,11 +18,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
-	"github.com/interlink-hq/interlink-dispatch/api/v1alpha1"
-	"github.com/interlink-hq/interlink-dispatch/pkg/agentapi"
+	"github.com/matbun/kueue-offload/api/v1alpha1"
+	"github.com/matbun/kueue-offload/pkg/executorapi"
 )
 
-// Record states the dispatcher writes itself, next to the agent's states.
+// Record states the offload controller writes itself, next to the executor's states.
 const (
 	recordSubmitted = "submitted"
 	recordLost      = "lost"
@@ -30,31 +30,34 @@ const (
 
 // Event reasons on the Workload.
 const (
-	EventSubmitted        = "Submitted"
-	EventSubmitFailed     = "SubmitFailed"
-	EventRunning          = "Running"
-	EventCompleted        = "Completed"
-	EventFailed           = "Failed"
-	EventRetry            = "Retry"
-	EventRejected         = "Rejected"
-	EventAgentUnreachable = "AgentUnreachable"
+	EventSubmitted           = "Submitted"
+	EventSubmitFailed        = "SubmitFailed"
+	EventRunning             = "Running"
+	EventCompleted           = "Completed"
+	EventFailed              = "Failed"
+	EventRetry               = "Retry"
+	EventRejected            = "Rejected"
+	EventExecutorUnreachable = "ExecutorUnreachable"
 )
 
-const maxSubmitBackoff = 5 * time.Minute
+// maxSubmitBackoff caps the wait between submits the executor refused for now. The
+// usual cause is a site limit on submitted jobs per user, which ends when the user's
+// other job ends: a minute keeps the slot from staying idle long.
+const maxSubmitBackoff = time.Minute
 
-// WorkloadReconciler drives the dispatcher's admission check on Workloads.
+// WorkloadReconciler drives the offload controller's admission check on Workloads.
 type WorkloadReconciler struct {
 	// Client reads from the cache and writes to the API server.
 	Client client.Client
-	// APIReader reads objects the dispatcher may only get: Jobs, pods and
+	// APIReader reads objects the offload controller may only get: Jobs, pods and
 	// Namespaces.
 	APIReader client.Reader
 	Checks    CheckWriter
-	Agent     *AgentClient
+	Executor  *ExecutorClient
 	Recorder  events.EventRecorder
-	// Site is the SiteConfig name.
+	// Site is the OffloadConfig name.
 	Site string
-	// Namespace holds the SubmitRecords.
+	// Namespace holds the OffloadRecords.
 	Namespace string
 	Now       func() time.Time
 
@@ -70,10 +73,10 @@ func (r *WorkloadReconciler) now() time.Time {
 }
 
 func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	sc := &v1alpha1.SiteConfig{}
+	sc := &v1alpha1.OffloadConfig{}
 	if err := r.Client.Get(ctx, types.NamespacedName{Name: r.Site}, sc); err != nil {
 		if apierrors.IsNotFound(err) {
-			log.FromContext(ctx).Info("SiteConfig not found", "site", r.Site)
+			log.FromContext(ctx).Info("OffloadConfig not found", "site", r.Site)
 			return ctrl.Result{RequeueAfter: time.Minute}, nil
 		}
 		return ctrl.Result{}, err
@@ -157,14 +160,14 @@ func (r *WorkloadReconciler) ourCheck(ctx context.Context, wl *kueue.Workload) (
 	return "", nil
 }
 
-// servesCheck reports whether ac is an interlink-dispatch check naming site.
+// servesCheck reports whether ac is an kueue-offload check naming site.
 func servesCheck(ac *kueue.AdmissionCheck, site string) bool {
 	p := ac.Spec.Parameters
 	return ac.Spec.ControllerName == ControllerName && p != nil &&
-		p.APIGroup == v1alpha1.GroupVersion.Group && p.Kind == "SiteConfig" && p.Name == site
+		p.APIGroup == v1alpha1.GroupVersion.Group && p.Kind == "OffloadConfig" && p.Name == site
 }
 
-func (r *WorkloadReconciler) submit(ctx context.Context, s site, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, owner *workloadOwner, rec *v1alpha1.SubmitRecord) (ctrl.Result, error) {
+func (r *WorkloadReconciler) submit(ctx context.Context, s site, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, owner *workloadOwner, rec *v1alpha1.OffloadRecord) (ctrl.Result, error) {
 	ownerRef, ownerAnnotations, err := readOwner(ctx, r.APIReader, wl.Namespace, owner)
 	if err != nil || ownerRef == nil {
 		return ctrl.Result{}, err
@@ -181,20 +184,20 @@ func (r *WorkloadReconciler) submit(ctx context.Context, s site, wl *kueue.Workl
 	if err != nil {
 		return ctrl.Result{}, r.reject(ctx, wl, checkName, rec, owner, err.Error())
 	}
-	endpoint := s.agentEndpoint(ns)
+	endpoint := s.executorEndpoint(ns)
 
-	// The record exists before the call: a dispatcher that dies before storing
-	// the job ID submits again, and the agent answers with the existing job.
+	// The record exists before the call: an offload controller that dies before storing
+	// the job ID submits again, and the executor answers with the existing job.
 	if rec == nil {
-		rec = &v1alpha1.SubmitRecord{
+		rec = &v1alpha1.OffloadRecord{
 			ObjectMeta: metav1.ObjectMeta{Name: string(wl.UID), Namespace: r.Namespace},
 		}
 	}
-	spec := v1alpha1.SubmitRecordSpec{
-		Workload:      v1alpha1.WorkloadReference{Namespace: wl.Namespace, Name: wl.Name},
-		Site:          r.Site,
-		Account:       account,
-		AgentEndpoint: endpoint,
+	spec := v1alpha1.OffloadRecordSpec{
+		Workload:         v1alpha1.WorkloadReference{Namespace: wl.Namespace, Name: wl.Name},
+		Site:             r.Site,
+		Account:          account,
+		ExecutorEndpoint: endpoint,
 	}
 	if rec.CreationTimestamp.IsZero() && rec.ResourceVersion == "" {
 		rec.Spec = spec
@@ -208,8 +211,8 @@ func (r *WorkloadReconciler) submit(ctx context.Context, s site, wl *kueue.Workl
 		}
 	}
 
-	req := &agentapi.SubmitRequest{
-		APIVersion:   agentapi.APIVersion,
+	req := &executorapi.SubmitRequest{
+		APIVersion:   executorapi.APIVersion,
 		WorkloadUID:  string(wl.UID),
 		WorkloadName: wl.Name,
 		Namespace:    wl.Namespace,
@@ -219,11 +222,11 @@ func (r *WorkloadReconciler) submit(ctx context.Context, s site, wl *kueue.Workl
 		PodSets:      podSets,
 	}
 	start := time.Now()
-	resp, created, err := r.Agent.Submit(ctx, endpoint, req)
+	resp, created, err := r.Executor.Submit(ctx, endpoint, req)
 	submitLatency.WithLabelValues(r.Site, submitOutcome(created, err)).Observe(time.Since(start).Seconds())
 	if err != nil {
 		if IsPermanent(err) {
-			return ctrl.Result{}, r.reject(ctx, wl, checkName, rec, owner, agentMessage(err))
+			return ctrl.Result{}, r.reject(ctx, wl, checkName, rec, owner, executorMessage(err))
 		}
 		r.Recorder.Eventf(wl, nil, corev1.EventTypeWarning, EventSubmitFailed, "Submit", "submit to %s failed: %v", endpoint, err)
 		return ctrl.Result{RequeueAfter: r.backoff(wl.UID)}, nil
@@ -246,16 +249,16 @@ func (r *WorkloadReconciler) submit(ctx context.Context, s site, wl *kueue.Workl
 	return ctrl.Result{RequeueAfter: s.pollInterval}, nil
 }
 
-func (r *WorkloadReconciler) poll(ctx context.Context, s site, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, owner *workloadOwner, rec *v1alpha1.SubmitRecord) (ctrl.Result, error) {
+func (r *WorkloadReconciler) poll(ctx context.Context, s site, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, owner *workloadOwner, rec *v1alpha1.OffloadRecord) (ctrl.Result, error) {
 	switch rec.Status.State {
-	case agentapi.StateCompleted, agentapi.StateFailed:
+	case executorapi.StateCompleted, executorapi.StateFailed:
 		// The owner was patched; Kueue has not marked the Workload Finished yet.
 		return ctrl.Result{}, nil
-	case agentapi.StateRejected:
+	case executorapi.StateRejected:
 		return ctrl.Result{}, nil
 	}
 
-	st, err := r.Agent.GetJob(ctx, rec.Spec.AgentEndpoint, string(wl.UID))
+	st, err := r.Executor.GetJob(ctx, rec.Spec.ExecutorEndpoint, string(wl.UID))
 	now := r.now()
 	if err != nil && !IsNotFound(err) {
 		if rec.Status.FirstUnreachable == nil {
@@ -263,16 +266,16 @@ func (r *WorkloadReconciler) poll(ctx context.Context, s site, wl *kueue.Workloa
 			if err := r.Client.Status().Update(ctx, rec); err != nil {
 				return ctrl.Result{}, err
 			}
-			r.Recorder.Eventf(wl, nil, corev1.EventTypeWarning, EventAgentUnreachable, "Poll", "agent %s: %v", rec.Spec.AgentEndpoint, err)
-		} else if now.Sub(rec.Status.FirstUnreachable.Time) >= s.agentLostTimeout {
-			msg := fmt.Sprintf("agent %s unreachable since %s: %v", rec.Spec.AgentEndpoint,
+			r.Recorder.Eventf(wl, nil, corev1.EventTypeWarning, EventExecutorUnreachable, "Poll", "executor %s: %v", rec.Spec.ExecutorEndpoint, err)
+		} else if now.Sub(rec.Status.FirstUnreachable.Time) >= s.executorLostTimeout {
+			msg := fmt.Sprintf("executor %s unreachable since %s: %v", rec.Spec.ExecutorEndpoint,
 				rec.Status.FirstUnreachable.UTC().Format(time.RFC3339), err)
 			return ctrl.Result{}, r.retry(ctx, s, wl, checkName, owner, rec, recordLost, msg, false)
 		}
 		return ctrl.Result{RequeueAfter: s.pollInterval}, nil
 	}
 	if IsNotFound(err) {
-		st = &agentapi.JobStatus{State: agentapi.StateCancelled, Message: "the agent has no record of the job"}
+		st = &executorapi.JobStatus{State: executorapi.StateCancelled, Message: "the executor has no record of the job"}
 	}
 
 	prevState, prevNode := rec.Status.State, rec.Status.NodeName
@@ -281,12 +284,12 @@ func (r *WorkloadReconciler) poll(ctx context.Context, s site, wl *kueue.Workloa
 
 	jobID := rec.Status.JobID
 	switch st.State {
-	case agentapi.StateQueued, agentapi.StateRunning:
+	case executorapi.StateQueued, executorapi.StateRunning:
 		msg := fmt.Sprintf("Slurm job %s queued", jobID)
 		if st.Reason != "" {
 			msg += " (" + st.Reason + ")"
 		}
-		if st.State == agentapi.StateRunning {
+		if st.State == executorapi.StateRunning {
 			msg = fmt.Sprintf("Slurm job %s running on %s", jobID, st.NodeName)
 			if st.StartTime != nil {
 				msg += " since " + st.StartTime.UTC().Format(time.RFC3339)
@@ -299,13 +302,13 @@ func (r *WorkloadReconciler) poll(ctx context.Context, s site, wl *kueue.Workloa
 		if err := r.setCheck(ctx, wl, checkName, kueue.CheckStatePending, msg); err != nil {
 			return ctrl.Result{}, err
 		}
-		if st.State == agentapi.StateRunning && (prevState != agentapi.StateRunning || prevNode != st.NodeName) {
+		if st.State == executorapi.StateRunning && (prevState != executorapi.StateRunning || prevNode != st.NodeName) {
 			r.Recorder.Eventf(wl, nil, corev1.EventTypeNormal, EventRunning, "Poll", "%s", msg)
 		}
 		return ctrl.Result{RequeueAfter: s.pollInterval}, nil
 
-	case agentapi.StateCompleted, agentapi.StateFailed:
-		succeeded := st.State == agentapi.StateCompleted
+	case executorapi.StateCompleted, executorapi.StateFailed:
+		succeeded := st.State == executorapi.StateCompleted
 		msg := fmt.Sprintf("Slurm job %s completed", jobID)
 		if !succeeded {
 			msg = fmt.Sprintf("Slurm job %s failed", jobID)
@@ -313,7 +316,7 @@ func (r *WorkloadReconciler) poll(ctx context.Context, s site, wl *kueue.Workloa
 				msg += ": " + st.Message
 			}
 		}
-		o := jobOutcome{succeeded: succeeded, reason: ReasonDispatch, message: msg,
+		o := jobOutcome{succeeded: succeeded, reason: ReasonOffload, message: msg,
 			startTime: st.StartTime, completionTime: st.CompletionTime, exitCodes: exitCodes(st)}
 		if err := finishOwner(ctx, r.Client, r.APIReader, wl.Namespace, owner, o, now); err != nil {
 			return ctrl.Result{}, err
@@ -335,14 +338,14 @@ func (r *WorkloadReconciler) poll(ctx context.Context, s site, wl *kueue.Workloa
 		r.Recorder.Eventf(wl, nil, ty, reason, "Poll", "%s", msg)
 		return ctrl.Result{}, nil
 
-	case agentapi.StateCancelled:
+	case executorapi.StateCancelled:
 		msg := fmt.Sprintf("Slurm job %s cancelled", jobID)
 		if st.Message != "" {
 			msg += ": " + st.Message
 		}
-		return ctrl.Result{}, r.retry(ctx, s, wl, checkName, owner, rec, agentapi.StateCancelled, msg, true)
+		return ctrl.Result{}, r.retry(ctx, s, wl, checkName, owner, rec, executorapi.StateCancelled, msg, true)
 
-	case agentapi.StateRejected:
+	case executorapi.StateRejected:
 		msg := st.Message
 		if msg == "" {
 			msg = fmt.Sprintf("Slurm job %s rejected", jobID)
@@ -350,7 +353,7 @@ func (r *WorkloadReconciler) poll(ctx context.Context, s site, wl *kueue.Workloa
 		return ctrl.Result{}, r.reject(ctx, wl, checkName, rec, owner, msg)
 	}
 
-	log.FromContext(ctx).Info("unknown job state from agent", "state", st.State)
+	log.FromContext(ctx).Info("unknown job state from executor", "state", st.State)
 	if err := r.Client.Status().Update(ctx, rec); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -359,9 +362,9 @@ func (r *WorkloadReconciler) poll(ctx context.Context, s site, wl *kueue.Workloa
 
 // retry gives up on the current job and asks Kueue to requeue the Workload,
 // or rejects it once maxRetries resubmissions were spent.
-func (r *WorkloadReconciler) retry(ctx context.Context, s site, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, owner *workloadOwner, rec *v1alpha1.SubmitRecord, state, msg string, deleteJob bool) error {
+func (r *WorkloadReconciler) retry(ctx context.Context, s site, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, owner *workloadOwner, rec *v1alpha1.OffloadRecord, state, msg string, deleteJob bool) error {
 	if deleteJob {
-		if err := r.Agent.DeleteJob(ctx, rec.Spec.AgentEndpoint, string(wl.UID)); err != nil {
+		if err := r.Executor.DeleteJob(ctx, rec.Spec.ExecutorEndpoint, string(wl.UID)); err != nil {
 			return fmt.Errorf("deleting cancelled job: %w", err)
 		}
 	}
@@ -383,8 +386,8 @@ func (r *WorkloadReconciler) retry(ctx context.Context, s site, wl *kueue.Worklo
 	return nil
 }
 
-// reject writes Rejected and, when the dispatcher handles the owner, fails it.
-func (r *WorkloadReconciler) reject(ctx context.Context, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, rec *v1alpha1.SubmitRecord, owner *workloadOwner, msg string) error {
+// reject writes Rejected and, when the offload controller handles the owner, fails it.
+func (r *WorkloadReconciler) reject(ctx context.Context, wl *kueue.Workload, checkName kueue.AdmissionCheckReference, rec *v1alpha1.OffloadRecord, owner *workloadOwner, msg string) error {
 	if owner != nil {
 		o := jobOutcome{reason: ReasonRejected, message: msg}
 		if err := finishOwner(ctx, r.Client, r.APIReader, wl.Namespace, owner, o, r.now()); err != nil {
@@ -392,7 +395,7 @@ func (r *WorkloadReconciler) reject(ctx context.Context, wl *kueue.Workload, che
 		}
 	}
 	if rec != nil && rec.ResourceVersion != "" {
-		rec.Status.State, rec.Status.Message = agentapi.StateRejected, msg
+		rec.Status.State, rec.Status.Message = executorapi.StateRejected, msg
 		if err := r.Client.Status().Update(ctx, rec); err != nil {
 			return err
 		}
@@ -404,9 +407,9 @@ func (r *WorkloadReconciler) reject(ctx context.Context, wl *kueue.Workload, che
 	return nil
 }
 
-// releaseJob deletes the agent's job of a Workload that lost its reservation.
-func (r *WorkloadReconciler) releaseJob(ctx context.Context, wl *kueue.Workload, rec *v1alpha1.SubmitRecord) error {
-	if err := r.Agent.DeleteJob(ctx, rec.Spec.AgentEndpoint, string(wl.UID)); err != nil {
+// releaseJob deletes the executor's job of a Workload that lost its reservation.
+func (r *WorkloadReconciler) releaseJob(ctx context.Context, wl *kueue.Workload, rec *v1alpha1.OffloadRecord) error {
+	if err := r.Executor.DeleteJob(ctx, rec.Spec.ExecutorEndpoint, string(wl.UID)); err != nil {
 		return fmt.Errorf("deleting job of evicted workload: %w", err)
 	}
 	rec.Status.JobID, rec.Status.NodeName = "", ""
@@ -442,9 +445,9 @@ func (r *WorkloadReconciler) setCheck(ctx context.Context, wl *kueue.Workload, n
 	return nil
 }
 
-// record returns this site's SubmitRecord for a Workload UID, or nil.
-func (r *WorkloadReconciler) record(ctx context.Context, uid types.UID) (*v1alpha1.SubmitRecord, error) {
-	rec := &v1alpha1.SubmitRecord{}
+// record returns this site's OffloadRecord for a Workload UID, or nil.
+func (r *WorkloadReconciler) record(ctx context.Context, uid types.UID) (*v1alpha1.OffloadRecord, error) {
+	rec := &v1alpha1.OffloadRecord{}
 	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: r.Namespace, Name: string(uid)}, rec); err != nil {
 		return nil, client.IgnoreNotFound(err)
 	}
@@ -456,7 +459,7 @@ func (r *WorkloadReconciler) record(ctx context.Context, uid types.UID) (*v1alph
 
 // cleanupByName handles a deleted Workload seen by the watch.
 func (r *WorkloadReconciler) cleanupByName(ctx context.Context, key types.NamespacedName) error {
-	list := &v1alpha1.SubmitRecordList{}
+	list := &v1alpha1.OffloadRecordList{}
 	if err := r.Client.List(ctx, list, client.InNamespace(r.Namespace)); err != nil {
 		return err
 	}
@@ -470,10 +473,10 @@ func (r *WorkloadReconciler) cleanupByName(ctx context.Context, key types.Namesp
 	return errors.Join(errs...)
 }
 
-// cleanupRecord deletes the agent's job and the record of a Workload that is
+// cleanupRecord deletes the executor's job and the record of a Workload that is
 // gone (design D7).
-func (r *WorkloadReconciler) cleanupRecord(ctx context.Context, rec *v1alpha1.SubmitRecord) error {
-	if err := r.Agent.DeleteJob(ctx, rec.Spec.AgentEndpoint, rec.Name); err != nil {
+func (r *WorkloadReconciler) cleanupRecord(ctx context.Context, rec *v1alpha1.OffloadRecord) error {
+	if err := r.Executor.DeleteJob(ctx, rec.Spec.ExecutorEndpoint, rec.Name); err != nil {
 		return fmt.Errorf("deleting job of removed workload %s/%s: %w", rec.Spec.Workload.Namespace, rec.Spec.Workload.Name, err)
 	}
 	return client.IgnoreNotFound(r.Client.Delete(ctx, rec))
@@ -481,7 +484,7 @@ func (r *WorkloadReconciler) cleanupRecord(ctx context.Context, rec *v1alpha1.Su
 
 // GarbageCollect removes the records whose Workload no longer exists.
 func (r *WorkloadReconciler) GarbageCollect(ctx context.Context) error {
-	list := &v1alpha1.SubmitRecordList{}
+	list := &v1alpha1.OffloadRecordList{}
 	if err := r.Client.List(ctx, list, client.InNamespace(r.Namespace)); err != nil {
 		return err
 	}
@@ -536,8 +539,8 @@ func findCheck(wl *kueue.Workload, name kueue.AdmissionCheckReference) *kueue.Ad
 	return nil
 }
 
-func agentMessage(err error) string {
-	var ae *AgentError
+func executorMessage(err error) string {
+	var ae *ExecutorError
 	if errors.As(err, &ae) && ae.Message != "" {
 		return ae.Message
 	}
@@ -545,7 +548,7 @@ func agentMessage(err error) string {
 }
 
 func submitOutcome(created bool, err error) string {
-	var ae *AgentError
+	var ae *ExecutorError
 	switch {
 	case err == nil && created:
 		return "created"

@@ -1,5 +1,5 @@
-// Command dispatcher is the Kueue admission check controller that submits
-// admitted Workloads to an HPC site through the per-namespace agents.
+// Command offload-controller is the Kueue admission check controller that submits
+// admitted Workloads to an HPC site through the per-namespace executors.
 package main
 
 import (
@@ -19,8 +19,8 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
-	"github.com/interlink-hq/interlink-dispatch/api/v1alpha1"
-	"github.com/interlink-hq/interlink-dispatch/pkg/dispatcher"
+	"github.com/matbun/kueue-offload/api/v1alpha1"
+	"github.com/matbun/kueue-offload/pkg/offload"
 )
 
 func main() {
@@ -28,16 +28,16 @@ func main() {
 		site, namespace, tokenFile string
 		metricsAddr, probeAddr     string
 		leaderElect                bool
-		resync, agentTimeout       time.Duration
+		resync, executorTimeout    time.Duration
 	)
-	flag.StringVar(&site, "site", "", "name of the SiteConfig this dispatcher serves")
-	flag.StringVar(&namespace, "namespace", "interlink-dispatch", "namespace of the SubmitRecords")
-	flag.StringVar(&tokenFile, "token-file", "/var/run/secrets/interlink/token", "bearer token sent to the agents")
+	flag.StringVar(&site, "site", "", "name of the OffloadConfig this offload controller serves")
+	flag.StringVar(&namespace, "namespace", "kueue-offload", "namespace of the OffloadRecords")
+	flag.StringVar(&tokenFile, "token-file", "/var/run/secrets/interlink/token", "bearer token sent to the executors")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "metrics endpoint address, 0 disables it")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "health probe address")
 	flag.BoolVar(&leaderElect, "leader-elect", false, "enable leader election")
-	flag.DurationVar(&resync, "resync-interval", time.Minute, "how often SubmitRecords of deleted Workloads are cleaned up")
-	flag.DurationVar(&agentTimeout, "agent-timeout", 30*time.Second, "timeout of one call to an agent")
+	flag.DurationVar(&resync, "resync-interval", time.Minute, "how often OffloadRecords of deleted Workloads are cleaned up")
+	flag.DurationVar(&executorTimeout, "executor-timeout", 30*time.Second, "timeout of one call to an executor")
 	opts := zap.Options{}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -59,10 +59,10 @@ func main() {
 		Metrics:                 metricsserver.Options{BindAddress: metricsAddr},
 		HealthProbeBindAddress:  probeAddr,
 		LeaderElection:          leaderElect,
-		LeaderElectionID:        "interlink-dispatch-" + site,
+		LeaderElectionID:        "kueue-offload-" + site,
 		LeaderElectionNamespace: namespace,
 		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
-			&v1alpha1.SubmitRecord{}: {Namespaces: map[string]cache.Config{namespace: {}}},
+			&v1alpha1.OffloadRecord{}: {Namespaces: map[string]cache.Config{namespace: {}}},
 		}},
 	})
 	if err != nil {
@@ -70,16 +70,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	agent := &dispatcher.AgentClient{
-		HTTP:  &http.Client{Timeout: agentTimeout},
-		Token: &dispatcher.TokenSource{Path: tokenFile},
+	executor := &offload.ExecutorClient{
+		HTTP:  &http.Client{Timeout: executorTimeout},
+		Token: &offload.TokenSource{Path: tokenFile},
 	}
-	wr := &dispatcher.WorkloadReconciler{
+	wr := &offload.WorkloadReconciler{
 		Client:    mgr.GetClient(),
 		APIReader: mgr.GetAPIReader(),
-		Checks:    &dispatcher.SSACheckWriter{Client: mgr.GetClient()},
-		Agent:     agent,
-		Recorder:  mgr.GetEventRecorder("interlink-dispatch"),
+		Checks:    &offload.SSACheckWriter{Client: mgr.GetClient()},
+		Executor:  executor,
+		Recorder:  mgr.GetEventRecorder("kueue-offload"),
 		Site:      site,
 		Namespace: namespace,
 	}
@@ -87,7 +87,7 @@ func main() {
 		logger.Error(err, "setting up workload controller")
 		os.Exit(1)
 	}
-	if err := (&dispatcher.AdmissionCheckReconciler{Client: mgr.GetClient(), Site: site}).SetupWithManager(mgr); err != nil {
+	if err := (&offload.AdmissionCheckReconciler{Client: mgr.GetClient(), Site: site}).SetupWithManager(mgr); err != nil {
 		logger.Error(err, "setting up admission check controller")
 		os.Exit(1)
 	}

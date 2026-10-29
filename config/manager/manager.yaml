@@ -1,35 +1,35 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: interlink-dispatch-hpc-a
-  namespace: interlink-dispatch
+  name: kueue-offload-hpc-a
+  namespace: kueue-offload
   labels:
-    app: interlink-dispatch
+    app: kueue-offload
     interlink.eu/site: hpc-a
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: interlink-dispatch
+      app: kueue-offload
       interlink.eu/site: hpc-a
   template:
     metadata:
       labels:
-        app: interlink-dispatch
+        app: kueue-offload
         interlink.eu/site: hpc-a
     spec:
-      serviceAccountName: interlink-dispatch
+      serviceAccountName: kueue-offload
       securityContext:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       containers:
-      - name: dispatcher
-        image: interlink-dispatch:latest
-        command: [/dispatcher]
+      - name: offload-controller
+        image: kueue-offload:latest
+        command: [/offload-controller]
         args:
         - --site=hpc-a
-        - --namespace=interlink-dispatch
+        - --namespace=kueue-offload
         - --token-file=/var/run/secrets/interlink/token
         - --metrics-bind-address=:8080
         - --health-probe-bind-address=:8081
@@ -58,6 +58,6 @@ spec:
         projected:
           sources:
           - serviceAccountToken:
-              audience: interlink-agent
+              audience: kueue-offload-executor
               expirationSeconds: 3600
               path: token

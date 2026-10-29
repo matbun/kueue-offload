@@ -1,4 +1,4 @@
-package dispatcher
+package offload
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
-	"github.com/interlink-hq/interlink-dispatch/api/v1alpha1"
+	"github.com/matbun/kueue-offload/api/v1alpha1"
 )
 
 // AdmissionCheckReconciler marks this site's AdmissionChecks Active, which
@@ -34,16 +34,16 @@ func (r *AdmissionCheckReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		Type:               kueue.AdmissionCheckActive,
 		Status:             metav1.ConditionTrue,
 		Reason:             "Active",
-		Message:            fmt.Sprintf("interlink-dispatch serves site %s", r.Site),
+		Message:            fmt.Sprintf("kueue-offload serves site %s", r.Site),
 		ObservedGeneration: ac.Generation,
 	}
-	if err := r.Client.Get(ctx, types.NamespacedName{Name: r.Site}, &v1alpha1.SiteConfig{}); err != nil {
+	if err := r.Client.Get(ctx, types.NamespacedName{Name: r.Site}, &v1alpha1.OffloadConfig{}); err != nil {
 		if !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
 		}
 		cond.Status = metav1.ConditionFalse
-		cond.Reason = "SiteConfigNotFound"
-		cond.Message = fmt.Sprintf("SiteConfig %s does not exist", r.Site)
+		cond.Reason = "OffloadConfigNotFound"
+		cond.Message = fmt.Sprintf("OffloadConfig %s does not exist", r.Site)
 	}
 	orig := ac.DeepCopy()
 	if !meta.SetStatusCondition(&ac.Status.Conditions, cond) {
@@ -52,12 +52,12 @@ func (r *AdmissionCheckReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	return ctrl.Result{}, r.Client.Status().Patch(ctx, ac, client.MergeFrom(orig))
 }
 
-// SetupWithManager registers the reconciler. A change to the SiteConfig
+// SetupWithManager registers the reconciler. A change to the OffloadConfig
 // re-evaluates every AdmissionCheck.
 func (r *AdmissionCheckReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("admissioncheck").
 		For(&kueue.AdmissionCheck{}).
-		Watches(&v1alpha1.SiteConfig{}, handlerAllChecks(r.Client)).
+		Watches(&v1alpha1.OffloadConfig{}, handlerAllChecks(r.Client)).
 		Complete(r)
 }

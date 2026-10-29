@@ -5,32 +5,32 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 )
 
-// SiteConfigSpec configures the dispatcher of one site. An AdmissionCheck with
-// controllerName interlink.eu/dispatch selects it through its parameters.
-type SiteConfigSpec struct {
-	// agentService is the name of the agent Service in every tenant namespace.
-	// +kubebuilder:default=interlink-agent
+// OffloadConfigSpec configures the offload controller of one site. An AdmissionCheck with
+// controllerName interlink.eu/offload selects it through its parameters.
+type OffloadConfigSpec struct {
+	// executorService is the name of the executor Service in every tenant namespace.
+	// +kubebuilder:default=kueue-offload-executor
 	// +optional
-	AgentService string `json:"agentService,omitempty"`
+	ExecutorService string `json:"executorService,omitempty"`
 
-	// agentPort is the port of the agent Service.
+	// executorPort is the port of the executor Service.
 	// +kubebuilder:default=8000
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
 	// +optional
-	AgentPort int32 `json:"agentPort,omitempty"`
+	ExecutorPort int32 `json:"executorPort,omitempty"`
 
-	// pollInterval is how often the dispatcher asks the agent for the state of
+	// pollInterval is how often the offload controller asks the executor for the state of
 	// a submitted job.
 	// +kubebuilder:default="15s"
 	// +optional
 	PollInterval *metav1.Duration `json:"pollInterval,omitempty"`
 
-	// agentLostTimeout is how long an agent may stay unreachable before the
+	// executorLostTimeout is how long an executor may stay unreachable before the
 	// check is set to Retry.
 	// +kubebuilder:default="10m"
 	// +optional
-	AgentLostTimeout *metav1.Duration `json:"agentLostTimeout,omitempty"`
+	ExecutorLostTimeout *metav1.Duration `json:"executorLostTimeout,omitempty"`
 
 	// maxRetries bounds how many times a job cancelled on the site is
 	// resubmitted before the check is Rejected.
@@ -43,12 +43,15 @@ type SiteConfigSpec struct {
 	// +optional
 	AccountRule AccountRule `json:"accountRule,omitempty"`
 
-	// flavorPartitions maps a ResourceFlavor name to a Slurm partition. A
-	// flavor that is not listed gives no --partition flag.
+	// flavors maps a ResourceFlavor name to the Slurm queue its quota stands for:
+	// a partition and a QOS. A project with several queues on one machine (say a
+	// debug, a production and an interactive QOS) is one ClusterQueue with one
+	// flavor each, and the flavor Kueue assigns decides where the job is submitted.
+	// A flavor that is not listed gives neither flag.
 	// +optional
-	FlavorPartitions map[string]string `json:"flavorPartitions,omitempty"`
+	Flavors map[string]FlavorTarget `json:"flavors,omitempty"`
 
-	// alwaysShadow asks the agents to render a shadow for every job, also for
+	// alwaysShadow asks the executors to render a shadow for every job, also for
 	// jobs without exposed ports, so that logs are always reachable.
 	// +optional
 	AlwaysShadow bool `json:"alwaysShadow,omitempty"`
@@ -62,10 +65,20 @@ type SiteConfigSpec struct {
 	Membership *Membership `json:"membership,omitempty"`
 }
 
+// FlavorTarget is the Slurm queue a ResourceFlavor stands for.
+type FlavorTarget struct {
+	// partition is passed as --partition; empty gives no flag.
+	// +optional
+	Partition string `json:"partition,omitempty"`
+	// qos is passed as --qos; empty gives no flag.
+	// +optional
+	QOS string `json:"qos,omitempty"`
+}
+
 // AccountRule derives a Slurm account from a ClusterQueue name.
 type AccountRule struct {
 	// stripPrefix is removed from the ClusterQueue name to give the account.
-	// Unset means "<site>-", where site is the SiteConfig name. A ClusterQueue
+	// Unset means "<site>-", where site is the OffloadConfig name. A ClusterQueue
 	// whose name does not start with the prefix is rejected.
 	// +optional
 	StripPrefix *string `json:"stripPrefix,omitempty"`
@@ -83,21 +96,21 @@ type Membership struct {
 	// Rows with an empty user are account rows and are skipped.
 	Associations ConfigMapKeyRef `json:"associations"`
 
-	// agentTemplate holds a Go text/template that renders the agent objects
+	// executorTemplate holds a Go text/template that renders the executor objects
 	// of one tenant namespace as multi-document YAML. It may produce only
-	// namespaced objects. Unset means no agent objects are rendered.
+	// namespaced objects. Unset means no executor objects are rendered.
 	// +optional
-	AgentTemplate *ConfigMapKeyRef `json:"agentTemplate,omitempty"`
+	ExecutorTemplate *ConfigMapKeyRef `json:"executorTemplate,omitempty"`
 
-	// agentImage is passed to the agent template as .Image.
+	// executorImage is passed to the executor template as .Image.
 	// +optional
-	AgentImage string `json:"agentImage,omitempty"`
+	ExecutorImage string `json:"executorImage,omitempty"`
 
-	// agentTokenReview also binds every ServiceAccount the agent template
+	// executorTokenReview also binds every ServiceAccount the executor template
 	// renders to system:auth-delegator, with one ClusterRoleBinding per tenant
-	// namespace, so that the agent can validate the dispatcher's token.
+	// namespace, so that the executor can validate the offload controller's token.
 	// +optional
-	AgentTokenReview bool `json:"agentTokenReview,omitempty"`
+	ExecutorTokenReview bool `json:"executorTokenReview,omitempty"`
 
 	// cohort is the Kueue Cohort of the site's ClusterQueues. Unset means the
 	// site name.
@@ -135,27 +148,27 @@ type ConfigMapKeyRef struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster
-// +kubebuilder:printcolumn:name="Agent",type=string,JSONPath=`.spec.agentService`
+// +kubebuilder:printcolumn:name="Executor",type=string,JSONPath=`.spec.executorService`
 // +kubebuilder:printcolumn:name="Poll",type=string,JSONPath=`.spec.pollInterval`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// SiteConfig is the configuration of one HPC site for the dispatcher.
-type SiteConfig struct {
+// OffloadConfig is the configuration of one HPC site for the offload controller.
+type OffloadConfig struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec SiteConfigSpec `json:"spec,omitempty"`
+	Spec OffloadConfigSpec `json:"spec,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 
-// SiteConfigList is a list of SiteConfig.
-type SiteConfigList struct {
+// OffloadConfigList is a list of OffloadConfig.
+type OffloadConfigList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []SiteConfig `json:"items"`
+	Items           []OffloadConfig `json:"items"`
 }
 
 func init() {
-	SchemeBuilder.Register(&SiteConfig{}, &SiteConfigList{})
+	SchemeBuilder.Register(&OffloadConfig{}, &OffloadConfigList{})
 }

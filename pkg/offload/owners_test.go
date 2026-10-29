@@ -1,4 +1,4 @@
-package dispatcher
+package offload
 
 import (
 	"net/http"
@@ -7,7 +7,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
-	"github.com/interlink-hq/interlink-dispatch/pkg/agentapi"
+	"github.com/matbun/kueue-offload/pkg/executorapi"
 )
 
 var customKinds = []ownerKind{jobSetKind, trainJobKind}
@@ -40,11 +40,11 @@ func TestCustomOwnerSubmit(t *testing.T) {
 		t.Run(k.gvk.Kind, func(t *testing.T) {
 			e := newEnv(t, customOwned(k))
 			e.reconcile()
-			if s, _, _ := e.agent.counts(); s != 1 {
+			if s, _, _ := e.executor.counts(); s != 1 {
 				t.Fatalf("submits = %d, want 1", s)
 			}
-			req := e.agent.submits[0]
-			want := agentapi.OwnerReference{APIVersion: k.gvk.GroupVersion().String(), Kind: k.gvk.Kind, Name: "train", UID: string(customUID)}
+			req := e.executor.submits[0]
+			want := executorapi.OwnerReference{APIVersion: k.gvk.GroupVersion().String(), Kind: k.gvk.Kind, Name: "train", UID: string(customUID)}
 			if req.Owner != want {
 				t.Errorf("owner = %+v, want %+v", req.Owner, want)
 			}
@@ -68,21 +68,21 @@ func TestCustomOwnerSubmit(t *testing.T) {
 func TestCustomOwnerTerminal(t *testing.T) {
 	cases := []struct {
 		name     string
-		job      agentapi.JobStatus
+		job      executorapi.JobStatus
 		failed   bool
 		terminal string
 		message  string
 	}{
-		{"completed", agentapi.JobStatus{State: agentapi.StateCompleted}, false, "Completed", "Slurm job 123 completed"},
-		{"failed", agentapi.JobStatus{State: agentapi.StateFailed, Message: "rank 1 exited 3"}, true, "Failed", "Slurm job 123 failed: rank 1 exited 3"},
+		{"completed", executorapi.JobStatus{State: executorapi.StateCompleted}, false, "Completed", "Slurm job 123 completed"},
+		{"failed", executorapi.JobStatus{State: executorapi.StateFailed, Message: "rank 1 exited 3"}, true, "Failed", "Slurm job 123 failed: rank 1 exited 3"},
 	}
 	for _, k := range customKinds {
 		for _, tc := range cases {
 			t.Run(k.gvk.Kind+"/"+tc.name, func(t *testing.T) {
 				e := newEnv(t, customOwned(k))
 				e.reconcile()
-				tc.job.APIVersion, tc.job.JobID = agentapi.APIVersion, "123"
-				e.agent.set(func(a *fakeAgent) { a.job = tc.job })
+				tc.job.APIVersion, tc.job.JobID = executorapi.APIVersion, "123"
+				e.executor.set(func(a *fakeExecutor) { a.job = tc.job })
 				e.reconcile()
 				u := e.custom(k)
 				types := terminalTypes[k.gvk.Kind]
@@ -91,8 +91,8 @@ func TestCustomOwnerTerminal(t *testing.T) {
 					ty, other = other, ty
 				}
 				c := condition(t, u, ty)
-				if c == nil || c["status"] != "True" || c["reason"] != ReasonDispatch || c["message"] != tc.message || c["lastTransitionTime"] == nil {
-					t.Errorf("condition %s = %v, want True %s %q", ty, c, ReasonDispatch, tc.message)
+				if c == nil || c["status"] != "True" || c["reason"] != ReasonOffload || c["message"] != tc.message || c["lastTransitionTime"] == nil {
+					t.Errorf("condition %s = %v, want True %s %q", ty, c, ReasonOffload, tc.message)
 				}
 				if condition(t, u, other) != nil {
 					t.Errorf("condition %s also set", other)
@@ -120,9 +120,9 @@ func TestCustomOwnerRejected(t *testing.T) {
 	for _, k := range customKinds {
 		t.Run(k.gvk.Kind, func(t *testing.T) {
 			e := newEnv(t, customOwned(k))
-			e.agent.set(func(a *fakeAgent) {
+			e.executor.set(func(a *fakeExecutor) {
 				a.submitCode = http.StatusBadRequest
-				a.submitBody = agentapi.ErrorResponse{APIVersion: agentapi.APIVersion, Permanent: true, Message: msg}
+				a.submitBody = executorapi.ErrorResponse{APIVersion: executorapi.APIVersion, Permanent: true, Message: msg}
 			})
 			e.reconcile()
 			if st := e.check("hpc-a"); st.State != kueue.CheckStateRejected || st.Message != msg {

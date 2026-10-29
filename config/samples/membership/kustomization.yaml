@@ -1,6 +1,6 @@
 resources:
-- siteconfig.yaml
+- offloadconfig.yaml
 - associations.yaml
-- agent-template.yaml
+- executor-template.yaml
 - identitymap.yaml
 - projectquota.yaml

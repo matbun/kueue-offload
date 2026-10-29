@@ -1,0 +1,28 @@
+apiVersion: interlink.eu/v1alpha1
+kind: OffloadConfig
+metadata:
+  name: hpc-a
+spec:
+  executorService: kueue-offload-executor
+  executorPort: 8000
+  pollInterval: 15s
+  executorLostTimeout: 10m
+  maxRetries: 3
+  flavors:
+    hpc-a-gpu: {partition: gpu}
+    hpc-a-cpu: {partition: cpu}
+  membership:
+    slurmCluster: hpc-a
+    associations: {namespace: kueue-offload-membership, name: hpc-a-associations, key: associations}
+    executorTemplate: {namespace: kueue-offload-membership, name: hpc-a-executor-template, key: template.yaml}
+    executorImage: ghcr.io/interlink-hq/interlink-slurm-plugin:0.6.3-pre2
+    executorTokenReview: true
+    syncInterval: 15m
+    defaultProjectQuota:
+    - coveredResources: [cpu, memory, nvidia.com/gpu]
+      flavors:
+      - name: hpc-a-gpu
+        resources:
+        - {name: cpu, nominalQuota: 64}
+        - {name: memory, nominalQuota: 512Gi}
+        - {name: nvidia.com/gpu, nominalQuota: 8}

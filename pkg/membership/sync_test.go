@@ -18,26 +18,26 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/yaml"
 
-	"github.com/interlink-hq/interlink-dispatch/api/v1alpha1"
+	"github.com/matbun/kueue-offload/api/v1alpha1"
 )
 
-// agentConfig parses the SlurmConfig.yaml the sample template renders.
-type agentConfig struct {
+// executorConfig parses the SlurmConfig.yaml the sample template renders.
+type executorConfig struct {
 	Sites map[string]struct {
 		User            string   `json:"User"`
 		AllowedAccounts []string `json:"AllowedAccounts"`
 	} `json:"Sites"`
 }
 
-func (e *env) agentConfig(ns string) agentConfig {
+func (e *env) executorConfig(ns string) executorConfig {
 	e.t.Helper()
-	cm := e.agentConfigMap(ns)
+	cm := e.executorConfigMap(ns)
 	if cm == nil {
-		e.t.Fatalf("agent ConfigMap missing in %s", ns)
+		e.t.Fatalf("executor ConfigMap missing in %s", ns)
 	}
-	var c agentConfig
+	var c executorConfig
 	if err := yaml.Unmarshal([]byte(cm.Data["SlurmConfig.yaml"]), &c); err != nil {
-		e.t.Fatalf("agent config of %s does not parse: %v\n%s", ns, err, cm.Data["SlurmConfig.yaml"])
+		e.t.Fatalf("executor config of %s does not parse: %v\n%s", ns, err, cm.Data["SlurmConfig.yaml"])
 	}
 	return c
 }
@@ -60,7 +60,7 @@ func gpuQuota(t *testing.T, cq kueue.ClusterQueue) int64 {
 func TestSyncCreatesMemberships(t *testing.T) {
 	e := newEnv(t)
 	if after := e.sync(); after != time.Minute {
-		t.Errorf("requeue after %v while the new agents are not available, want 1m", after)
+		t.Errorf("requeue after %v while the new executors are not available, want 1m", after)
 	}
 
 	cqs := e.clusterQueues()
@@ -127,29 +127,29 @@ func TestSyncCreatesMemberships(t *testing.T) {
 		rendered = append(rendered, cm.Namespace+"/"+cm.Name)
 	}
 	sort.Strings(rendered)
-	if !reflect.DeepEqual(rendered, []string{"alice/interlink-agent", "bob/interlink-agent"}) {
+	if !reflect.DeepEqual(rendered, []string{"alice/kueue-offload-executor", "bob/kueue-offload-executor"}) {
 		t.Errorf("rendered ConfigMaps %v", rendered)
 	}
 	for ns, want := range map[string][]string{"alice": {"proj42", "proj99"}, "bob": {"proj42"}} {
-		c := e.agentConfig(ns)
+		c := e.executorConfig(ns)
 		got := c.Sites["hpc-a"]
 		if got.User != ns || !reflect.DeepEqual(got.AllowedAccounts, want) {
-			t.Errorf("%s agent config: user %q accounts %v, want %v", ns, got.User, got.AllowedAccounts, want)
+			t.Errorf("%s executor config: user %q accounts %v, want %v", ns, got.User, got.AllowedAccounts, want)
 		}
 	}
 	d := &appsv1.Deployment{}
-	if !e.get(types.NamespacedName{Namespace: "alice", Name: "interlink-agent"}, d) {
-		t.Fatal("agent Deployment missing")
+	if !e.get(types.NamespacedName{Namespace: "alice", Name: "kueue-offload-executor"}, d) {
+		t.Fatal("executor Deployment missing")
 	}
-	if d.Labels[ManagedByLabel] != ManagedByValue || d.Labels[SiteLabel] != testSite || d.Spec.Template.Spec.Containers[0].Image != "agent:1" {
-		t.Errorf("agent Deployment labels %v image %q", d.Labels, d.Spec.Template.Spec.Containers[0].Image)
+	if d.Labels[ManagedByLabel] != ManagedByValue || d.Labels[SiteLabel] != testSite || d.Spec.Template.Spec.Containers[0].Image != "executor:1" {
+		t.Errorf("executor Deployment labels %v image %q", d.Labels, d.Spec.Template.Spec.Containers[0].Image)
 	}
 
 	crb := &rbacv1.ClusterRoleBinding{}
-	if !e.get(types.NamespacedName{Name: "interlink-agent.hpc-a.alice"}, crb) {
+	if !e.get(types.NamespacedName{Name: "kueue-offload-executor.hpc-a.alice"}, crb) {
 		t.Fatal("token review binding missing")
 	}
-	wantSubj := []rbacv1.Subject{{Kind: "ServiceAccount", Name: "interlink-agent", Namespace: "alice"}}
+	wantSubj := []rbacv1.Subject{{Kind: "ServiceAccount", Name: "kueue-offload-executor", Namespace: "alice"}}
 	if crb.RoleRef.Name != "system:auth-delegator" || !reflect.DeepEqual(crb.Subjects, wantSubj) {
 		t.Errorf("token review binding %+v %+v", crb.RoleRef, crb.Subjects)
 	}
@@ -165,7 +165,7 @@ func TestSyncCreatesMemberships(t *testing.T) {
 		t.Errorf("%d Secret calls", e.secretCalls)
 	}
 
-	// A second pass writes the same state, and with the agents available it
+	// A second pass writes the same state, and with the executors available it
 	// waits for the default syncInterval.
 	e.setDeploymentAvailable("alice", true)
 	e.setDeploymentAvailable("bob", true)
@@ -213,18 +213,18 @@ func TestRemovedAssociationRevokesOnlyThatMembership(t *testing.T) {
 	if _, ok := lqs["alice/hpc-a-proj42"]; !ok {
 		t.Errorf("LocalQueue alice/hpc-a-proj42 removed")
 	}
-	if !e.get(types.NamespacedName{Namespace: "alice", Name: "interlink-agent"}, &appsv1.Deployment{}) {
-		t.Errorf("agent Deployment removed")
+	if !e.get(types.NamespacedName{Namespace: "alice", Name: "kueue-offload-executor"}, &appsv1.Deployment{}) {
+		t.Errorf("executor Deployment removed")
 	}
-	if got := e.agentConfig("alice").Sites["hpc-a"].AllowedAccounts; !reflect.DeepEqual(got, []string{"proj42"}) {
-		t.Errorf("agent accounts %v after removal", got)
+	if got := e.executorConfig("alice").Sites["hpc-a"].AllowedAccounts; !reflect.DeepEqual(got, []string{"proj42"}) {
+		t.Errorf("executor accounts %v after removal", got)
 	}
 	// ClusterQueues are never deleted.
 	if _, ok := e.clusterQueues()["hpc-a-proj99"]; !ok {
 		t.Errorf("ClusterQueue hpc-a-proj99 deleted")
 	}
 
-	// alice leaves her last project: the namespace and the agent stay.
+	// alice leaves her last project: the namespace and the executor stay.
 	e.setAssociations("hpc-a|proj42|bob\n")
 	e.sync()
 	ns = e.namespace("alice")
@@ -237,8 +237,8 @@ func TestRemovedAssociationRevokesOnlyThatMembership(t *testing.T) {
 	if _, ok := e.localQueues()["alice/hpc-a-proj42"]; ok {
 		t.Errorf("LocalQueue alice/hpc-a-proj42 kept")
 	}
-	if !e.get(types.NamespacedName{Namespace: "alice", Name: "interlink-agent"}, &appsv1.Deployment{}) {
-		t.Errorf("agent Deployment removed")
+	if !e.get(types.NamespacedName{Namespace: "alice", Name: "kueue-offload-executor"}, &appsv1.Deployment{}) {
+		t.Errorf("executor Deployment removed")
 	}
 }
 
@@ -260,8 +260,8 @@ func TestUserMissingFromIdentityMapIgnored(t *testing.T) {
 			t.Errorf("LocalQueue %s outside alice", k)
 		}
 	}
-	if e.agentConfigMap("bob") != nil {
-		t.Errorf("agent rendered for bob")
+	if e.executorConfigMap("bob") != nil {
+		t.Errorf("executor rendered for bob")
 	}
 }
 
@@ -282,8 +282,8 @@ func TestNamespaceDroppedFromIdentityMapIsRevoked(t *testing.T) {
 	if _, ok := e.localQueues()["bob/hpc-a-proj42"]; ok {
 		t.Errorf("bob keeps his LocalQueue")
 	}
-	if e.agentConfigMap("bob") == nil {
-		t.Errorf("bob's agent removed")
+	if e.executorConfigMap("bob") == nil {
+		t.Errorf("bob's executor removed")
 	}
 }
 
@@ -312,10 +312,10 @@ func TestOtherSlurmClusterIgnored(t *testing.T) {
 }
 
 func TestTemplateRefusals(t *testing.T) {
-	cm := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: interlink-agent\ndata:\n  accounts: {{ join \",\" .Accounts | quote }}\n"
+	cm := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: kueue-offload-executor\ndata:\n  accounts: {{ join \",\" .Accounts | quote }}\n"
 	cases := map[string]string{
-		"cluster scoped":  cm + "---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: agent-{{ .Namespace }}\nrules: []\n",
-		"other namespace": cm + "---\napiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: agent\n  namespace: kube-system\n",
+		"cluster scoped":  cm + "---\napiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: executor-{{ .Namespace }}\nrules: []\n",
+		"other namespace": cm + "---\napiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: executor\n  namespace: kube-system\n",
 		"secret":          cm + "---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: key\nstringData: {k: v}\n",
 		"no name":         cm + "---\napiVersion: v1\nkind: ServiceAccount\nmetadata: {}\n",
 		"unknown field":   "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: {{ .Nope }}\n",
@@ -329,14 +329,14 @@ func TestTemplateRefusals(t *testing.T) {
 			}
 			// Nothing of the template is applied, not even its valid objects.
 			for _, ns := range []string{"alice", "bob"} {
-				if e.agentConfigMap(ns) != nil {
+				if e.executorConfigMap(ns) != nil {
 					t.Errorf("ConfigMap applied in %s from a refused template", ns)
 				}
 			}
-			if e.get(types.NamespacedName{Name: "agent-alice"}, &rbacv1.ClusterRole{}) {
+			if e.get(types.NamespacedName{Name: "executor-alice"}, &rbacv1.ClusterRole{}) {
 				t.Errorf("cluster-scoped object applied")
 			}
-			if e.get(types.NamespacedName{Namespace: "kube-system", Name: "agent"}, &corev1.ServiceAccount{}) {
+			if e.get(types.NamespacedName{Namespace: "kube-system", Name: "executor"}, &corev1.ServiceAccount{}) {
 				t.Errorf("object applied in another namespace")
 			}
 			if e.secretCalls != 0 {
@@ -386,7 +386,7 @@ func TestIdentityConflictSkipsNamespace(t *testing.T) {
 }
 
 func TestConfigMapOutsideOwnNamespaceRefused(t *testing.T) {
-	sc := siteConfig()
+	sc := offloadConfig()
 	sc.Spec.Membership.Associations.Namespace = "alice"
 	e := newEnv(t, sc, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "assoc", Namespace: "alice"},
 		Data: map[string]string{"associations": fixture}})
@@ -399,14 +399,14 @@ func TestConfigMapOutsideOwnNamespaceRefused(t *testing.T) {
 }
 
 func TestQueueNamesFollowAccountRule(t *testing.T) {
-	sc := siteConfig()
+	sc := offloadConfig()
 	sc.Spec.AccountRule.StripPrefix = new(string)
 	sc.Spec.Membership.Cohort = "pool"
-	sc.Spec.Membership.AdmissionCheck = "dispatch-a"
+	sc.Spec.Membership.AdmissionCheck = "offload-a"
 	e := newEnv(t, sc, assocConfigMap("hpc-a|proj42|alice\nhpc-a|Bad_Account|alice\n"))
 	e.sync()
 	cq, ok := e.clusterQueues()["proj42"]
-	if !ok || cq.Spec.CohortName != "pool" || cq.Spec.AdmissionChecksStrategy.AdmissionChecks[0].Name != "dispatch-a" {
+	if !ok || cq.Spec.CohortName != "pool" || cq.Spec.AdmissionChecksStrategy.AdmissionChecks[0].Name != "offload-a" {
 		t.Fatalf("ClusterQueues %v", e.clusterQueues())
 	}
 	if len(e.clusterQueues()) != 1 {
@@ -438,7 +438,7 @@ func TestSampleTemplateRenders(t *testing.T) {
 		t.Fatal(err)
 	}
 	objs, err := renderObjects(tmpl, TemplateData{Namespace: "alice", Site: "hpc-a", HPCUser: "alice",
-		Accounts: []string{"proj42", "proj99"}, Image: "agent:1", AgentService: "interlink-agent", AgentPort: 8000})
+		Accounts: []string{"proj42", "proj99"}, Image: "executor:1", ExecutorService: "kueue-offload-executor", ExecutorPort: 8000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +457,7 @@ func TestSampleTemplateRenders(t *testing.T) {
 	for _, o := range objs {
 		if o.GetKind() == "RoleBinding" {
 			ref, _, _ := unstructured.NestedString(o.Object, "roleRef", "name")
-			if ref != "interlink-agent" {
+			if ref != "kueue-offload-executor" {
 				t.Errorf("RoleBinding points at %q", ref)
 			}
 		}

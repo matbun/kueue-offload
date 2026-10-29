@@ -1,6 +1,6 @@
-// Package agentapi holds the wire types of the agent HTTP API
-// (dispatch.interlink.eu/v1alpha1) shared by the dispatcher and the agent.
-package agentapi
+// Package executorapi holds the wire types of the executor HTTP API
+// (offload.interlink.eu/v1alpha1) shared by the offload controller and the executor.
+package executorapi
 
 import (
 	corev1 "k8s.io/api/core/v1"
@@ -8,7 +8,7 @@ import (
 )
 
 // APIVersion is carried by every request and response body.
-const APIVersion = "dispatch.interlink.eu/v1alpha1"
+const APIVersion = "offload.interlink.eu/v1alpha1"
 
 // SessionHeader carries the Workload UID on every call, for tracing.
 const SessionHeader = "InterLink-Http-Session"
@@ -31,11 +31,12 @@ type OwnerReference struct {
 	UID        string `json:"uid"`
 }
 
-// PodSet is one PodSet of the Workload, resolved to what the agent submits.
+// PodSet is one PodSet of the Workload, resolved to what the executor submits.
 type PodSet struct {
 	Name          string                 `json:"name"`
 	Count         int32                  `json:"count"`
 	Partition     string                 `json:"partition,omitempty"`
+	QOS           string                 `json:"qos,omitempty"`
 	Template      corev1.PodTemplateSpec `json:"template"`
 	SecretRefs    []string               `json:"secretRefs,omitempty"`
 	ConfigMapRefs []string               `json:"configMapRefs,omitempty"`
@@ -76,7 +77,7 @@ type RankStatus struct {
 	Containers []corev1.ContainerStatus `json:"containers,omitempty"`
 }
 
-// ShadowRef names the shadow objects the agent rendered for the job.
+// ShadowRef names the shadow objects the executor rendered for the job.
 type ShadowRef struct {
 	Deployment string `json:"deployment,omitempty"`
 	Service    string `json:"service,omitempty"`

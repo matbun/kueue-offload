@@ -1,4 +1,4 @@
-package dispatcher
+package offload
 
 import (
 	"context"
@@ -19,9 +19,9 @@ import (
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=admissionchecks,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=admissionchecks/status,verbs=get;patch
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=clusterqueues,verbs=get;list;watch
-// +kubebuilder:rbac:groups=interlink.eu,resources=siteconfigs,verbs=get;list;watch
-// +kubebuilder:rbac:groups=interlink.eu,resources=submitrecords,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=interlink.eu,resources=submitrecords/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=interlink.eu,resources=offloadconfigs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=interlink.eu,resources=offloadrecords,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=interlink.eu,resources=offloadrecords/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get
 // +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=patch
 // +kubebuilder:rbac:groups=jobset.x-k8s.io,resources=jobsets,verbs=get
@@ -33,9 +33,9 @@ import (
 // +kubebuilder:rbac:groups="",resources=pods/status,verbs=patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups=coordination.k8s.io,namespace=interlink-dispatch,resources=leases,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=coordination.k8s.io,namespace=kueue-offload,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
-// SetupWithManager registers the Workload reconciler and the SubmitRecord
+// SetupWithManager registers the Workload reconciler and the OffloadRecord
 // resync.
 func (r *WorkloadReconciler) SetupWithManager(mgr ctrl.Manager, resync time.Duration) error {
 	err := ctrl.NewControllerManagedBy(mgr).
@@ -68,7 +68,7 @@ func (s *resyncer) Start(ctx context.Context) error {
 			return nil
 		case <-t.C:
 			if err := s.r.GarbageCollect(ctx); err != nil {
-				log.FromContext(ctx).Error(err, "SubmitRecord resync")
+				log.FromContext(ctx).Error(err, "OffloadRecord resync")
 			}
 		}
 	}

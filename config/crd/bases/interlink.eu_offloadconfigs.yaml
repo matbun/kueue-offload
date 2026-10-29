@@ -4,19 +4,19 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.16.5
-  name: siteconfigs.interlink.eu
+  name: offloadconfigs.interlink.eu
 spec:
   group: interlink.eu
   names:
-    kind: SiteConfig
-    listKind: SiteConfigList
-    plural: siteconfigs
-    singular: siteconfig
+    kind: OffloadConfig
+    listKind: OffloadConfigList
+    plural: offloadconfigs
+    singular: offloadconfig
   scope: Cluster
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.agentService
-      name: Agent
+    - jsonPath: .spec.executorService
+      name: Executor
       type: string
     - jsonPath: .spec.pollInterval
       name: Poll
@@ -27,7 +27,8 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: SiteConfig is the configuration of one HPC site for the dispatcher.
+        description: OffloadConfig is the configuration of one HPC site for the offload
+          controller.
         properties:
           apiVersion:
             description: |-
@@ -48,8 +49,8 @@ spec:
             type: object
           spec:
             description: |-
-              SiteConfigSpec configures the dispatcher of one site. An AdmissionCheck with
-              controllerName interlink.eu/dispatch selects it through its parameters.
+              OffloadConfigSpec configures the offload controller of one site. An AdmissionCheck with
+              controllerName interlink.eu/offload selects it through its parameters.
             properties:
               accountRule:
                 description: accountRule derives the Slurm account from the ClusterQueue
@@ -58,39 +59,52 @@ spec:
                   stripPrefix:
                     description: |-
                       stripPrefix is removed from the ClusterQueue name to give the account.
-                      Unset means "<site>-", where site is the SiteConfig name. A ClusterQueue
+                      Unset means "<site>-", where site is the OffloadConfig name. A ClusterQueue
                       whose name does not start with the prefix is rejected.
                     type: string
                 type: object
-              agentLostTimeout:
+              alwaysShadow:
+                description: |-
+                  alwaysShadow asks the executors to render a shadow for every job, also for
+                  jobs without exposed ports, so that logs are always reachable.
+                type: boolean
+              executorLostTimeout:
                 default: 10m
                 description: |-
-                  agentLostTimeout is how long an agent may stay unreachable before the
+                  executorLostTimeout is how long an executor may stay unreachable before the
                   check is set to Retry.
                 type: string
-              agentPort:
+              executorPort:
                 default: 8000
-                description: agentPort is the port of the agent Service.
+                description: executorPort is the port of the executor Service.
                 format: int32
                 maximum: 65535
                 minimum: 1
                 type: integer
-              agentService:
-                default: interlink-agent
-                description: agentService is the name of the agent Service in every
-                  tenant namespace.
+              executorService:
+                default: kueue-offload-executor
+                description: executorService is the name of the executor Service in
+                  every tenant namespace.
                 type: string
-              alwaysShadow:
-                description: |-
-                  alwaysShadow asks the agents to render a shadow for every job, also for
-                  jobs without exposed ports, so that logs are always reachable.
-                type: boolean
-              flavorPartitions:
+              flavors:
                 additionalProperties:
-                  type: string
+                  description: FlavorTarget is the Slurm queue a ResourceFlavor stands
+                    for.
+                  properties:
+                    partition:
+                      description: partition is passed as --partition; empty gives
+                        no flag.
+                      type: string
+                    qos:
+                      description: qos is passed as --qos; empty gives no flag.
+                      type: string
+                  type: object
                 description: |-
-                  flavorPartitions maps a ResourceFlavor name to a Slurm partition. A
-                  flavor that is not listed gives no --partition flag.
+                  flavors maps a ResourceFlavor name to the Slurm queue its quota stands for:
+                  a partition and a QOS. A project with several queues on one machine (say a
+                  debug, a production and an interactive QOS) is one ClusterQueue with one
+                  flavor each, and the flavor Kueue assigns decides where the job is submitted.
+                  A flavor that is not listed gives neither flag.
                 type: object
               maxRetries:
                 default: 3
@@ -109,35 +123,6 @@ spec:
                       admissionCheck is the AdmissionCheck every ClusterQueue of the site
                       carries. Unset means the site name.
                     type: string
-                  agentImage:
-                    description: agentImage is passed to the agent template as .Image.
-                    type: string
-                  agentTemplate:
-                    description: |-
-                      agentTemplate holds a Go text/template that renders the agent objects
-                      of one tenant namespace as multi-document YAML. It may produce only
-                      namespaced objects. Unset means no agent objects are rendered.
-                    properties:
-                      key:
-                        minLength: 1
-                        type: string
-                      name:
-                        minLength: 1
-                        type: string
-                      namespace:
-                        minLength: 1
-                        type: string
-                    required:
-                    - key
-                    - name
-                    - namespace
-                    type: object
-                  agentTokenReview:
-                    description: |-
-                      agentTokenReview also binds every ServiceAccount the agent template
-                      renders to system:auth-delegator, with one ClusterRoleBinding per tenant
-                      namespace, so that the agent can validate the dispatcher's token.
-                    type: boolean
                   associations:
                     description: |-
                       associations holds the output of
@@ -294,6 +279,36 @@ spec:
                     maxItems: 16
                     type: array
                     x-kubernetes-list-type: atomic
+                  executorImage:
+                    description: executorImage is passed to the executor template
+                      as .Image.
+                    type: string
+                  executorTemplate:
+                    description: |-
+                      executorTemplate holds a Go text/template that renders the executor objects
+                      of one tenant namespace as multi-document YAML. It may produce only
+                      namespaced objects. Unset means no executor objects are rendered.
+                    properties:
+                      key:
+                        minLength: 1
+                        type: string
+                      name:
+                        minLength: 1
+                        type: string
+                      namespace:
+                        minLength: 1
+                        type: string
+                    required:
+                    - key
+                    - name
+                    - namespace
+                    type: object
+                  executorTokenReview:
+                    description: |-
+                      executorTokenReview also binds every ServiceAccount the executor template
+                      renders to system:auth-delegator, with one ClusterRoleBinding per tenant
+                      namespace, so that the executor can validate the offload controller's token.
+                    type: boolean
                   slurmCluster:
                     description: |-
                       slurmCluster is the value of the cluster column of the associations that
@@ -317,7 +332,7 @@ spec:
               pollInterval:
                 default: 15s
                 description: |-
-                  pollInterval is how often the dispatcher asks the agent for the state of
+                  pollInterval is how often the offload controller asks the executor for the state of
                   a submitted job.
                 type: string
             type: object

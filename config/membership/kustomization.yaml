@@ -1,5 +1,5 @@
 resources:
 - namespace.yaml
 - ../rbac/membership
-- ../rbac/agent
+- ../rbac/executor
 - manager.yaml

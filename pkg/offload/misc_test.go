@@ -1,8 +1,9 @@
-package dispatcher
+package offload
 
 import (
 	"context"
 	"encoding/json"
+	"github.com/matbun/kueue-offload/api/v1alpha1"
 	"os"
 	"path/filepath"
 	"slices"
@@ -112,7 +113,7 @@ func TestSSACheckWriterPatch(t *testing.T) {
 
 func TestAdmissionCheckActive(t *testing.T) {
 	c := fake.NewClientBuilder().WithScheme(testScheme(t)).
-		WithObjects(siteConfig(), admissionCheck("hpc-a", ControllerName, testSite),
+		WithObjects(offloadConfig(), admissionCheck("hpc-a", ControllerName, testSite),
 			admissionCheck("hpc-b", ControllerName, "hpc-b"),
 			admissionCheck("other-check", "example.org/other", testSite)).
 		WithStatusSubresource(&kueue.AdmissionCheck{}).Build()
@@ -138,7 +139,7 @@ func TestAdmissionCheckActive(t *testing.T) {
 		}
 	}
 
-	// Without the SiteConfig the check is reported inactive.
+	// Without the OffloadConfig the check is reported inactive.
 	c2 := fake.NewClientBuilder().WithScheme(testScheme(t)).
 		WithObjects(admissionCheck("hpc-a", ControllerName, testSite)).
 		WithStatusSubresource(&kueue.AdmissionCheck{}).Build()
@@ -149,24 +150,29 @@ func TestAdmissionCheckActive(t *testing.T) {
 	ac := &kueue.AdmissionCheck{}
 	_ = c2.Get(context.Background(), types.NamespacedName{Name: "hpc-a"}, ac)
 	if cond := meta.FindStatusCondition(ac.Status.Conditions, kueue.AdmissionCheckActive); cond == nil || cond.Status != metav1.ConditionFalse {
-		t.Errorf("Active = %+v without a SiteConfig", cond)
+		t.Errorf("Active = %+v without a OffloadConfig", cond)
 	}
 }
 
 func TestPartitionConflictRejected(t *testing.T) {
-	s := resolveSite(siteConfig())
+	s := resolveSite(offloadConfig())
 	asg := &kueue.PodSetAssignment{}
 	asg.Flavors = map[corev1.ResourceName]kueue.ResourceFlavorReference{"cpu": "hpc-a-cpu", "nvidia.com/gpu": "hpc-a-gpu"}
-	if _, err := partitionFor(asg, s); err == nil || !strings.Contains(err.Error(), "cpu, gpu") {
+	if _, err := targetFor(asg, s); err == nil || !strings.Contains(err.Error(), "partition cpu qos , partition gpu qos ") {
 		t.Errorf("err = %v, want a conflict between cpu and gpu", err)
 	}
 	asg.Flavors = map[corev1.ResourceName]kueue.ResourceFlavorReference{"cpu": "unmapped"}
-	if p, err := partitionFor(asg, s); err != nil || p != "" {
-		t.Errorf("unmapped flavor gave %q, %v", p, err)
+	if tg, err := targetFor(asg, s); err != nil || tg != (v1alpha1.FlavorTarget{}) {
+		t.Errorf("unmapped flavor gave %+v, %v", tg, err)
+	}
+	// One project, several queues: the flavor Kueue assigned gives partition and QOS
+	asg.Flavors = map[corev1.ResourceName]kueue.ResourceFlavorReference{"cpu": "hpc-a-debug", "nvidia.com/gpu": "hpc-a-debug"}
+	if tg, err := targetFor(asg, s); err != nil || tg != (v1alpha1.FlavorTarget{Partition: "gpu", QOS: "debug"}) {
+		t.Errorf("debug flavor gave %+v, %v", tg, err)
 	}
 }
 
-// TestRBACGrantsNoSecrets fails when the dispatcher's RBAC reaches what the
+// TestRBACGrantsNoSecrets fails when the offload controller's RBAC reaches what the
 // design forbids: Secrets, ConfigMaps, or pods beyond reading them and
 // patching their status for the terminal phase (D2).
 func TestRBACGrantsNoSecrets(t *testing.T) {

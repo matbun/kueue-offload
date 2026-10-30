@@ -31,6 +31,12 @@ rules:
 - apiGroups: [apps]
   resources: [deployments]
   verbs: [create, update, patch, delete, get, list, watch]
+# A shadow standing for rank 0's pod of an operator (a RayCluster's head) does
+# not carry the labels the operator's Services select that pod by: it is
+# published to them with an EndpointSlice each, labelled as its own.
+- apiGroups: [discovery.k8s.io]
+  resources: [endpointslices]
+  verbs: [create, update, delete, list]
 # patch: a node change annotates the shadow's pods so the kubelet refreshes
 # the node ConfigMap at once. list: the IP and readiness of the shadow's pod.
 - apiGroups: [""]

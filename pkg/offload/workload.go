@@ -31,6 +31,7 @@ const (
 	EventCompleted           = "Completed"
 	EventFailed              = "Failed"
 	EventRetry               = "Retry"
+	EventDeferred            = "Deferred"
 	EventRejected            = "Rejected"
 	EventExecutorUnreachable = "ExecutorUnreachable"
 )
@@ -126,19 +127,29 @@ func (r *WorkloadReconciler) reconcileCheck(ctx context.Context, wl *kueue.Workl
 		return ctrl.Result{}, err
 	}
 	s := resolveSite(sc)
+	delay := maxStartDelay(sc)
 
 	owner, unsupported := ownerOf(wl)
 	if owner == nil {
 		return ctrl.Result{}, r.reject(ctx, wl, name, nil, unsupported)
 	}
 	if q := newestLive(reqs); q != nil {
-		return r.sync(ctx, s, wl, name, owner, q)
+		return r.sync(ctx, s, delay, wl, name, owner, q)
 	}
-	return r.submit(ctx, s, wl, st, owner, reqs)
+	return r.submit(ctx, s, delay, wl, st, owner, reqs)
 }
 
-// submit creates the OffloadRequest of the check's next attempt.
-func (r *WorkloadReconciler) submit(ctx context.Context, s site, wl *kueue.Workload, st *kueue.AdmissionCheckState, owner *workloadOwner, reqs []v1alpha1.OffloadRequest) (ctrl.Result, error) {
+// maxStartDelay is the OffloadConfig's maxStartDelay, 0 without a limit.
+func maxStartDelay(sc *v1alpha1.OffloadConfig) time.Duration {
+	if d := sc.Spec.MaxStartDelay; d != nil && d.Duration > 0 {
+		return d.Duration
+	}
+	return 0
+}
+
+// submit creates the OffloadRequest of the check's next attempt. delay is the
+// OffloadConfig's maxStartDelay, which the attempt's deferrals count by.
+func (r *WorkloadReconciler) submit(ctx context.Context, s site, delay time.Duration, wl *kueue.Workload, st *kueue.AdmissionCheckState, owner *workloadOwner, reqs []v1alpha1.OffloadRequest) (ctrl.Result, error) {
 	ownerRef, ownerObj, err := readOwner(ctx, r.APIReader, wl.Namespace, owner)
 	if err != nil || ownerRef == nil {
 		return ctrl.Result{}, err
@@ -150,12 +161,24 @@ func (r *WorkloadReconciler) submit(ctx context.Context, s site, wl *kueue.Workl
 	if refusal != "" {
 		return ctrl.Result{}, r.reject(ctx, wl, st.Name, owner, refusal)
 	}
-	podSets, err := buildPodSets(wl, s, account)
+	ownerAnnotations := forwardedAnnotations(ownerObj.GetAnnotations())
+	wt, err := jobWallTime(wl, ownerAnnotations)
+	if err != nil {
+		return ctrl.Result{}, r.reject(ctx, wl, st.Name, owner, err.Error())
+	}
+	podSets, err := buildPodSets(wl, s, account, wt)
+	if err == nil {
+		err = ownerPodSets(ownerObj, podSets)
+	}
 	if err != nil {
 		return ctrl.Result{}, r.reject(ctx, wl, st.Name, owner, err.Error())
 	}
 
-	q := newRequest(wl, st.Name, nextAttempt(reqs, st), s.name, account, *ownerRef, forwardedAnnotations(ownerObj.GetAnnotations()), podSets)
+	q := newRequest(wl, st.Name, nextAttempt(reqs, st), s.name, account, *ownerRef, ownerAnnotations, podSets)
+	q.Spec.Deferrals = deferrals(reqs, delay)
+	if wt != nil {
+		q.Spec.MaximumExecutionTimeSeconds = ptr.To(wt.seconds)
+	}
 	if owner.singlePod() != nil {
 		q.Spec.OwnerLabels = ownerObj.GetLabels()
 	}
@@ -176,8 +199,10 @@ func (r *WorkloadReconciler) submit(ctx context.Context, s site, wl *kueue.Workl
 }
 
 // sync maps the executor's status of the live request to the check and the
-// owner, as MultiKueue maps a remote Workload's conditions.
-func (r *WorkloadReconciler) sync(ctx context.Context, s site, wl *kueue.Workload, name kueue.AdmissionCheckReference, owner *workloadOwner, q *v1alpha1.OffloadRequest) (ctrl.Result, error) {
+// owner, as MultiKueue maps a remote Workload's conditions. An attempt the
+// site's start estimate defers by more than delay is given up before its job is
+// submitted.
+func (r *WorkloadReconciler) sync(ctx context.Context, s site, delay time.Duration, wl *kueue.Workload, name kueue.AdmissionCheckReference, owner *workloadOwner, q *v1alpha1.OffloadRequest) (ctrl.Result, error) {
 	now := r.now()
 	conds := q.Status.Conditions
 	job := jobOf(q)
@@ -188,6 +213,9 @@ func (r *WorkloadReconciler) sync(ctx context.Context, s site, wl *kueue.Workloa
 			msg = fmt.Sprintf("the executor in namespace %s refused OffloadRequest %s", wl.Namespace, q.Name)
 		}
 		return ctrl.Result{}, r.reject(ctx, wl, name, owner, msg)
+	}
+	if deferred(q, delay) {
+		return ctrl.Result{}, r.deferAttempt(ctx, s, wl, name, owner, q)
 	}
 	if c := meta.FindStatusCondition(conds, v1alpha1.OffloadRequestFinished); c != nil && c.Status == metav1.ConditionTrue {
 		return ctrl.Result{}, r.finish(ctx, wl, name, owner, q, c, now)
@@ -259,32 +287,89 @@ func (r *WorkloadReconciler) finish(ctx context.Context, wl *kueue.Workload, nam
 	return nil
 }
 
-// retry gives up on the attempt and sets the check to Retry with
-// requeueAfterSeconds from Kueue's backoff: Kueue evicts the Workload and
-// requeues it after the delay. Once backoffLimitCount retries were spent the
-// check is Rejected instead, as Kueue's provisioning check does. Either way the
-// request is deleted after the check is written, and the executor's finalizer
-// cancels the job; a request still there when the check is Retry is deleted
-// at the eviction. A single owner pod shown running goes back to Pending.
+// retry gives up on the attempt and sets the check to Retry (requeue). Once
+// backoffLimitCount retries were spent, the request's deferrals not counted,
+// the check is Rejected instead, as Kueue's provisioning check does. Either way
+// the request is deleted after the check is written, and the executor's
+// finalizer cancels the job; a request still there when the check is Retry is
+// deleted at the eviction.
 func (r *WorkloadReconciler) retry(ctx context.Context, s site, wl *kueue.Workload, name kueue.AdmissionCheckReference, owner *workloadOwner, q *v1alpha1.OffloadRequest, msg string) error {
-	retries := q.Spec.Attempt - 1
-	if retries >= s.backoffLimitCount {
-		if err := r.reject(ctx, wl, name, owner, fmt.Sprintf("%s; giving up after %d retries", msg, retries)); err != nil {
+	lost := q.Spec.Attempt - 1 - q.Spec.Deferrals
+	if lost >= s.backoffLimitCount {
+		if err := r.reject(ctx, wl, name, owner, fmt.Sprintf("%s; giving up after %d retries", msg, lost)); err != nil {
 			return err
 		}
 		return r.deleteRequest(ctx, q)
 	}
-	if err := syncSinglePod(ctx, r.Client, r.APIReader, wl.Namespace, owner, nil, r.now()); err != nil {
-		return err
-	}
-	st := kueue.AdmissionCheckState{Name: name, State: kueue.CheckStateRetry, Message: msg, RetryCount: ptr.To(retries)}
-	kueueworkload.UpdateAdmissionCheckRequeueState(&st, s.backoffBaseSeconds, s.backoffMaxSeconds, clock.RealClock{})
-	if _, err := r.writeCheck(ctx, wl, st); err != nil {
+	after, err := r.requeue(ctx, s, wl, name, owner, q, msg)
+	if err != nil {
 		return err
 	}
 	r.Recorder.Eventf(wl, nil, corev1.EventTypeWarning, EventRetry, "Retry", "%s; retry %d of %d in %ds",
-		msg, retries+1, s.backoffLimitCount, *st.RequeueAfterSeconds)
+		msg, lost+1, s.backoffLimitCount, after)
 	return r.deleteRequest(ctx, q)
+}
+
+// deferAttempt gives up on an attempt whose job the site would not start
+// within maxStartDelay, before it is submitted: the check goes to Retry
+// (requeue), so that a job the site would keep waiting does not hold the quota
+// meanwhile, as the virtual kubelet's Slurm admission check does. It never
+// rejects: the next attempt counts this one in its deferrals, not as a retry.
+func (r *WorkloadReconciler) deferAttempt(ctx context.Context, s site, wl *kueue.Workload, name kueue.AdmissionCheckReference, owner *workloadOwner, q *v1alpha1.OffloadRequest) error {
+	msg := deferMessage(q.Status.Estimate)
+	after, err := r.requeue(ctx, s, wl, name, owner, q, msg)
+	if err != nil {
+		return err
+	}
+	r.Recorder.Eventf(wl, nil, corev1.EventTypeNormal, EventDeferred, "Retry", "%s; requeued in %ds", msg, after)
+	return r.deleteRequest(ctx, q)
+}
+
+// requeue sets the check to Retry with requeueAfterSeconds from Kueue's backoff,
+// counted by the attempt, and returns that delay: Kueue evicts the Workload,
+// which releases its quota, and requeues it after the delay. A single owner pod
+// shown running goes back to Pending.
+func (r *WorkloadReconciler) requeue(ctx context.Context, s site, wl *kueue.Workload, name kueue.AdmissionCheckReference, owner *workloadOwner, q *v1alpha1.OffloadRequest, msg string) (int32, error) {
+	if err := syncSinglePod(ctx, r.Client, r.APIReader, wl.Namespace, owner, nil, r.now()); err != nil {
+		return 0, err
+	}
+	st := kueue.AdmissionCheckState{Name: name, State: kueue.CheckStateRetry, Message: msg, RetryCount: ptr.To(q.Spec.Attempt - 1)}
+	kueueworkload.UpdateAdmissionCheckRequeueState(&st, s.backoffBaseSeconds, s.backoffMaxSeconds, clock.RealClock{})
+	if _, err := r.writeCheck(ctx, wl, st); err != nil {
+		return 0, err
+	}
+	return *st.RequeueAfterSeconds, nil
+}
+
+// deferred reports whether the site's start estimate gives q's attempt up
+// under delay: nothing of it created yet, neither its stage-in nor its job, and
+// a start further away than delay from when the executor asked, or none at all
+// while a submit limit of the site holds. A delay of 0 defers nothing.
+func deferred(q *v1alpha1.OffloadRequest, delay time.Duration) bool {
+	e := q.Status.Estimate
+	staging := meta.FindStatusCondition(q.Status.Conditions, v1alpha1.OffloadRequestStagingIn) != nil
+	if delay <= 0 || e == nil || q.Status.JobID != "" || staging {
+		return false
+	}
+	return e.StartTime == nil || e.StartTime.Sub(e.ProbeTime.Time) > delay
+}
+
+// deferrals is the deferrals of the check's next attempt: those of its newest
+// request, plus that one when the start estimate deferred it.
+func deferrals(reqs []v1alpha1.OffloadRequest, delay time.Duration) int32 {
+	var last *v1alpha1.OffloadRequest
+	for i := range reqs {
+		if last == nil || reqs[i].Spec.Attempt > last.Spec.Attempt {
+			last = &reqs[i]
+		}
+	}
+	if last == nil {
+		return 0
+	}
+	if deferred(last, delay) {
+		return last.Spec.Deferrals + 1
+	}
+	return last.Spec.Deferrals
 }
 
 // reject writes Rejected and, when the offload controller handles the owner,
@@ -377,10 +462,29 @@ func progress(q *v1alpha1.OffloadRequest, namespace string) string {
 		return withDetail("staging in", "", st.Message)
 	case st.Reason != "" || st.Message != "":
 		return withDetail("waiting to submit", st.Reason, st.Message)
+	case st.Estimate != nil && st.JobID == "":
+		return estimateMessage(st.Estimate)
 	case meta.IsStatusConditionTrue(st.Conditions, v1alpha1.OffloadRequestAccepted):
 		return "accepted by the executor in namespace " + namespace
 	}
 	return waitingMessage(namespace)
+}
+
+// estimateMessage is the site's start estimate in a check message, in the
+// virtual kubelet's words.
+func estimateMessage(e *v1alpha1.StartEstimate) string {
+	if e.StartTime == nil {
+		return withDetail("no start time from Slurm", e.Reason, e.Message)
+	}
+	return fmt.Sprintf("Slurm expects to start %d node(s) at %s", e.Nodes, e.StartTime.UTC().Format(time.RFC3339))
+}
+
+// deferMessage is the check message of an attempt the start estimate deferred.
+func deferMessage(e *v1alpha1.StartEstimate) string {
+	if e.StartTime == nil {
+		return estimateMessage(e) + "; quota released until then"
+	}
+	return fmt.Sprintf("%s, in %d s: quota released until then", estimateMessage(e), int64(e.StartTime.Sub(e.ProbeTime.Time).Seconds()))
 }
 
 func waitingMessage(namespace string) string {

@@ -22,6 +22,11 @@ const CapabilityPodGroup = "pod-group"
 // submits them as one job without buffering them (backends.md 3.3).
 const CapabilityPodGroupCreate = "pod-group-create"
 
+// CapabilityEstimate is listed in a plugin's ping answer when it answers
+// /estimate: when the site would start a job of a given shape if it were
+// submitted now.
+const CapabilityEstimate = "estimate"
+
 // capabilitiesInterval is how often the executor reads the plugin's capabilities
 // again.
 var capabilitiesInterval = 5 * time.Minute
@@ -127,4 +132,12 @@ func (d *Executor) createsPodGroup(ctx context.Context, req jobRequest) (bool, *
 		return false, aerr
 	}
 	return slices.Contains(caps, CapabilityPodGroupCreate), nil
+}
+
+// estimates reports whether the plugin answers /estimate: not when its
+// capabilities cannot be read, an API server that cannot be reached, which the
+// create that follows reports.
+func (d *Executor) estimates(ctx context.Context) bool {
+	caps, aerr := d.pluginCapabilities(ctx)
+	return aerr == nil && slices.Contains(caps, CapabilityEstimate)
 }

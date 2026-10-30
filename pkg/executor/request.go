@@ -84,7 +84,7 @@ func (d *Executor) Reconcile(ctx context.Context, r ctrl.Request) (ctrl.Result, 
 		}
 	}
 	if !q.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, d.finalize(ctx, q)
+		return d.finalize(ctx, q)
 	}
 	if !controllerutil.ContainsFinalizer(q, v1alpha1.ExecutorFinalizer) {
 		orig := q.DeepCopy()
@@ -110,6 +110,9 @@ func (d *Executor) Reconcile(ctx context.Context, r ctrl.Request) (ctrl.Result, 
 func (d *Executor) take(ctx context.Context, q *v1alpha1.OffloadRequest) (ctrl.Result, error) {
 	orig := q.DeepCopy()
 	aerr := d.validateSubmit(jobRequestOf(q))
+	if aerr == nil {
+		aerr = d.checkStageClaims(ctx, jobRequestOf(q))
+	}
 	if aerr == nil {
 		aerr = d.checkWorkload(ctx, q)
 	}
@@ -187,18 +190,37 @@ func (d *Executor) endShadow(ctx context.Context, q *v1alpha1.OffloadRequest) {
 	}
 }
 
-// finalize cancels the job of a deleted request and removes the executor's
-// finalizer.
-func (d *Executor) finalize(ctx context.Context, q *v1alpha1.OffloadRequest) error {
+// finalize cancels the job of a deleted request, copies its outputs back
+// (stageOutDeleted), and then removes the executor's finalizer.
+func (d *Executor) finalize(ctx context.Context, q *v1alpha1.OffloadRequest) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(q, v1alpha1.ExecutorFinalizer) {
-		return nil
+		return ctrl.Result{}, nil
 	}
-	if err := d.cancel(ctx, q); err != nil {
-		return err
+	if !d.wasCancelled(q.UID) {
+		if err := d.cancel(ctx, q); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if wait := d.stageOutDeleted(ctx, q); wait > 0 {
+		return ctrl.Result{RequeueAfter: wait}, nil
 	}
 	orig := q.DeepCopy()
 	controllerutil.RemoveFinalizer(q, v1alpha1.ExecutorFinalizer)
-	return client.IgnoreNotFound(d.Client.Patch(ctx, q, client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})))
+	if err := d.Client.Patch(ctx, q, client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})); client.IgnoreNotFound(err) != nil {
+		return ctrl.Result{}, err
+	}
+	d.mu.Lock()
+	delete(d.cancelled, q.UID)
+	d.mu.Unlock()
+	return ctrl.Result{}, nil
+}
+
+// wasCancelled reports whether this process cancelled the job of the deleted
+// request with that UID.
+func (d *Executor) wasCancelled(uid types.UID) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.cancelled[uid]
 }
 
 // checkWorkload refuses a request the offload controller did not make for the
@@ -276,8 +298,12 @@ func podSetsDiffer(wl *kueue.Workload, podSets []v1alpha1.PodSet) string {
 }
 
 // checkEarlierAttempts holds a request while another one of its Workload still
-// has the executor's finalizer: that attempt's job, shadow and stage Jobs carry
-// the same Workload UID, and go only once its cancel ended.
+// has the executor's finalizer: that attempt's job, shadow and stage-in Job carry
+// the same Workload UID, and go only once its cancel ended. An attempt that then
+// copies its outputs back holds the next one until the copy ended, as a deleted
+// pod's stage-out holds the pod that replaces it under the virtual kubelet: both
+// attempts stage to the same paths of the site, and the next one's stage-in or
+// job would overwrite outputs not copied back yet. StageOutTimeout bounds that.
 func (d *Executor) checkEarlierAttempts(ctx context.Context, q *v1alpha1.OffloadRequest) *refusal {
 	list := &v1alpha1.OffloadRequestList{}
 	if err := d.Client.List(ctx, list, client.InNamespace(q.Namespace)); err != nil {
@@ -287,6 +313,9 @@ func (d *Executor) checkEarlierAttempts(ctx context.Context, q *v1alpha1.Offload
 		o := &list.Items[i]
 		if o.UID != q.UID && o.Spec.Workload.UID == q.Spec.Workload.UID && !o.DeletionTimestamp.IsZero() &&
 			controllerutil.ContainsFinalizer(o, v1alpha1.ExecutorFinalizer) {
+			if d.wasCancelled(o.UID) && d.copiesBackOnDelete(o) {
+				return transientError("waiting for OffloadRequest %s to copy back the outputs of its job (Job %s)", o.Name, stageJobName(jobRequestOf(o), stageOut))
+			}
 			return transientError("waiting for the job of OffloadRequest %s to be cancelled", o.Name)
 		}
 	}

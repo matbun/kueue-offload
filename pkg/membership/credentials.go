@@ -9,9 +9,13 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -161,4 +165,159 @@ func eventTime(ev corev1.Event) time.Time {
 		t = ev.Series.LastObservedTime.Time
 	}
 	return t
+}
+
+// stampSecretVersions sets SecretVersionsAnnotation on the pod templates of
+// objs, from the metadata of the Secrets they reference in ns: never their
+// data. A missing Secret keeps the version the live object carries, so that a
+// running executor stays as it is until the Secret is back, and is left out of
+// an object that has none, so that its creation rolls the pods.
+func (r *Reconciler) stampSecretVersions(ctx context.Context, objs []*unstructured.Unstructured, ns string) error {
+	versions := map[string]string{}
+	for _, u := range objs {
+		path := podTemplatePath(u.GroupVersionKind().GroupKind())
+		if path == nil {
+			continue
+		}
+		m, found, err := unstructured.NestedMap(u.Object, path...)
+		if err != nil || !found {
+			continue
+		}
+		pt := &corev1.PodTemplateSpec{}
+		if err := runtime.DefaultUnstructuredConverter.FromUnstructured(m, pt); err != nil {
+			return fmt.Errorf("%s %s: %w", u.GetKind(), u.GetName(), err)
+		}
+		var (
+			stamp []string
+			live  map[string]string
+		)
+		for _, name := range secretNames(&pt.Spec) {
+			v, ok := versions[name]
+			if !ok {
+				if v, err = r.secretVersion(ctx, ns, name); err != nil {
+					return fmt.Errorf("Secret %s/%s: %w", ns, name, err)
+				}
+				versions[name] = v
+			}
+			if v == "" {
+				if live == nil {
+					if live, err = r.liveSecretVersions(ctx, u, path, ns); err != nil {
+						return fmt.Errorf("%s %s: %w", u.GetKind(), u.GetName(), err)
+					}
+				}
+				v = live[name]
+			}
+			if v != "" {
+				stamp = append(stamp, name+"="+v)
+			}
+		}
+		if len(stamp) == 0 {
+			continue
+		}
+		annPath := append(append([]string(nil), path...), "metadata", "annotations")
+		ann, _, err := unstructured.NestedStringMap(u.Object, annPath...)
+		if err != nil {
+			return fmt.Errorf("%s %s: %w", u.GetKind(), u.GetName(), err)
+		}
+		if ann == nil {
+			ann = map[string]string{}
+		}
+		ann[SecretVersionsAnnotation] = strings.Join(stamp, ",")
+		if err := unstructured.SetNestedStringMap(u.Object, ann, annPath...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// liveSecretVersions reads SecretVersionsAnnotation from the pod template of
+// the object in ns that u renders, empty when that object does not exist.
+func (r *Reconciler) liveSecretVersions(ctx context.Context, u *unstructured.Unstructured, path []string, ns string) (map[string]string, error) {
+	cur := &unstructured.Unstructured{}
+	cur.SetGroupVersionKind(u.GroupVersionKind())
+	out := map[string]string{}
+	err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: ns, Name: u.GetName()}, cur)
+	if apierrors.IsNotFound(err) {
+		return out, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	ann, _, err := unstructured.NestedStringMap(cur.Object, append(append([]string(nil), path...), "metadata", "annotations")...)
+	if err != nil {
+		return nil, err
+	}
+	for _, kv := range splitList(ann[SecretVersionsAnnotation]) {
+		if name, v, ok := strings.Cut(kv, "="); ok {
+			out[name] = v
+		}
+	}
+	return out, nil
+}
+
+// secretVersion is the resourceVersion of a Secret, empty when it does not
+// exist. It reads the Secret's metadata only.
+func (r *Reconciler) secretVersion(ctx context.Context, ns, name string) (string, error) {
+	m := &metav1.PartialObjectMetadata{}
+	m.SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
+	err := r.APIReader.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, m)
+	if apierrors.IsNotFound(err) {
+		return "", nil
+	}
+	return m.ResourceVersion, err
+}
+
+// podTemplatePath is where an object of kind gk holds its pod template, nil
+// for a kind without one.
+func podTemplatePath(gk schema.GroupKind) []string {
+	switch gk {
+	case schema.GroupKind{Group: appsv1.GroupName, Kind: "Deployment"}, schema.GroupKind{Group: appsv1.GroupName, Kind: "StatefulSet"},
+		schema.GroupKind{Group: appsv1.GroupName, Kind: "DaemonSet"}, schema.GroupKind{Group: appsv1.GroupName, Kind: "ReplicaSet"},
+		schema.GroupKind{Group: batchv1.GroupName, Kind: "Job"}:
+		return []string{"spec", "template"}
+	case schema.GroupKind{Group: batchv1.GroupName, Kind: "CronJob"}:
+		return []string{"spec", "jobTemplate", "spec", "template"}
+	}
+	return nil
+}
+
+// secretNames lists, sorted, the Secrets a pod spec mounts (secret and
+// projected volumes) or reads into its containers' environment.
+func secretNames(spec *corev1.PodSpec) []string {
+	seen := map[string]bool{}
+	add := func(name string) {
+		if name != "" {
+			seen[name] = true
+		}
+	}
+	for _, v := range spec.Volumes {
+		if v.Secret != nil {
+			add(v.Secret.SecretName)
+		}
+		if v.Projected != nil {
+			for _, src := range v.Projected.Sources {
+				if src.Secret != nil {
+					add(src.Secret.Name)
+				}
+			}
+		}
+	}
+	for _, c := range append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...) {
+		for _, ef := range c.EnvFrom {
+			if ef.SecretRef != nil {
+				add(ef.SecretRef.Name)
+			}
+		}
+		for _, e := range c.Env {
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+				add(e.ValueFrom.SecretKeyRef.Name)
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }

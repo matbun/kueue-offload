@@ -20,6 +20,7 @@ import (
 	"github.com/containerd/containerd/log"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -62,7 +63,11 @@ type Spec struct {
 	Reverse *ReverseTunnel
 	// Labels are the owner pod's, for a workload of one plain pod. A shadow that
 	// tunnels carries those a Service selects the pod by (serviceLabels), so that
-	// the Service selects the shadow too.
+	// the Service selects the shadow too. Without them the template's labels
+	// stand for rank 0's pod, as a RayCluster's head template carries the labels
+	// its head Service selects; the shadow does not carry those, which an
+	// operator counts its own pods by, and is published to the Services that
+	// select them with an EndpointSlice each instead.
 	Labels map[string]string
 }
 
@@ -79,8 +84,9 @@ type Ref struct {
 // Manager creates, updates and deletes shadows.
 type Manager interface {
 	// Ensure creates or updates the shadow for spec: Deployment, Service (only with exposed
-	// ports), node ConfigMap with compute-node and socket-dir. Idempotent; called on every poll
-	// once the job runs.
+	// ports), node ConfigMap with compute-node and socket-dir, and without owner pod labels an
+	// EndpointSlice for each Service that selects the template. Idempotent; called on every
+	// poll once the job runs.
 	Ensure(ctx context.Context, spec Spec) (Ref, error)
 	// Delete removes every object labelled for this workload. Idempotent.
 	Delete(ctx context.Context, workloadUID string) error
@@ -177,9 +183,19 @@ func (m *manager) Ensure(ctx context.Context, spec Spec) (Ref, error) {
 		}
 	}
 
-	var err error
-	if !logsOnly {
+	var (
+		err       error
+		published []corev1.Service
+	)
+	ownerPod := len(spec.Labels) > 0
+	switch {
+	case logsOnly:
+	case ownerPod:
 		if spec.Labels, err = m.serviceLabels(ctx, spec.Labels); err != nil {
+			return Ref{}, err
+		}
+	default:
+		if published, err = m.selectingServices(ctx, spec.Template.Labels); err != nil {
 			return Ref{}, err
 		}
 	}
@@ -206,8 +222,23 @@ func (m *manager) Ensure(ctx context.Context, spec Spec) (Ref, error) {
 	} else if err := m.deleteService(ctx, spec.WorkloadUID, name); err != nil {
 		return Ref{}, err
 	}
-	if ref.PodIP, ref.Ready, err = m.podState(ctx, spec.WorkloadUID, name); err != nil {
+	pod, err := m.shadowPod(ctx, spec.WorkloadUID, name)
+	if err != nil {
 		return Ref{}, err
+	}
+	var endpointSlices []*discoveryv1.EndpointSlice
+	if pod != nil {
+		ref.PodIP, ref.Ready = pod.Status.PodIP, podReady(pod)
+		for _, svc := range published {
+			if s := endpointSlice(svc, name, spec.WorkloadUID, ports, pod); s != nil {
+				endpointSlices = append(endpointSlices, s)
+			}
+		}
+	}
+	if !ownerPod {
+		if err := m.applyEndpointSlices(ctx, spec.WorkloadUID, endpointSlices); err != nil {
+			return Ref{}, err
+		}
 	}
 	return ref, nil
 }
@@ -220,20 +251,13 @@ const kueueLabelPrefix = "kueue.x-k8s.io/"
 // labelled pod, less Kueue's. The shadow carries no other label of the pod: a
 // PodDefault or a policy that selects the pod by one would change the shadow too.
 func (m *manager) serviceLabels(ctx context.Context, pod map[string]string) (map[string]string, error) {
-	if len(pod) == 0 {
-		return nil, nil
-	}
-	list, err := m.client.CoreV1().Services(m.namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list the services of %s: %w", m.namespace, err)
+	services, err := m.selectingServices(ctx, pod)
+	if err != nil || len(services) == 0 {
+		return nil, err
 	}
 	out := map[string]string{}
-	for _, svc := range list.Items {
-		selector := svc.Spec.Selector
-		if len(selector) == 0 || !labels.SelectorFromSet(selector).Matches(labels.Set(pod)) {
-			continue
-		}
-		for k, v := range selector {
+	for _, svc := range services {
+		for k, v := range svc.Spec.Selector {
 			if !strings.HasPrefix(k, kueueLabelPrefix) {
 				out[k] = v
 			}
@@ -242,28 +266,48 @@ func (m *manager) serviceLabels(ctx context.Context, pod map[string]string) (map
 	return out, nil
 }
 
-// podState is the IP and readiness of the shadow's pod: a ready one if there is
-// one, else one with an IP. Pods being deleted do not count.
-func (m *manager) podState(ctx context.Context, workloadUID, name string) (string, bool, error) {
+// selectingServices are the namespace's Services that select a pod labelled
+// pod.
+func (m *manager) selectingServices(ctx context.Context, pod map[string]string) ([]corev1.Service, error) {
+	if len(pod) == 0 {
+		return nil, nil
+	}
+	list, err := m.client.CoreV1().Services(m.namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list the services of %s: %w", m.namespace, err)
+	}
+	var out []corev1.Service
+	for _, svc := range list.Items {
+		if selector := svc.Spec.Selector; len(selector) > 0 && labels.SelectorFromSet(selector).Matches(labels.Set(pod)) {
+			out = append(out, svc)
+		}
+	}
+	return out, nil
+}
+
+// shadowPod is the shadow's pod: a ready one if there is one, else one with an
+// IP, else nil. Pods being deleted do not count.
+func (m *manager) shadowPod(ctx context.Context, workloadUID, name string) (*corev1.Pod, error) {
 	list, err := m.client.CoreV1().Pods(m.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labels.Set{componentLabel: name, LabelShadowOf: workloadUID}.String(),
 	})
 	if err != nil {
-		return "", false, fmt.Errorf("failed to list the pods of shadow %s/%s: %w", m.namespace, name, err)
+		return nil, fmt.Errorf("failed to list the pods of shadow %s/%s: %w", m.namespace, name, err)
 	}
-	ip := ""
-	for _, pod := range list.Items {
+	var found *corev1.Pod
+	for i := range list.Items {
+		pod := &list.Items[i]
 		if pod.DeletionTimestamp != nil || pod.Status.PodIP == "" {
 			continue
 		}
-		if podReady(&pod) {
-			return pod.Status.PodIP, true, nil
+		if podReady(pod) {
+			return pod, nil
 		}
-		if ip == "" {
-			ip = pod.Status.PodIP
+		if found == nil {
+			found = pod
 		}
 	}
-	return ip, false, nil
+	return found, nil
 }
 
 func podReady(pod *corev1.Pod) bool {
@@ -491,6 +535,14 @@ func (m *manager) Delete(ctx context.Context, workloadUID string) error {
 	} else {
 		for _, o := range list.Items {
 			collect("service", o.Name, services.Delete(ctx, o.Name, opts))
+		}
+	}
+	endpointSlices := m.client.DiscoveryV1().EndpointSlices(m.namespace)
+	if list, err := endpointSlices.List(ctx, selector); err != nil {
+		errs = append(errs, fmt.Errorf("failed to list shadow endpoint slices: %w", err))
+	} else {
+		for _, o := range list.Items {
+			collect("endpointslice", o.Name, endpointSlices.Delete(ctx, o.Name, opts))
 		}
 	}
 	configMaps := m.client.CoreV1().ConfigMaps(m.namespace)

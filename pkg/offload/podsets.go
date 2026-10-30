@@ -4,13 +4,14 @@ import (
 	"bytes"
 	"fmt"
 	"maps"
+	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"text/template"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/utils/ptr"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
 	"github.com/matbun/kueue-offload/api/v1alpha1"
@@ -20,23 +21,108 @@ import (
 // carries in ownerAnnotations, for every PodSet template.
 var forwardedAnnotationPrefixes = []string{"slurm-job.vk.io/", "htcondor-job.vk.io/", "interlink.eu/", "offload.interlink.eu/"}
 
-// buildPodSets turns the Workload's PodSets into the OffloadRequest's, with the
-// flavors and count Kueue admitted and the annotations of each PodSet's flavor
-// expanded for account. An error means the Workload can never be submitted.
-func buildPodSets(wl *kueue.Workload, s site, account string) ([]v1alpha1.PodSet, error) {
-	assignments := map[kueue.PodSetReference]*kueue.PodSetAssignment{}
-	if wl.Status.Admission != nil {
-		if err := oneFlavor(wl.Status.Admission.PodSetAssignments); err != nil {
+// TimeLimitAnnotation asks for the job's wall time as HH:MM:SS, as on the
+// virtual kubelet, on the owner or on a PodSet's pod template; an empty value
+// is unset. The Workload's maximumExecutionTimeSeconds (Kueue's label
+// kueue.x-k8s.io/max-exec-time-seconds) wins over it.
+const TimeLimitAnnotation = "interlink.eu/time-limit"
+
+var timeLimitFormat = regexp.MustCompile(`^([0-9]{1,3}):([0-5][0-9]):([0-5][0-9])$`)
+
+// wallTime is the job's wall time and what asked for it, for refusals.
+type wallTime struct {
+	seconds int32
+	from    string
+}
+
+// jobWallTime is the Workload's maximumExecutionTimeSeconds, else the longest
+// TimeLimitAnnotation of its PodSets, a template's own value winning over the
+// owner's; nil when neither is set. A value that is not HH:MM:SS is an error.
+func jobWallTime(wl *kueue.Workload, ownerAnnotations map[string]string) (*wallTime, error) {
+	if s := wl.Spec.MaximumExecutionTimeSeconds; s != nil {
+		return &wallTime{seconds: *s, from: "maximumExecutionTimeSeconds"}, nil
+	}
+	var longest *wallTime
+	for _, ps := range wl.Spec.PodSets {
+		v := ps.Template.Annotations[TimeLimitAnnotation]
+		if v == "" {
+			v = ownerAnnotations[TimeLimitAnnotation]
+		}
+		if v == "" {
+			continue
+		}
+		seconds, err := parseTimeLimit(v)
+		if err != nil {
 			return nil, err
 		}
-		for i := range wl.Status.Admission.PodSetAssignments {
-			a := &wl.Status.Admission.PodSetAssignments[i]
-			assignments[a.Name] = a
+		if longest == nil || seconds > longest.seconds {
+			longest = &wallTime{seconds: seconds, from: TimeLimitAnnotation}
 		}
 	}
-	data := newFlavorData(account, ptr.Deref(wl.Spec.MaximumExecutionTimeSeconds, 0))
-	out := make([]v1alpha1.PodSet, 0, len(wl.Spec.PodSets))
-	for _, ps := range wl.Spec.PodSets {
+	return longest, nil
+}
+
+func parseTimeLimit(v string) (int32, error) {
+	m := timeLimitFormat.FindStringSubmatch(v)
+	if m == nil {
+		return 0, fmt.Errorf("%s %q is not HH:MM:SS, for example 01:30:00", TimeLimitAnnotation, v)
+	}
+	var seconds int32
+	for _, part := range m[1:] {
+		n, _ := strconv.Atoi(part)
+		seconds = seconds*60 + int32(n)
+	}
+	if seconds == 0 {
+		return 0, fmt.Errorf("%s %q asks for no time: ask for HH:MM:SS above 00:00:00", TimeLimitAnnotation, v)
+	}
+	return seconds, nil
+}
+
+func formatSeconds(s int32) string {
+	return fmt.Sprintf("%02d:%02d:%02d", s/3600, s%3600/60, s%60)
+}
+
+// withinFlavorTime refuses a wall time above the maxExecutionTimeSeconds of a
+// flavor admitted for the PodSet: Kueue cannot choose a flavor by time, and the
+// queue would hold or refuse the job.
+func withinFlavorTime(a *kueue.PodSetAssignment, s site, wt *wallTime) error {
+	if wt == nil {
+		return nil
+	}
+	for _, f := range sortedKeys(flavorSet(a)) {
+		if limit := s.flavors[f].MaxExecutionTimeSeconds; limit != nil && wt.seconds > *limit {
+			return fmt.Errorf("a job runs at most %s on queue %s; %s asks for %s", formatSeconds(*limit), f, wt.from, formatSeconds(wt.seconds))
+		}
+	}
+	return nil
+}
+
+// buildPodSets turns the Workload's PodSets that run (runPodSets) into the
+// OffloadRequest's, with the flavors and count Kueue admitted and the
+// annotations of each PodSet's flavor expanded for account and the job's wall
+// time wt, which none of the admitted flavors may limit to less; a Ray owner's
+// are prepared for the site's launcher (rayPodSets). An error means the
+// Workload can never be submitted.
+func buildPodSets(wl *kueue.Workload, s site, account string, wt *wallTime) ([]v1alpha1.PodSet, error) {
+	podSets, admitted := runPodSets(wl)
+	assignments := map[kueue.PodSetReference]*kueue.PodSetAssignment{}
+	if err := oneFlavor(admitted); err != nil {
+		return nil, err
+	}
+	for i := range admitted {
+		a := &admitted[i]
+		if err := withinFlavorTime(a, s, wt); err != nil {
+			return nil, err
+		}
+		assignments[a.Name] = a
+	}
+	var seconds int32
+	if wt != nil {
+		seconds = wt.seconds
+	}
+	data := newFlavorData(account, seconds)
+	out := make([]v1alpha1.PodSet, 0, len(podSets))
+	for _, ps := range podSets {
 		p := v1alpha1.PodSet{Name: ps.Name, Count: ps.Count, Template: *ps.Template.DeepCopy()}
 		if a := assignments[ps.Name]; a != nil {
 			if a.Count != nil {
@@ -51,6 +137,11 @@ func buildPodSets(wl *kueue.Workload, s site, account string) ([]v1alpha1.PodSet
 		p.SecretRefs, p.ConfigMapRefs = references(&p.Template.Spec)
 		out = append(out, p)
 	}
+	if c := rayOwnerOf(wl); c != nil {
+		if err := rayPodSets(c, out); err != nil {
+			return nil, err
+		}
+	}
 	return out, nil
 }
 
@@ -58,7 +149,9 @@ func buildPodSets(wl *kueue.Workload, s site, account string) ([]v1alpha1.PodSet
 type FlavorData struct {
 	// Account is the account of the Workload's ClusterQueue.
 	Account string
-	// MaxExecSeconds is the Workload's maximumExecutionTimeSeconds, 0 when unset.
+	// MaxExecSeconds is the job's wall time: the Workload's
+	// maximumExecutionTimeSeconds, else TimeLimitAnnotation, 0 when neither is
+	// set.
 	MaxExecSeconds int32
 	// MaxExecMinutes is MaxExecSeconds in minutes, rounded up.
 	MaxExecMinutes int32

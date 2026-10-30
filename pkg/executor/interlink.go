@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
 	v1 "k8s.io/api/core/v1"
@@ -22,8 +23,8 @@ const maxErrorText = 4096
 
 // InterLink calls an interLink API server, as the virtual kubelet does
 // (pkg/virtualkubelet/execute.go): /create, /status, /getLogs, /delete and
-// /pinglink, with interLink's own wire types, and /createPodGroup for a plugin
-// that lists pod-group-create.
+// /pinglink, with interLink's own wire types, /createPodGroup for a plugin
+// that lists pod-group-create and /estimate for one that lists estimate.
 type InterLink struct {
 	URL  string
 	HTTP *http.Client
@@ -122,6 +123,33 @@ type PodGroupCreateRequests struct {
 func (c *InterLink) CreatePodGroup(ctx context.Context, session string, req PodGroupCreateRequests) ([]commonIL.CreateStruct, error) {
 	var out []commonIL.CreateStruct
 	err := c.call(ctx, http.MethodPost, "/createPodGroup", session, req, &out)
+	return out, err
+}
+
+// EstimateRequest is the body of /estimate: a job of Nodes nodes, each with
+// GPUsPerNode GPUs and CPUsPerNode cores (0: none sent), of at most Time
+// (HH:MM:SS), with the scheduler options its pods carry in Flags. It and
+// EstimateResponse are copies of interLink's types until interLink has them.
+type EstimateRequest struct {
+	Nodes       int    `json:"nodes"`
+	GPUsPerNode int    `json:"gpusPerNode"`
+	CPUsPerNode int    `json:"cpusPerNode,omitempty"`
+	Time        string `json:"time,omitempty"`
+	Flags       string `json:"flags,omitempty"`
+}
+
+// EstimateResponse is the plugin's answer to /estimate: when the site expects
+// to start the job, and the site's own answer as text.
+type EstimateResponse struct {
+	Start time.Time `json:"start"`
+	Raw   string    `json:"raw"`
+}
+
+// Estimate asks when the site would start a job of that shape if it were
+// submitted now. A site that gives no start time answers with an error.
+func (c *InterLink) Estimate(ctx context.Context, session string, req EstimateRequest) (EstimateResponse, error) {
+	var out EstimateResponse
+	err := c.call(ctx, http.MethodPost, "/estimate", session, req, &out)
 	return out, err
 }
 

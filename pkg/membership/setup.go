@@ -22,11 +22,17 @@ import (
 // +kubebuilder:rbac:groups="",namespace=kueue-offload-membership,resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=clusterqueues;cohorts,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=localqueues,verbs=get;list;watch;create;patch;delete
-// +kubebuilder:rbac:groups="",resources=configmaps;services;serviceaccounts;persistentvolumeclaims,verbs=create;patch
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;patch
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;patch;delete
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=create;patch
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;patch
+// +kubebuilder:rbac:groups="",resources=configmaps;services;serviceaccounts;persistentvolumeclaims,verbs=create;patch;deletecollection
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;patch;deletecollection
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;create;patch;delete;deletecollection
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=create;patch;deletecollection
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=create;patch;deletecollection
+// Offboarding deletes the OffloadRequests of finished Workloads, which the
+// executor then finalizes.
+// +kubebuilder:rbac:groups=interlink.eu,resources=offloadrequests,verbs=list;delete
+// +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=workloads,verbs=get
+// The resourceVersion of the Secrets executor pods use, read as metadata only.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,verbs=bind,resourceNames=kueue-offload-executor
 // +kubebuilder:rbac:groups="",resources=pods,verbs=list
 // +kubebuilder:rbac:groups="",resources=events,verbs=list;create;patch

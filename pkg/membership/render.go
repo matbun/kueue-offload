@@ -17,12 +17,13 @@ import (
 )
 
 // TemplateData is what the executor template is executed with, once per tenant
-// namespace.
+// namespace, and the offboard template once per namespace that left the site.
 type TemplateData struct {
 	Namespace string
 	Site      string
 	HPCUser   string
-	// Accounts are the tenant's accounts on the site, sorted.
+	// Accounts are the tenant's accounts on the site, sorted; in the offboard
+	// template, those the namespace had before it left.
 	Accounts []string
 	// Image is membership.executorImage of the OffloadConfig.
 	Image string

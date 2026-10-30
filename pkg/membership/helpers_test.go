@@ -21,6 +21,7 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
@@ -90,7 +91,7 @@ func quota(gpus int64) []kueue.ResourceGroup {
 func offloadConfig() *v1alpha1.OffloadConfig {
 	return &v1alpha1.OffloadConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: testSite},
-		Spec: v1alpha1.OffloadConfigSpec{Membership: &v1alpha1.Membership{
+		Spec: v1alpha1.OffloadConfigSpec{Workers: []string{testSite}, Membership: &v1alpha1.Membership{
 			SlurmCluster:        "hpc-a",
 			Associations:        v1alpha1.ConfigMapKeyRef{Namespace: ownNS, Name: "assoc", Key: "associations"},
 			ExecutorTemplate:    &v1alpha1.ConfigMapKeyRef{Namespace: ownNS, Name: "hpc-a-executor-template", Key: "template.yaml"},
@@ -150,11 +151,15 @@ type env struct {
 
 	mu          sync.Mutex
 	secretCalls int
+	// secretMetadataCalls counts reads of a Secret's metadata only.
+	secretMetadataCalls int
+	// failDeleteAllOf makes DeleteAllOf of that kind fail.
+	failDeleteAllOf string
 }
 
 // newEnv builds a fake cluster with the default fixture; objs are added or
 // replace fixture objects of the same name. Every read or write of a Secret is
-// counted.
+// counted, apart from reads of its metadata only.
 func newEnv(t *testing.T, objs ...client.Object) *env {
 	e := &env{t: t, events: events.NewFakeRecorder(200)}
 	base := map[string]client.Object{}
@@ -180,11 +185,19 @@ func newEnv(t *testing.T, objs ...client.Object) *env {
 	}
 	s := testScheme(t)
 	count := func(obj runtime.Object) {
-		switch obj.(type) {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		switch o := obj.(type) {
 		case *corev1.Secret, *corev1.SecretList:
-			e.mu.Lock()
 			e.secretCalls++
-			e.mu.Unlock()
+		case *metav1.PartialObjectMetadata:
+			if o.Kind == "Secret" {
+				e.secretMetadataCalls++
+			}
+		case *metav1.PartialObjectMetadataList:
+			if o.Kind == "SecretList" {
+				e.secretCalls++
+			}
 		}
 	}
 	// The client-go type converter of the fake client cannot apply a
@@ -204,6 +217,15 @@ func newEnv(t *testing.T, objs ...client.Object) *env {
 			Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 				count(obj)
 				return c.Create(ctx, obj, opts...)
+			},
+			DeleteAllOf: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteAllOfOption) error {
+				e.mu.Lock()
+				fail := e.failDeleteAllOf
+				e.mu.Unlock()
+				if gvk, err := apiutil.GVKForObject(obj, c.Scheme()); err == nil && gvk.Kind == fail {
+					return fmt.Errorf("deleting %s: refused", fail)
+				}
+				return c.DeleteAllOf(ctx, obj, opts...)
 			},
 		}).Build()
 	e.r = &Reconciler{Client: e.c, APIReader: e.c, Recorder: e.events, Site: testSite, Namespace: ownNS,

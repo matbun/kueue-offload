@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -67,10 +68,47 @@ type ExecutorKubernetesAPI struct {
 	Port string `yaml:"Port"`
 }
 
-// SiteConfig is one site: which accounts this executor may charge. How the plugin
+// SiteConfig is one site: which accounts this executor may charge, how a member is
+// sized there, and which Slurm options a workload may give itself. How the plugin
 // reaches the site is the plugin's configuration.
 type SiteConfig struct {
 	AllowedAccounts []string `yaml:"AllowedAccounts"`
+	// Resources sizes the members at a site that hands out whole GPUs, each with a
+	// fixed share of a node's cores. Unset: a member goes as its template asks.
+	Resources *SiteResources `yaml:"Resources"`
+	// AllowedFlags, when set, is all a workload may ask of Slurm itself, in the
+	// annotations slurm-job.vk.io/flags and slurm-job.vk.io/flavor of its owner or
+	// templates; anything else refuses the request. The flags of the request's
+	// Kueue flavor (OffloadConfig flavors) are the site's and always go. Unset:
+	// anything.
+	AllowedFlags *AllowedFlags `yaml:"AllowedFlags"`
+}
+
+// SiteResources is the shape of one member at the site: one node, with 1 to
+// GPUsPerMember GPUs and CPUsPerGPU cores for each.
+type SiteResources struct {
+	// GPUResource is the resource a template asks GPUs with, e.g. nvidia.com/gpu.
+	GPUResource string `yaml:"GPUResource"`
+	// GPUAliases are other names of GPUResource in the templates, such as the one
+	// an admission policy renames it to so that a namespace's ResourceQuota does not
+	// count GPUs of pods that never run in the cluster. A member gets GPUResource
+	// back, which the plugin turns into the job's GPUs.
+	GPUAliases []string `yaml:"GPUAliases"`
+	// CPUsPerGPU is the cores a member gets per GPU. A template that sets no CPU
+	// gets that many times its GPUs as its first container's CPU limit, which the
+	// plugin makes the job's CPUs; one that sets another number is refused.
+	CPUsPerGPU int64 `yaml:"CPUsPerGPU"`
+	// GPUsPerMember is the GPUs of one node: a member asks for 1 to that many.
+	GPUsPerMember int64 `yaml:"GPUsPerMember"`
+}
+
+// AllowedFlags is what SiteConfig.AllowedFlags lets a workload ask of Slurm.
+type AllowedFlags struct {
+	// Flags are the sbatch options, by name (--constraint), slurm-job.vk.io/flags
+	// may set. Empty: none.
+	Flags []string `yaml:"Flags"`
+	// Flavors are the plugin flavors slurm-job.vk.io/flavor may name. Empty: none.
+	Flavors []string `yaml:"Flavors"`
 }
 
 // ShadowConfig is what the shadow manager renders a workload's shadow with.
@@ -136,6 +174,16 @@ type StagingConfig struct {
 	Volumes []StagingVolume `yaml:"Volumes"`
 	// Kerberos is used for the paths on a volume marked Kerberos.
 	Kerberos *StagingKerberos `yaml:"Kerberos"`
+	// DeleteGrace is how long after a running job's request is deleted (its owner
+	// stopped or deleted) the copy back starts, so that the cancelled job stops
+	// writing first. Empty: 30s.
+	DeleteGrace string `yaml:"DeleteGrace"`
+	// StageOutTimeout is the longest a stage-out Job may run; a deleted request
+	// waits for it that long at most. Empty: 4h.
+	StageOutTimeout string `yaml:"StageOutTimeout"`
+
+	deleteGrace     time.Duration
+	stageOutTimeout time.Duration
 }
 
 // StagingVolume is a PersistentVolumeClaim of the namespace, mounted in the
@@ -160,9 +208,11 @@ type StagingKerberos struct {
 const defaultStageCommand = "/usr/local/bin/stage-rsync"
 
 const (
-	defaultListen       = ":8000"
-	defaultPollInterval = 15 * time.Second
-	defaultLostTimeout  = 10 * time.Minute
+	defaultListen          = ":8000"
+	defaultPollInterval    = 15 * time.Second
+	defaultLostTimeout     = 10 * time.Minute
+	defaultDeleteGrace     = 30 * time.Second
+	defaultStageOutTimeout = 4 * time.Hour
 )
 
 // serviceAccountNamespaceFile is where a pod reads its own namespace.
@@ -219,6 +269,16 @@ func (c *Config) Validate() error {
 		if len(site.AllowedAccounts) == 0 {
 			return fmt.Errorf("Sites.%s: AllowedAccounts is empty, every OffloadRequest would be refused", name)
 		}
+		if err := validateSiteResources(site.Resources); err != nil {
+			return fmt.Errorf("Sites.%s.Resources: %w", name, err)
+		}
+		if f := site.AllowedFlags; f != nil {
+			for _, flag := range f.Flags {
+				if !strings.HasPrefix(flag, "-") || strings.ContainsAny(flag, "= \t") {
+					return fmt.Errorf("Sites.%s.AllowedFlags.Flags: %q is not an option name such as --constraint", name, flag)
+				}
+			}
+		}
 	}
 
 	if c.Executor.Namespace == "" {
@@ -259,11 +319,55 @@ func (c *Config) Validate() error {
 	return validateStagingConfig(c)
 }
 
+// validateSiteResources checks a site's Resources block, nil included.
+func validateSiteResources(r *SiteResources) error {
+	if r == nil {
+		return nil
+	}
+	switch {
+	case r.GPUResource == "":
+		return fmt.Errorf("GPUResource is required")
+	case r.CPUsPerGPU < 1:
+		return fmt.Errorf("CPUsPerGPU must be at least 1")
+	case r.GPUsPerMember < 1:
+		return fmt.Errorf("GPUsPerMember must be at least 1")
+	}
+	for i, alias := range r.GPUAliases {
+		if alias == "" || alias == r.GPUResource || slices.Contains(r.GPUAliases[:i], alias) {
+			return fmt.Errorf("GPUAliases: %q is empty, GPUResource or listed twice", alias)
+		}
+	}
+	return nil
+}
+
 // validateStagingConfig fills the Staging block's defaults and checks it.
 func validateStagingConfig(c *Config) error {
 	st := &c.Staging
 	if !st.Enabled {
 		return nil
+	}
+	for _, t := range []struct {
+		key, value string
+		into       *time.Duration
+		def        time.Duration
+		zeroOK     bool
+	}{
+		{"DeleteGrace", st.DeleteGrace, &st.deleteGrace, defaultDeleteGrace, true},
+		{"StageOutTimeout", st.StageOutTimeout, &st.stageOutTimeout, defaultStageOutTimeout, false},
+	} {
+		*t.into = t.def
+		if t.value == "" {
+			continue
+		}
+		d, err := time.ParseDuration(t.value)
+		if err != nil || d < 0 || (d == 0 && !t.zeroOK) {
+			want := "a positive duration"
+			if t.zeroOK {
+				want = "a duration of 0 or more"
+			}
+			return fmt.Errorf("Staging.%s %q: %s is required", t.key, t.value, want)
+		}
+		*t.into = d
 	}
 	if st.Command == "" {
 		st.Command = defaultStageCommand

@@ -81,7 +81,6 @@ rules:
   resources:
   - admissionchecks
   - clusterqueues
-  - workloads
   verbs:
   - get
   - list
@@ -96,7 +95,29 @@ rules:
 - apiGroups:
   - kueue.x-k8s.io
   resources:
+  - workloads
+  verbs:
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - kueue.x-k8s.io
+  resources:
   - workloads/status
+  verbs:
+  - patch
+- apiGroups:
+  - ray.io
+  resources:
+  - rayclusters
+  - rayjobs
+  verbs:
+  - get
+- apiGroups:
+  - ray.io
+  resources:
+  - rayjobs/status
   verbs:
   - patch
 - apiGroups:

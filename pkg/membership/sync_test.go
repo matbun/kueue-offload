@@ -224,7 +224,8 @@ func TestRemovedAssociationRevokesOnlyThatMembership(t *testing.T) {
 		t.Errorf("ClusterQueue hpc-a-proj99 deleted")
 	}
 
-	// alice leaves her last project: the namespace and the executor stay.
+	// alice leaves her last project: the pass that revokes it keeps the
+	// namespace and the executor, which go when she is offboarded.
 	e.setAssociations("hpc-a|proj42|bob\n")
 	e.sync()
 	ns = e.namespace("alice")

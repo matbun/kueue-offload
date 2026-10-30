@@ -55,11 +55,24 @@ func has(list []string, v string) bool {
 }
 
 // TestMembershipRBAC fails when the membership controller's RBAC reaches what
-// the design forbids: anything on Secrets, ConfigMap reads outside its own
-// namespace, escalation, or binding roles other than the executor's.
+// the design forbids: more than get on Secrets (it reads their metadata only),
+// ConfigMap reads outside its own namespace, deleting collections of kinds it
+// does not make, escalation, or binding roles other than the executor's.
 func TestMembershipRBAC(t *testing.T) {
 	docs := readRBAC(t, "../../config/rbac/membership/*.yaml")
 	sawBind, sawConfigMapRead := false, false
+	created := map[string]bool{}
+	for _, d := range docs {
+		for _, r := range d.Rules {
+			if has(r.Verbs, "create") {
+				for _, g := range r.APIGroups {
+					for _, res := range r.Resources {
+						created[g+"/"+res] = true
+					}
+				}
+			}
+		}
+	}
 	for _, d := range docs {
 		for _, r := range d.Rules {
 			for _, list := range [][]string{r.APIGroups, r.Resources, r.Verbs} {
@@ -72,8 +85,16 @@ func TestMembershipRBAC(t *testing.T) {
 			core := has(r.APIGroups, "")
 			for _, res := range r.Resources {
 				name := strings.SplitN(res, "/", 2)[0]
-				if core && name == "secrets" {
+				if core && name == "secrets" && (res != "secrets" || strings.Join(r.Verbs, ",") != "get") {
 					t.Errorf("%s %s grants %v on %s", d.Kind, d.Metadata.Name, r.Verbs, res)
+				}
+				// Offboarding deletes the objects the controller made for the site.
+				if has(r.Verbs, "deletecollection") {
+					for _, g := range r.APIGroups {
+						if !created[g+"/"+res] {
+							t.Errorf("%s %s grants deletecollection on %s/%s, which it does not create", d.Kind, d.Metadata.Name, g, res)
+						}
+					}
 				}
 				if core && name == "configmaps" && (has(r.Verbs, "get") || has(r.Verbs, "list") || has(r.Verbs, "watch")) {
 					if d.Kind != "Role" || d.Metadata.Namespace != ownNS {
@@ -85,8 +106,9 @@ func TestMembershipRBAC(t *testing.T) {
 					t.Errorf("%s %s grants %v on pods", d.Kind, d.Metadata.Name, r.Verbs)
 				}
 				// Jobs: a Job whose pod template changed is replaced, since the template is immutable.
+				// OffloadRequests: offboarding deletes those of finished Workloads.
 				if has(r.Verbs, "delete") && !(has(r.APIGroups, "kueue.x-k8s.io") && name == "localqueues") && !(d.Kind == "Role" && name == "leases") &&
-					!(has(r.APIGroups, "batch") && name == "jobs") {
+					!(has(r.APIGroups, "batch") && name == "jobs") && !(has(r.APIGroups, "interlink.eu") && res == "offloadrequests") {
 					t.Errorf("%s %s grants delete on %s", d.Kind, d.Metadata.Name, res)
 				}
 				if name == "clusterroles" || name == "roles" {

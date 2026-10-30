@@ -7,11 +7,13 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/containerd/containerd/log"
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
@@ -34,6 +36,18 @@ const (
 	stageIn  = "in"
 	stageOut = "out"
 )
+
+// Events on the workload's owner about the copy back, the virtual kubelet's
+// stager's.
+const (
+	EventStageOut       = "StageOut"
+	EventStagedOut      = "StagedOut"
+	EventStageOutFailed = "StageOutFailed"
+)
+
+// stageOutTTL is how long a stage-out Job stays after it ended: it is owned by
+// nothing, so its log outlives a stopped or deleted owner.
+const stageOutTTL = 24 * time.Hour
 
 // Where the stage Job's container finds its credentials.
 const (
@@ -61,6 +75,40 @@ func stageVolume(cfg StagingConfig, p string) *StagingVolume {
 	for i, v := range cfg.Volumes {
 		if strings.HasPrefix(p, v.MountPath+"/") {
 			return &cfg.Volumes[i]
+		}
+	}
+	return nil
+}
+
+// checkStageClaims refuses stage paths on a volume whose claim the namespace
+// does not have: their stage Job would never start. A claim the executor may not
+// read is not checked.
+func (d *Executor) checkStageClaims(ctx context.Context, req jobRequest) *refusal {
+	cfg := d.Config.Staging
+	if !cfg.Enabled {
+		return nil
+	}
+	checked := map[string]bool{}
+	for _, ann := range []string{StageInAnnotation, StageOutAnnotation} {
+		for _, p := range stagePaths(req, ann) {
+			vol := stageVolume(cfg, strings.TrimSuffix(p, "/"))
+			if vol == nil || checked[vol.ClaimName] {
+				continue
+			}
+			checked[vol.ClaimName] = true
+			if d.Kube == nil {
+				return transientError("the executor has no Kubernetes client to read PersistentVolumeClaim %q", vol.ClaimName)
+			}
+			_, err := d.Kube.CoreV1().PersistentVolumeClaims(req.Namespace).Get(ctx, vol.ClaimName, metav1.GetOptions{})
+			switch {
+			case err == nil:
+			case apierrors.IsNotFound(err):
+				return permanentError("%s: %q is on %s, but namespace %s has no PersistentVolumeClaim %s to copy it with", ann, p, vol.MountPath, req.Namespace, vol.ClaimName)
+			case apierrors.IsForbidden(err):
+				log.L.Warning("executor: workload ", req.WorkloadUID, ": PersistentVolumeClaim ", vol.ClaimName, " not checked: ", err)
+			default:
+				return transientError("reading PersistentVolumeClaim %q: %v", vol.ClaimName, err)
+			}
 		}
 	}
 	return nil
@@ -94,13 +142,15 @@ func (d *Executor) validateStaging(req jobRequest) *refusal {
 	return nil
 }
 
-// stageJobName is the name of the workload's stage Job in a direction.
-func stageJobName(workloadUID, direction string) string {
-	short := strings.ToLower(workloadUID)
+// stageJobName is the name of the stage Job of a request in a direction. It
+// names the attempt: a stage-out Job outlives its request, and the next attempt
+// copies back its own outputs.
+func stageJobName(req jobRequest, direction string) string {
+	short := strings.ToLower(req.WorkloadUID)
 	if len(short) > 8 {
 		short = short[:8]
 	}
-	return "stage-" + direction + "-" + short
+	return fmt.Sprintf("stage-%s-%s-%d", direction, short, req.Attempt)
 }
 
 // stageJob is the batch Job that copies paths in a direction for the workload:
@@ -159,8 +209,8 @@ func (d *Executor) stageJob(req jobRequest, direction string, paths []string) *b
 
 	backoff := int32(0)
 	automount := false
-	return &batchv1.Job{
-		ObjectMeta: metav1.ObjectMeta{Name: stageJobName(req.WorkloadUID, direction), Namespace: req.Namespace, Labels: labels},
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: stageJobName(req, direction), Namespace: req.Namespace, Labels: labels},
 		Spec: batchv1.JobSpec{
 			BackoffLimit: &backoff,
 			Template: v1.PodTemplateSpec{
@@ -184,21 +234,33 @@ func (d *Executor) stageJob(req jobRequest, direction string, paths []string) *b
 			},
 		},
 	}
+	if direction == stageOut {
+		ttl := int32(stageOutTTL / time.Second)
+		job.Spec.TTLSecondsAfterFinished = &ttl
+		if st.stageOutTimeout > 0 {
+			deadline := int64(st.stageOutTimeout / time.Second)
+			job.Spec.ActiveDeadlineSeconds = &deadline
+		}
+	}
+	return job
 }
 
-// ensureStageJob returns the workload's stage Job in a direction, created if
-// there is none yet.
+// ensureStageJob returns the request's stage Job in a direction, created if
+// there is none yet. A stage-out Job it creates is announced on the owner.
 func (d *Executor) ensureStageJob(ctx context.Context, req jobRequest, direction string, paths []string) (*batchv1.Job, error) {
 	if d.Kube == nil {
 		return nil, fmt.Errorf("the executor has no Kubernetes client to run stage Jobs")
 	}
 	jobs := d.Kube.BatchV1().Jobs(req.Namespace)
-	name := stageJobName(req.WorkloadUID, direction)
+	name := stageJobName(req, direction)
 	job, err := jobs.Get(ctx, name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		job, err = jobs.Create(ctx, d.stageJob(req, direction, paths), metav1.CreateOptions{})
 		if err == nil {
 			log.L.Infof("executor: workload %s: staging %s with Job %s", req.WorkloadUID, direction, name)
+			if direction == stageOut {
+				d.ownerEvent(ctx, req, v1.EventTypeNormal, EventStageOut, "copying "+strings.Join(paths, ":"))
+			}
 		}
 	}
 	if err != nil {
@@ -273,8 +335,8 @@ func (d *Executor) stageIn(ctx context.Context, q *v1alpha1.OffloadRequest, req 
 // stageOut copies the stage-out paths back once the job completed or failed, and
 // reports the job running and staging out until the copy ended: the outputs are
 // not where the user reads them before that. A failed copy fails the job. A
-// cancelled job is not copied: the offload controller deletes its request and
-// submits the workload again.
+// cancelled job is copied once its request is deleted (stageOutDeleted): the
+// offload controller deletes the request and submits the workload again.
 func (d *Executor) stageOut(ctx context.Context, req jobRequest, st *jobState) {
 	if st.State != jobCompleted && st.State != jobFailed {
 		return
@@ -313,15 +375,101 @@ func (d *Executor) stageOut(ctx context.Context, req jobRequest, st *jobState) {
 	case !done:
 		running("Job " + job.Name + " is running")
 	}
+	if done {
+		d.stageOutEvent(ctx, req, paths, job.Name, failed, why)
+	}
 }
 
-// deleteStageJobs deletes the workload's stage Jobs and their pods.
+// stageOutDeleted copies the stage-out paths of a deleted request back, as the
+// virtual kubelet's stager does for a deleted pod: for a job that started, unless
+// the request's poll already copied them, and DeleteGrace after the delete when
+// the job had not ended, so that the cancelled job stops writing first. It returns
+// how long the executor's finalizer must still hold the request: until the
+// stage-out Job ended, which its deadline (StageOutTimeout) bounds.
+func (d *Executor) stageOutDeleted(ctx context.Context, q *v1alpha1.OffloadRequest) time.Duration {
+	if !d.copiesBackOnDelete(q) {
+		return 0
+	}
+	req := jobRequestOf(q)
+	paths := stagePaths(req, StageOutAnnotation)
+	if !jobEnded(q) {
+		if wait := d.Config.Staging.deleteGrace - time.Since(q.DeletionTimestamp.Time); wait > 0 {
+			return wait
+		}
+	}
+	job, err := d.ensureStageJob(ctx, req, stageOut, paths)
+	if err != nil {
+		if !stageKubeErrorIsPermanent(err) {
+			log.L.Warning("executor: workload ", req.WorkloadUID, ": staging out: ", err)
+			return d.Config.Executor.pollInterval
+		}
+		// A namespace being deleted takes no Job: its outputs cannot be copied back.
+		d.ownerEvent(ctx, req, v1.EventTypeWarning, EventStageOutFailed, fmt.Sprintf("copying back %s failed: %v", strings.Join(paths, ":"), err))
+		return 0
+	}
+	done, failed, why := stageJobResult(job)
+	if !done {
+		return d.Config.Executor.pollInterval
+	}
+	d.stageOutEvent(ctx, req, paths, job.Name, failed, why)
+	return 0
+}
+
+// copiesBackOnDelete reports whether a deleted request has outputs to copy back:
+// stage-out paths, a job that started, and no copy by the request's poll.
+func (d *Executor) copiesBackOnDelete(q *v1alpha1.OffloadRequest) bool {
+	return d.Config.Staging.Enabled && started(q) && !stagedOut(q) && len(stagePaths(jobRequestOf(q), StageOutAnnotation)) > 0
+}
+
+// stagedOut reports whether the request's poll copied its outputs back already,
+// or tried to.
+func stagedOut(q *v1alpha1.OffloadRequest) bool {
+	c := meta.FindStatusCondition(q.Status.Conditions, v1alpha1.OffloadRequestStagingOut)
+	return c != nil && c.Status == metav1.ConditionFalse
+}
+
+// stageOutEvent records the end of a stage-out Job on the owner.
+func (d *Executor) stageOutEvent(ctx context.Context, req jobRequest, paths []string, job string, failed bool, why string) {
+	if failed {
+		d.ownerEvent(ctx, req, v1.EventTypeWarning, EventStageOutFailed,
+			fmt.Sprintf("copying back %s failed (%s), see the logs of Job %s", strings.Join(paths, ":"), why, job))
+		return
+	}
+	d.ownerEvent(ctx, req, v1.EventTypeNormal, EventStagedOut, "copied back "+strings.Join(paths, ":"))
+}
+
+// ownerEvent records an event on the workload's owner, where kubectl describe
+// shows it. A failure is only logged.
+func (d *Executor) ownerEvent(ctx context.Context, req jobRequest, eventType, reason, msg string) {
+	o := req.Owner
+	if d.Kube == nil || o.Name == "" {
+		return
+	}
+	now := metav1.Now()
+	ev := &v1.Event{
+		ObjectMeta:     metav1.ObjectMeta{Name: fmt.Sprintf("%s.%x", o.Name, now.UnixNano()), Namespace: req.Namespace},
+		InvolvedObject: v1.ObjectReference{APIVersion: o.APIVersion, Kind: o.Kind, Name: o.Name, Namespace: req.Namespace, UID: o.UID},
+		Type:           eventType,
+		Reason:         reason,
+		Message:        msg,
+		Count:          1,
+		Source:         v1.EventSource{Component: "kueue-offload-executor"},
+		FirstTimestamp: now,
+		LastTimestamp:  now,
+	}
+	if _, err := d.Kube.CoreV1().Events(req.Namespace).Create(ctx, ev, metav1.CreateOptions{}); err != nil {
+		log.L.Warning("executor: workload ", req.WorkloadUID, ": event ", reason, " on ", o.Kind, " ", o.Name, ": ", err)
+	}
+}
+
+// deleteStageJobs deletes the workload's stage-in Jobs and their pods. Its
+// stage-out Jobs go a day after they ended (stageOutTTL).
 func (d *Executor) deleteStageJobs(ctx context.Context, uid string) error {
 	if !d.Config.Staging.Enabled || d.Kube == nil {
 		return nil
 	}
 	jobs := d.Kube.BatchV1().Jobs(d.Config.Executor.Namespace)
-	list, err := jobs.List(ctx, metav1.ListOptions{LabelSelector: StageOfLabel + "=" + uid})
+	list, err := jobs.List(ctx, metav1.ListOptions{LabelSelector: StageOfLabel + "=" + uid + "," + StageDirectionLabel + "=" + stageIn})
 	if err != nil {
 		return err
 	}

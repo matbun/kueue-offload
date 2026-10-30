@@ -61,10 +61,10 @@ type templateData struct {
 	Reverse            *ReverseTunnel
 }
 
-const (
-	jobLogsContainer = "job-logs"
-	jobLogsCommand   = "/executor"
-)
+// JobLogsContainer is the shadow's container that streams the job's logs.
+const JobLogsContainer = "job-logs"
+
+const jobLogsCommand = "/executor"
 
 func (cfg Config) sshTunnel() sshTunnel {
 	return sshTunnel{
@@ -172,7 +172,7 @@ func render(cfg Config, spec Spec, name string, ports []portMapping, logsOnly bo
 func jobLogs(cfg Config, workloadUID string) corev1.Container {
 	noEscalation := false
 	return corev1.Container{
-		Name:    jobLogsContainer,
+		Name:    JobLogsContainer,
 		Image:   cfg.ExecutorImage,
 		Command: []string{jobLogsCommand, "logs", "--executor", cfg.ExecutorURL, "--workload", workloadUID, "--follow"},
 		Resources: corev1.ResourceRequirements{

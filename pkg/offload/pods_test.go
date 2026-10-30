@@ -248,15 +248,15 @@ func TestPodOwnersRejectedOnPermanentError(t *testing.T) {
 }
 
 func TestUnknownOwnerKindRejected(t *testing.T) {
-	ray := metav1.OwnerReference{APIVersion: "ray.io/v1", Kind: "RayCluster", Name: "train", UID: "rc"}
+	other := metav1.OwnerReference{APIVersion: "kubeflow.org/v1", Kind: "PyTorchJob", Name: "train", UID: "pt"}
 	pod := metav1.OwnerReference{APIVersion: "v1", Kind: "Pod", Name: "train-0", UID: "0b6c-pod-0"}
 	cases := []struct {
 		name   string
 		owners []metav1.OwnerReference
 		want   string
 	}{
-		{"controller", []metav1.OwnerReference{{APIVersion: ray.APIVersion, Kind: ray.Kind, Name: ray.Name, UID: ray.UID, Controller: ptr.To(true)}}, "owner ray.io/v1 RayCluster"},
-		{"next to a pod", []metav1.OwnerReference{pod, ray}, "owner ray.io/v1 RayCluster"},
+		{"controller", []metav1.OwnerReference{{APIVersion: other.APIVersion, Kind: other.Kind, Name: other.Name, UID: other.UID, Controller: ptr.To(true)}}, "owner kubeflow.org/v1 PyTorchJob"},
+		{"next to a pod", []metav1.OwnerReference{pod, other}, "owner kubeflow.org/v1 PyTorchJob"},
 		{"none", nil, "no owner"},
 	}
 	for _, tc := range cases {
@@ -270,7 +270,7 @@ func TestUnknownOwnerKindRejected(t *testing.T) {
 			})
 			e.reconcile()
 			st := e.check("hpc-a")
-			if st.State != kueue.CheckStateRejected || !strings.Contains(st.Message, "TrainJob and v1 Pod") || !strings.Contains(st.Message, tc.want) {
+			if st.State != kueue.CheckStateRejected || !strings.Contains(st.Message, "RayJob and RayCluster, and v1 Pod") || !strings.Contains(st.Message, tc.want) {
 				t.Errorf("check = %s %q, want Rejected naming %q", st.State, st.Message, tc.want)
 			}
 			if len(e.requests()) != 0 {
@@ -577,5 +577,138 @@ func TestRunningShownOnSinglePodsOnly(t *testing.T) {
 				t.Errorf("Job status %+v", j.Status)
 			}
 		})
+	}
+}
+
+// probedNotebook gives the single owner pod's container the readiness probe a
+// notebook's server is tested with at the site.
+func probedNotebook(objs *[]client.Object, _ *interceptor.Funcs) {
+	for _, o := range *objs {
+		if p, ok := o.(*corev1.Pod); ok {
+			p.Spec.Containers[0].ReadinessProbe = &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+				Exec: &corev1.ExecAction{Command: []string{"test", "-S", "$INTERLINK_SOCKET_DIR/fwd-8888.sock"}},
+			}}
+		}
+	}
+}
+
+// siteContainers is the head rank's container status the executor copies
+// from the plugin.
+func (e *env) siteContainers(ready bool) func(st *v1alpha1.OffloadRequestStatus) {
+	return func(st *v1alpha1.OffloadRequestStatus) {
+		st.Ranks = []v1alpha1.RankStatus{{Rank: 0, State: v1alpha1.RankRunning, Containers: []corev1.ContainerStatus{
+			{Name: "train", Ready: ready}, {Name: "wait", Ready: true},
+		}}}
+	}
+}
+
+// TestProbedContainerHoldsReady: a container with a readiness probe is ready
+// once the site reports it ready, and the pod with it; the shadow alone is not
+// enough. A container without a probe follows the shadow.
+func TestProbedContainerHoldsReady(t *testing.T) {
+	e := newEnv(t, podOwned(1), notebookPod, argoShaped, probedNotebook)
+	e.submitted()
+	start := metav1.NewTime(e.now)
+	e.report(1, func(st *v1alpha1.OffloadRequestStatus) {
+		e.running("node07", &start)(st)
+		e.shadow("10.244.1.7", true)(st)
+	})
+	e.reconcile()
+	p := e.pod("train-0")
+	for _, ty := range []corev1.PodConditionType{corev1.ContainersReady, corev1.PodReady} {
+		if c := podCondition(p, ty); c == nil || c.Status != corev1.ConditionFalse || c.Message != "container train of job 123 is not ready" {
+			t.Errorf("%s %+v, want False until the site reports the probed container ready", ty, c)
+		}
+	}
+	if cs := p.Status.ContainerStatuses; cs[0].Ready || !cs[1].Ready {
+		t.Errorf("containers ready %v %v, want the probed one not ready, the other ready", cs[0].Ready, cs[1].Ready)
+	}
+
+	e.report(1, e.siteContainers(false))
+	e.reconcile()
+	if c := podCondition(e.pod("train-0"), corev1.PodReady); c.Status != corev1.ConditionFalse {
+		t.Errorf("Ready %+v while the site's probe fails", c)
+	}
+
+	e.now = e.now.Add(time.Minute)
+	e.report(1, e.siteContainers(true))
+	e.reconcile()
+	p = e.pod("train-0")
+	for _, ty := range []corev1.PodConditionType{corev1.ContainersReady, corev1.PodReady} {
+		if c := podCondition(p, ty); c == nil || c.Status != corev1.ConditionTrue || !c.LastTransitionTime.Time.Equal(e.now) {
+			t.Errorf("%s %+v, want True since now", ty, c)
+		}
+	}
+	for _, cs := range p.Status.ContainerStatuses {
+		if !cs.Ready {
+			t.Errorf("container %s not ready", cs.Name)
+		}
+	}
+
+	// The shadow goes: nothing is ready, the probed container included.
+	e.report(1, e.shadow("10.244.1.7", false))
+	e.reconcile()
+	p = e.pod("train-0")
+	if c := podCondition(p, corev1.PodReady); c.Status != corev1.ConditionFalse || !strings.Contains(c.Message, "shadow of job 123 is not ready") {
+		t.Errorf("Ready %+v without the shadow", c)
+	}
+	for _, cs := range p.Status.ContainerStatuses {
+		if cs.Ready {
+			t.Errorf("container %s ready without the shadow", cs.Name)
+		}
+	}
+}
+
+// TestPodShowsLogsCommand: a single pod whose job has a shadow carries the
+// command that prints the job's logs, in its annotation and its status
+// message, and keeps it in the message of its terminal status.
+func TestPodShowsLogsCommand(t *testing.T) {
+	const cmd = "kubectl logs -n alice -l interlink.eu/shadow-of=0b6c-wl -c job-logs --tail=-1"
+	e := newEnv(t, podOwned(1), notebookPod)
+	e.submitted()
+	start := metav1.NewTime(e.now)
+	e.report(1, e.running("node07", &start))
+	e.reconcile()
+	if p := e.pod("train-0"); p.Annotations[LogsAnnotation] != "" || p.Status.Message != "" {
+		t.Errorf("logs command %q, message %q without a shadow", p.Annotations[LogsAnnotation], p.Status.Message)
+	}
+
+	e.report(1, e.shadow("10.244.1.7", true))
+	e.reconcile()
+	p := e.pod("train-0")
+	if p.Annotations[LogsAnnotation] != cmd || p.Status.Message != "logs: "+cmd {
+		t.Errorf("logs command %q, message %q, want %q", p.Annotations[LogsAnnotation], p.Status.Message, cmd)
+	}
+	if p.Annotations["slurm-job.vk.io/flags"] != "--time=01:00:00" || len(p.Spec.SchedulingGates) != 1 {
+		t.Errorf("pod changed beyond the annotation: %v %v", p.Annotations, p.Spec.SchedulingGates)
+	}
+
+	e.report(1, e.finished(false, "rank 0 exited 3"))
+	e.reconcile()
+	p = e.pod("train-0")
+	if want := "job 123 failed: rank 0 exited 3; logs: " + cmd; p.Status.Phase != corev1.PodFailed || p.Status.Message != want {
+		t.Errorf("pod %s %q, want Failed %q", p.Status.Phase, p.Status.Message, want)
+	}
+}
+
+// TestPendingAgainClearsLogsMessage: a pod back to a gated pod's status loses
+// the running job's message and keeps the command, which names the Workload's
+// shadow whatever the attempt.
+func TestPendingAgainClearsLogsMessage(t *testing.T) {
+	e := newEnv(t, podOwned(1), notebookPod)
+	e.submitted()
+	start := metav1.NewTime(e.now)
+	e.report(1, func(st *v1alpha1.OffloadRequestStatus) {
+		e.running("node07", &start)(st)
+		e.shadow("10.244.1.7", true)(st)
+	})
+	e.reconcile()
+	e.report(1, func(st *v1alpha1.OffloadRequestStatus) {
+		e.condition(st, v1alpha1.OffloadRequestAdmitted, metav1.ConditionFalse, "Queued", "")
+	})
+	e.reconcile()
+	p := e.pod("train-0")
+	if p.Status.Phase != corev1.PodPending || p.Status.Message != "" || p.Annotations[LogsAnnotation] == "" {
+		t.Errorf("pod %s %q, command %q", p.Status.Phase, p.Status.Message, p.Annotations[LogsAnnotation])
 	}
 }

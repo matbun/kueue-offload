@@ -58,13 +58,28 @@ type OffloadConfigSpec struct {
 	// +optional
 	MaxQueueTime *metav1.Duration `json:"maxQueueTime,omitempty"`
 
+	// maxStartDelay is how far ahead the site may expect to start a job when
+	// asked. Before it submits an attempt, the executor of a site that answers
+	// estimates records in the OffloadRequest's status.estimate when the job
+	// would start. A start further away than this from when it asked, or no start
+	// time at all (the site takes no further job of the user now), sets the check
+	// to Retry before the job is submitted: Kueue releases the quota and requeues
+	// the Workload after its backoff, so that a job the site would keep waiting
+	// does not hold the project's quota meanwhile. These retries never reject the
+	// Workload: the OffloadRequest's deferrals counts them apart from the
+	// retryStrategy's. Unset: no limit, and the estimate only shows in the check
+	// message.
+	// +optional
+	MaxStartDelay *metav1.Duration `json:"maxStartDelay,omitempty"`
+
 	// retryStrategy bounds the new attempts after a job is lost: cancelled on
 	// the site, behind an executor without a heartbeat for executorLostTimeout,
 	// or queued for longer than maxQueueTime. Each loss sets the check to Retry
 	// with requeueAfterSeconds from Kueue's backoff, backoffBaseSeconds doubled
 	// per retry up to backoffMaxSeconds, and Kueue requeues the Workload after
-	// that delay. The retries are counted by the OffloadRequest's attempt; once
-	// backoffLimitCount retries were spent the check is Rejected, and 0 rejects
+	// that delay. The retries are counted by the OffloadRequest's attempt less
+	// its deferrals; once backoffLimitCount retries were spent the check is
+	// Rejected, and 0 rejects
 	// at the first loss. A job that ran and failed is not retried, and a submit
 	// the executor refuses for now (a submit limit, an unreachable site) keeps
 	// the check Pending with the quota. The type and its defaults are
@@ -92,13 +107,24 @@ type OffloadConfigSpec struct {
 type FlavorTarget struct {
 	// annotations are added to every member pod of a PodSet admitted on this
 	// flavor. Each value is a Go text/template executed with .Account (the
-	// ClusterQueue's account label), .MaxExecSeconds (the Workload's
-	// maximumExecutionTimeSeconds, 0 when unset) and .MaxExecMinutes (the same in
-	// minutes, rounded up). The executor appends each value to the template's own
-	// value for that key, after a space, and never parses it, for example
+	// ClusterQueue's account label), .MaxExecSeconds (the job's wall time: the
+	// Workload's maximumExecutionTimeSeconds, else the annotation
+	// interlink.eu/time-limit, 0 when neither is set) and .MaxExecMinutes (the
+	// same in minutes, rounded up). The executor appends each value to the
+	// template's own value for that key, after a space, and never parses it, for
+	// example
 	// slurm-job.vk.io/flags: "--account={{.Account}} --qos=prod{{with .MaxExecMinutes}} --time={{.}}{{end}}".
 	// +optional
 	Annotations map[string]string `json:"annotations,omitempty"`
+
+	// maxExecutionTimeSeconds is the longest wall time a job may ask for on this
+	// flavor, the limit of the batch queue it stands for. A Workload asking for
+	// more, through its maximumExecutionTimeSeconds or interlink.eu/time-limit,
+	// is rejected: Kueue cannot choose a flavor by time, and the queue would hold
+	// or refuse the job. Unset: no limit.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxExecutionTimeSeconds *int32 `json:"maxExecutionTimeSeconds,omitempty"`
 }
 
 // Membership holds the settings of the membership sync controller.
@@ -122,6 +148,24 @@ type Membership struct {
 	// executorImage is passed to the executor template as .Image.
 	// +optional
 	ExecutorImage string `json:"executorImage,omitempty"`
+
+	// offboardTemplate holds a Go text/template, executed with the data of
+	// executorTemplate, that renders as multi-document YAML the Jobs to run in a
+	// namespace that left the site, once it has no OffloadRequest of the site
+	// left: for example one that removes the tenant's directories on the site.
+	// When they succeed, the controller deletes the objects it made for the
+	// namespace and the site; the Secrets the tenant made stay, so that adding
+	// the namespace back restores it. Unset: the objects are deleted without
+	// running anything.
+	// +optional
+	OffboardTemplate *ConfigMapKeyRef `json:"offboardTemplate,omitempty"`
+
+	// namespaceLabels are added to every member namespace of the site, for
+	// example the label that Kueue's managedJobsNamespaceSelector selects, so
+	// that Kueue manages the jobs of every tenant. A namespace that stops being
+	// a member loses only those the controller added, not one it already had.
+	// +optional
+	NamespaceLabels map[string]string `json:"namespaceLabels,omitempty"`
 
 	// cohort is the Kueue Cohort of the site's ClusterQueues. Unset means the
 	// site name.

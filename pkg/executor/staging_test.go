@@ -2,25 +2,40 @@ package executor
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stesting "k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/matbun/kueue-offload/api/v1alpha1"
 )
 
 const (
-	stageInJob  = "stage-in-0b6c1d2e"
-	stageOutJob = "stage-out-0b6c1d2e"
+	stageInJob  = "stage-in-0b6c1d2e-1"
+	stageOutJob = "stage-out-0b6c1d2e-1"
 )
 
+// enableStaging turns staging on, with the claims of its volumes in the
+// namespace.
 func (e *executorEnv) enableStaging() {
+	e.t.Helper()
+	for _, claim := range []string{"archive-claim", "shared-claim"} {
+		pvc := &v1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: claim, Namespace: executorNS}}
+		if _, err := e.kube.CoreV1().PersistentVolumeClaims(executorNS).Create(context.Background(), pvc, metav1.CreateOptions{}); err != nil {
+			e.t.Fatal(err)
+		}
+	}
 	e.d.Config.Staging = StagingConfig{
 		Enabled:             true,
 		Image:               "registry.a.example.org/stage:1",
@@ -35,7 +50,8 @@ func (e *executorEnv) enableStaging() {
 			{Name: "archive", ClaimName: "archive-claim", MountPath: "/archive", Kerberos: true},
 			{Name: "shared", ClaimName: "shared-claim", MountPath: "/shared"},
 		},
-		Kerberos: &StagingKerberos{KeytabSecret: "alice-keytab", KeytabKey: "keytab", Principal: "alice@A.EXAMPLE.ORG", Krb5ConfigMap: "krb5"},
+		Kerberos:        &StagingKerberos{KeytabSecret: "alice-keytab", KeytabKey: "keytab", Principal: "alice@A.EXAMPLE.ORG", Krb5ConfigMap: "krb5"},
+		stageOutTimeout: defaultStageOutTimeout,
 	}
 }
 
@@ -187,12 +203,16 @@ func TestStagePathRefusals(t *testing.T) {
 		{"relative", StageInAnnotation, "shared/data", "not a clean absolute path", false},
 		{"dot dot", StageOutAnnotation, "/shared/../etc", "not a clean absolute path", false},
 		{"staging off", StageInAnnotation, "/shared/alice/data", "stages nothing", true},
+		{"no claim", StageOutAnnotation, "/archive/alice/out", "namespace alice has no PersistentVolumeClaim archive-claim", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			e := newExecutorEnv(t)
 			if !tt.disabled {
 				e.enableStaging()
+				if err := e.kube.CoreV1().PersistentVolumeClaims(executorNS).Delete(context.Background(), "archive-claim", metav1.DeleteOptions{}); err != nil {
+					t.Fatal(err)
+				}
 			}
 			e.refusedWith(e.take(stagedRequest(tt.annotation, tt.paths)), tt.want)
 			if n := e.countActions("create", "jobs"); n != 0 {
@@ -232,10 +252,51 @@ func TestStageOut(t *testing.T) {
 	if env := envOf(job.Spec.Template.Spec.Containers[0]); env["STAGE_DIRECTION"] != "out" || env["STAGE_PATHS"] != "/shared/alice/out" || job.Labels[StageDirectionLabel] != "out" {
 		t.Fatalf("stage-out Job: %+v", job)
 	}
+	// Owned by nothing and kept a day after it ended, for its log; at most the
+	// stage-out timeout long.
+	if len(job.OwnerReferences) != 0 || job.Spec.TTLSecondsAfterFinished == nil || *job.Spec.TTLSecondsAfterFinished != 86400 ||
+		job.Spec.ActiveDeadlineSeconds == nil || *job.Spec.ActiveDeadlineSeconds != 4*3600 {
+		t.Fatalf("stage-out Job: owners %v, ttl %v, deadline %v", job.OwnerReferences, job.Spec.TTLSecondsAfterFinished, job.Spec.ActiveDeadlineSeconds)
+	}
+	if in := e.d.stageJob(jobRequestOf(e.request()), stageIn, []string{"/shared/alice/in"}); in.Spec.TTLSecondsAfterFinished != nil || in.Spec.ActiveDeadlineSeconds != nil {
+		t.Fatalf("stage-in Job with a TTL or a deadline: %+v", in.Spec)
+	}
 
 	e.endStageJob(stageOutJob, batchv1.JobComplete, "")
 	if q := e.poll(); state(q) != "succeeded" || q.Status.CompletionTime == nil || condition(q, v1alpha1.OffloadRequestStagingOut).Status != metav1.ConditionFalse {
 		t.Fatalf("after the stage-out: %s %+v", state(q), q.Status)
+	}
+	e.ownerEvents(EventStageOut+": copying /shared/alice/out", EventStagedOut+": copied back /shared/alice/out")
+
+	// Deleting the request copies nothing again and keeps the Job.
+	if err := e.remove(); err != nil {
+		t.Fatal(err)
+	}
+	if q := e.request(); slices.Contains(q.Finalizers, v1alpha1.ExecutorFinalizer) || e.countActions("create", "jobs") != 1 {
+		t.Fatalf("finalizers %v, %d Jobs created", q.Finalizers, e.countActions("create", "jobs"))
+	}
+	e.stageJob(stageOutJob)
+	e.ownerEvents(EventStageOut+": copying /shared/alice/out", EventStagedOut+": copied back /shared/alice/out")
+}
+
+// ownerEvents checks the events on the request's owner, as reason: message.
+func (e *executorEnv) ownerEvents(want ...string) {
+	e.t.Helper()
+	list, err := e.kube.CoreV1().Events(executorNS).List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	var got []string
+	for _, ev := range list.Items {
+		if o := ev.InvolvedObject; o.Kind != "Job" || o.APIVersion != "batch/v1" || o.Name != "train" || o.UID != "owner-uid" || ev.Source.Component != "kueue-offload-executor" {
+			e.t.Fatalf("event on %+v from %s", o, ev.Source.Component)
+		}
+		got = append(got, ev.Reason+": "+ev.Message)
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		e.t.Fatalf("events %q, want %q", got, want)
 	}
 }
 
@@ -252,8 +313,10 @@ func TestStageOutFailed(t *testing.T) {
 	}
 }
 
-func TestDeleteRemovesStageJobs(t *testing.T) {
-	other := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "stage-in-11111111", Namespace: executorNS, Labels: map[string]string{StageOfLabel: "11111111-other"}}}
+// A request deleted while its outputs are copied back loses its stage-in Job at
+// once, and keeps its finalizer until the stage-out Job ended, which stays.
+func TestDeleteWhileStagingOut(t *testing.T) {
+	other := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "stage-in-11111111-1", Namespace: executorNS, Labels: map[string]string{StageOfLabel: "11111111-other", StageDirectionLabel: stageIn}}}
 	e := newExecutorEnv(t, other)
 	e.enableStaging()
 	req := stagedRequest(StageInAnnotation, "/shared/alice/data")
@@ -269,24 +332,194 @@ func TestDeleteRemovesStageJobs(t *testing.T) {
 	if err := e.remove(); err != nil {
 		t.Fatal(err)
 	}
-	jobs, err := e.kube.BatchV1().Jobs(executorNS).List(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		t.Fatal(err)
+	if q := e.request(); !slices.Contains(q.Finalizers, v1alpha1.ExecutorFinalizer) {
+		t.Fatalf("the request went before its copy back: %v", q.Finalizers)
 	}
-	if len(jobs.Items) != 1 || jobs.Items[0].Name != other.Name {
-		t.Fatalf("Jobs left: %+v", jobs.Items)
-	}
+	e.jobsLeft(other.Name, stageOutJob)
 	deletes := 0
 	for _, a := range e.kube.Actions() {
 		if d, ok := a.(k8stesting.DeleteAction); ok && a.GetResource().Resource == "jobs" {
 			deletes++
-			if p := d.GetDeleteOptions().PropagationPolicy; p == nil || *p != metav1.DeletePropagationBackground {
-				t.Errorf("delete of %s without Background propagation", d.GetName())
+			if p := d.GetDeleteOptions().PropagationPolicy; p == nil || *p != metav1.DeletePropagationBackground || d.GetName() != stageInJob {
+				t.Errorf("delete of %s, propagation %v", d.GetName(), p)
 			}
 		}
 	}
-	if deletes != 2 {
-		t.Fatalf("%d Job deletes, want 2", deletes)
+	if deletes != 1 {
+		t.Fatalf("%d Job deletes, want 1", deletes)
+	}
+
+	e.endStageJob(stageOutJob, batchv1.JobComplete, "")
+	e.reconcile()
+	if q := e.request(); slices.Contains(q.Finalizers, v1alpha1.ExecutorFinalizer) || len(e.plugin.deletedUIDs()) != 1 {
+		t.Fatalf("after the copy back: finalizers %v, /delete for %v", q.Finalizers, e.plugin.deletedUIDs())
+	}
+	e.jobsLeft(other.Name, stageOutJob)
+	e.ownerEvents(EventStageOut+": copying /shared/alice/out", EventStagedOut+": copied back /shared/alice/out")
+}
+
+// jobsLeft checks the Jobs of the namespace by name.
+func (e *executorEnv) jobsLeft(want ...string) {
+	e.t.Helper()
+	jobs, err := e.kube.BatchV1().Jobs(executorNS).List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	var got []string
+	for _, j := range jobs.Items {
+		got = append(got, j.Name)
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		e.t.Fatalf("Jobs %v, want %v", got, want)
+	}
+}
+
+// startStagedOut submits a request with stage-out paths and makes its job run.
+func (e *executorEnv) startStagedOut() {
+	e.t.Helper()
+	e.submit(stagedRequest(StageOutAnnotation, "/shared/alice/out"))
+	e.setStatus(0, "node07", runningContainer(executorCtn, time.Now()))
+	if q := e.poll(); state(q) != "running" {
+		e.t.Fatalf("state %s", state(q))
+	}
+}
+
+// A running job whose request is deleted (its owner stopped or deleted) is
+// cancelled, and its outputs are copied back DeleteGrace later.
+func TestStageOutOnDelete(t *testing.T) {
+	e := newExecutorEnv(t)
+	e.enableStaging()
+	e.d.Config.Staging.deleteGrace = time.Hour
+	e.startStagedOut()
+
+	if err := e.c.Delete(context.Background(), e.request()); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		res, err := e.reconcileKey(e.key)
+		if err != nil || res.RequeueAfter < 59*time.Minute || res.RequeueAfter > time.Hour {
+			t.Fatalf("within the grace: %+v, %v", res, err)
+		}
+	}
+	if n := len(e.plugin.deletedUIDs()); n != 1 || e.countActions("create", "jobs") != 0 || len(e.shadow.deleted) != 1 {
+		t.Fatalf("within the grace: %d /delete calls, %d Jobs, shadow deletes %v", n, e.countActions("create", "jobs"), e.shadow.deleted)
+	}
+
+	e.d.Config.Staging.deleteGrace = 0
+	for range 2 {
+		res, err := e.reconcileKey(e.key)
+		if err != nil || res.RequeueAfter != defaultPollInterval {
+			t.Fatalf("while copying back: %+v, %v", res, err)
+		}
+	}
+	if q := e.request(); !slices.Contains(q.Finalizers, v1alpha1.ExecutorFinalizer) || e.countActions("create", "jobs") != 1 || len(e.plugin.deletedUIDs()) != 1 {
+		t.Fatalf("while copying back: finalizers %v, %d Jobs, %d /delete calls", q.Finalizers, e.countActions("create", "jobs"), len(e.plugin.deletedUIDs()))
+	}
+	if env := envOf(e.stageJob(stageOutJob).Spec.Template.Spec.Containers[0]); env["STAGE_DIRECTION"] != "out" || env["STAGE_PATHS"] != "/shared/alice/out" {
+		t.Fatalf("stage-out Job env %v", env)
+	}
+
+	e.endStageJob(stageOutJob, batchv1.JobFailed, "DeadlineExceeded")
+	e.reconcile()
+	if q := e.request(); slices.Contains(q.Finalizers, v1alpha1.ExecutorFinalizer) {
+		t.Fatalf("finalizers %v", q.Finalizers)
+	}
+	e.jobsLeft(stageOutJob)
+	e.ownerEvents(EventStageOut+": copying /shared/alice/out",
+		EventStageOutFailed+": copying back /shared/alice/out failed (DeadlineExceeded: from the test), see the logs of Job "+stageOutJob)
+}
+
+// The next attempt of a workload copies back into a stage-out Job of its own: the
+// last attempt's stays for its log.
+func TestStageOutOfTheNextAttempt(t *testing.T) {
+	e := newExecutorEnv(t)
+	e.enableStaging()
+	e.startStagedOut()
+	e.setStatus(0, "node07", terminatedContainer(executorCtn, 0, ReasonCancelled, time.Now(), time.Now()))
+	if q := e.poll(); state(q) != "evicted" {
+		t.Fatalf("state %s", state(q))
+	}
+	if err := e.remove(); err != nil {
+		t.Fatal(err)
+	}
+	e.endStageJob(stageOutJob, batchv1.JobComplete, "")
+	e.reconcile()
+
+	e.plugin.with(func(p *fakePlugin) { delete(p.status, memberUID(executorWorkload, 0)) })
+	e.submit(attempt(stagedRequest(StageOutAnnotation, "/shared/alice/out"), 2))
+	e.endJob(0)
+	if q := e.poll(); state(q) != "staging out" || q.Status.Message != "Job stage-out-0b6c1d2e-2 is running" {
+		t.Fatalf("attempt 2: %s %+v", state(q), q.Status)
+	}
+	e.jobsLeft(stageOutJob, "stage-out-0b6c1d2e-2")
+}
+
+// The next attempt waits while the cancelled one copies back: both stage to the
+// same paths of the site.
+func TestNextAttemptWaitsForTheCopyBack(t *testing.T) {
+	e := newExecutorEnv(t)
+	e.enableStaging()
+	e.d.Config.Staging.deleteGrace = 0
+	e.startStagedOut()
+	first := e.request()
+	if err := e.remove(); err != nil {
+		t.Fatal(err)
+	}
+	e.jobsLeft(stageOutJob)
+
+	e.plugin.with(func(p *fakePlugin) { delete(p.status, memberUID(executorWorkload, 0)) })
+	second := attempt(stagedRequest(StageOutAnnotation, "/shared/alice/out"), 2)
+	want := "waiting for OffloadRequest " + first.Name + " to copy back the outputs of its job (Job " + stageOutJob + ")"
+	waitingWith(t, e.take(second), want, true)
+	waitingWith(t, e.poll(), want, true)
+	if n := len(e.plugin.createdPods()); n != 1 {
+		t.Fatalf("%d /create calls while copying back, want only the first attempt's", n)
+	}
+
+	e.endStageJob(stageOutJob, batchv1.JobComplete, "")
+	if _, err := e.reconcileKey(client.ObjectKeyFromObject(first)); err != nil {
+		t.Fatal(err)
+	}
+	if q := e.poll(); q.Status.JobID != executorJobID || len(e.plugin.createdPods()) != 2 {
+		t.Fatalf("once copied back: %s %+v", state(q), q.Status)
+	}
+}
+
+// A job that never started has nothing to copy back.
+func TestDeleteQueuedCopiesNothing(t *testing.T) {
+	e := newExecutorEnv(t)
+	e.enableStaging()
+	e.submit(stagedRequest(StageOutAnnotation, "/shared/alice/out"))
+	if err := e.remove(); err != nil {
+		t.Fatal(err)
+	}
+	if q := e.request(); slices.Contains(q.Finalizers, v1alpha1.ExecutorFinalizer) || e.countActions("create", "jobs") != 0 {
+		t.Fatalf("finalizers %v, %d Jobs", q.Finalizers, e.countActions("create", "jobs"))
+	}
+}
+
+// A stage-out Job the executor will never get (a namespace being deleted) lets the
+// request go, with an event on the owner.
+func TestStageOutOnDeleteRefused(t *testing.T) {
+	e := newExecutorEnv(t)
+	e.enableStaging()
+	e.startStagedOut()
+	e.d.Config.Staging.deleteGrace = 0
+	e.kube.PrependReactor("create", "jobs", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "batch", Resource: "jobs"}, stageOutJob, errors.New("namespace alice is being terminated"))
+	})
+	if err := e.remove(); err != nil {
+		t.Fatal(err)
+	}
+	if q := e.request(); slices.Contains(q.Finalizers, v1alpha1.ExecutorFinalizer) {
+		t.Fatalf("finalizers %v", q.Finalizers)
+	}
+	list, err := e.kube.CoreV1().Events(executorNS).List(context.Background(), metav1.ListOptions{})
+	if err != nil || len(list.Items) != 1 || list.Items[0].Reason != EventStageOutFailed || list.Items[0].Type != v1.EventTypeWarning ||
+		!strings.Contains(list.Items[0].Message, "being terminated") {
+		t.Fatalf("events %+v, %v", list, err)
 	}
 }
 

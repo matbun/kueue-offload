@@ -122,11 +122,15 @@ Health. `/healthz` is the API server's `/pinglink`, which reaches the plugin.
 
 The controller knows the account, the flavor and the wall time. The plugin needs them in its own
 annotation syntax. Each OffloadConfig flavor gets `annotations` in place of `partition` and `qos`
-(`api/v1alpha1/offloadconfig_types.go:76-84`). The values are Go text/templates, as the membership
-executor template already is, and the controller expands them with `.Account` (the
-ClusterQueue's label `hpc.interlink.eu/account`, `pkg/offload/workload.go:300`), `.MaxExecSeconds` (the Workload's
-`spec.maximumExecutionTimeSeconds`, `0.16.9 apis/kueue/v1beta2/workload_types.go:77`, 0 when
-unset) and `.MaxExecMinutes` (the same, rounded up).
+(`FlavorTarget`, `api/v1alpha1/offloadconfig_types.go:107-128`). The values are Go text/templates,
+as the membership executor template already is, and the controller expands them with `.Account`
+(the ClusterQueue's label `hpc.interlink.eu/account`, `pkg/offload/workload.go:401`),
+`.MaxExecSeconds` (the job's wall time: the Workload's `spec.maximumExecutionTimeSeconds`,
+`0.16.9 apis/kueue/v1beta2/workload_types.go:77`, else the longest `interlink.eu/time-limit`
+(`HH:MM:SS`) of its PodSets, a template's value winning over the owner's; 0 when neither) and
+`.MaxExecMinutes` (the same, rounded up). The request's `spec.maximumExecutionTimeSeconds` carries
+that value, and a flavor's `maxExecutionTimeSeconds` bounds it: a longer job is rejected, since
+Kueue cannot choose a flavor by time.
 
 ```yaml
 spec:
@@ -198,6 +202,23 @@ then every few minutes, and at the submit of a gang that comes before the first 
 decoder ignores unknown fields, so older virtual kubelets are not affected. Upstream this is one
 field in `pkg/interlink/types.go`. Until it lands, the executor and the plugin decode their own
 copy of the type; the Slurm plugin already carries one (slurm `pkg/slurm/types.go:302-309`).
+
+| Capability | Route | What the executor does with it |
+| --- | --- | --- |
+| `pod-group` | `/create` per member | a pod group as one allocation (3.2) |
+| `pod-group-create` | `POST /createPodGroup` | a pod group in one call (3.3) |
+| `estimate` | `POST /estimate` | asks, before an attempt's first create, when the site would start the job (`design.md`, "Start estimate") |
+
+`/estimate` takes `{"nodes": N, "gpusPerNode": M, "cpusPerNode": C, "time": "HH:MM:SS", "flags":
+"..."}`: one node per member of a pod group, else 1; the most GPUs and CPUs any PodSet asks for
+(the site's `Resources.GPUResource` and its aliases, else any `<vendor>/gpu` resource); the wall
+time rounded up to minutes; the head member's `slurm-job.vk.io/flags`, the flavor's included. The
+API server refuses `nodes` below 1 itself with 400 and forwards the body unchanged otherwise. A
+plugin answers 200 with `{"start": "<RFC 3339>", "raw": "<its scheduler's text>"}`, or an error
+with its own status code, which the API server relays: 400 for a malformed request, 502 when the
+scheduler gives no start time (a per-user submit limit among them), 404 from a plugin without the
+route. The Slurm plugin runs `sbatch --test-only` with those values and the default flavor's
+flags.
 
 ### 3.2 `pod-group`: a gang as one allocation over per-pod /create
 

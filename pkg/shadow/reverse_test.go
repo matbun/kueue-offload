@@ -195,7 +195,7 @@ func TestEnsureReverseOnly(t *testing.T) {
 		t.Errorf("a reverse-only shadow has Service %q", ref.Service)
 	}
 	d := getDeployment(t, client, ref.Deployment)
-	if names := containerNames(d.Spec.Template.Spec.Containers); !slices.Equal(names, []string{"ssh-reverse", jobLogsContainer}) {
+	if names := containerNames(d.Spec.Template.Spec.Containers); !slices.Equal(names, []string{"ssh-reverse", JobLogsContainer}) {
 		t.Fatalf("containers %v", names)
 	}
 	reverse := container(t, d, "ssh-reverse")

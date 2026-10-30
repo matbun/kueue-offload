@@ -118,11 +118,20 @@ type OffloadRequestSpec struct {
 	Workload WorkloadReference `json:"workload"`
 	// admissionCheck is the Workload's check this request is an attempt of.
 	AdmissionCheck kueue.AdmissionCheckReference `json:"admissionCheck"`
-	// attempt counts the check's attempts from 1. Retries spent are attempt-1.
+	// attempt counts the check's attempts from 1. Retries spent are
+	// attempt-1-deferrals.
 	// It lives here because Kueue drops the state of a check that covers only
 	// some flavors, retryCount included, when it evicts the Workload.
 	// +kubebuilder:validation:Minimum=1
 	Attempt int32 `json:"attempt"`
+	// deferrals counts the check's earlier attempts set to Retry by the site's
+	// start estimate (the OffloadConfig's maxStartDelay), which are not retries:
+	// the previous attempt's deferrals, plus one when that attempt submitted no
+	// job and its status.estimate has no startTime or one further than
+	// maxStartDelay from its probeTime.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Deferrals int32 `json:"deferrals,omitempty"`
 	// site is the OffloadWorker the job runs on.
 	// +kubebuilder:validation:MinLength=1
 	Site string `json:"site"`
@@ -150,7 +159,9 @@ type OffloadRequestSpec struct {
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=8
 	PodSets []PodSet `json:"podSets"`
-	// maximumExecutionTimeSeconds is the Workload's, the job's wall time.
+	// maximumExecutionTimeSeconds is the job's wall time: the Workload's, else
+	// the longest interlink.eu/time-limit of its PodSets, a template's own value
+	// winning over the owner's.
 	// +optional
 	MaximumExecutionTimeSeconds *int32 `json:"maximumExecutionTimeSeconds,omitempty"`
 	// priority is the Workload's.
@@ -195,6 +206,29 @@ type ShadowReference struct {
 	Ready bool `json:"ready,omitempty"`
 }
 
+// StartEstimate is the site's answer, before an attempt is submitted, to when
+// it would start the job.
+type StartEstimate struct {
+	// probeTime is when the executor asked.
+	ProbeTime metav1.Time `json:"probeTime"`
+	// nodes is the number of nodes the job asked for.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	Nodes int32 `json:"nodes,omitempty"`
+	// startTime is when the site expects to start the job; unset when it gave
+	// none, as reason and message say.
+	// +optional
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+	// reason and message say why the site gave no start time, for example that
+	// it takes no further job of the user now (for Slurm,
+	// QOSMaxSubmitJobPerUserLimit).
+	// +optional
+	Reason string `json:"reason,omitempty"`
+	// +kubebuilder:validation:MaxLength=4096
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
 // OffloadRequestStatus is the executor's account of the request and its job.
 type OffloadRequestStatus struct {
 	// conditions are Accepted, StagingIn, QuotaReserved, Admitted, StagingOut,
@@ -236,6 +270,10 @@ type OffloadRequestStatus struct {
 	// shadow names the shadow objects of the job.
 	// +optional
 	Shadow *ShadowReference `json:"shadow,omitempty"`
+	// estimate is the site's start estimate for the job, asked before it is
+	// submitted, which the OffloadConfig's maxStartDelay is held against.
+	// +optional
+	Estimate *StartEstimate `json:"estimate,omitempty"`
 	// reason and message say what the executor is doing or waiting for: the
 	// site's reason for a queued job, why a submit is refused for now (a limit
 	// on submitted jobs, a site that cannot be reached), why a job failed.

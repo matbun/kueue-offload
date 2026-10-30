@@ -15,12 +15,13 @@ import (
 )
 
 // fakePlugin is an interLink plugin behind the API server: /create, /status (with
-// an empty list, the ping), /getLogs, /delete and /createPodGroup. Every answer is
-// scripted by the test. With capability pod-group, which it lists by default,
-// members of a pod group are buffered until the last one, as the Slurm plugin's
-// gang path does; without it every pod is its own job, numbered from fakeJobID by
-// completion index. /createPodGroup gives every pod of the group fakeJobID, as the
-// Slurm plugin does; the executor calls it only when a test lists pod-group-create.
+// an empty list, the ping), /getLogs, /delete, /createPodGroup and /estimate.
+// Every answer is scripted by the test. With capability pod-group, which it
+// lists by default, members of a pod group are buffered until the last one, as
+// the Slurm plugin's gang path does; without it every pod is its own job,
+// numbered from fakeJobID by completion index. /createPodGroup gives every pod of
+// the group fakeJobID, as the Slurm plugin does; the executor calls it only when
+// a test lists pod-group-create, and /estimate only when a test lists estimate.
 type fakePlugin struct {
 	t   *testing.T
 	srv *httptest.Server
@@ -57,6 +58,13 @@ type fakePlugin struct {
 	// that answer.
 	capabilities []string
 	pingBody     string
+	// estimates holds every /estimate body, in arrival order. estimateCode and
+	// estimateText answer them when the code is set; otherwise the answer is
+	// estimateStart.
+	estimates     []EstimateRequest
+	estimateCode  int
+	estimateText  string
+	estimateStart time.Time
 }
 
 const fakeJobID = executorJobID
@@ -79,6 +87,7 @@ func newFakePlugin(t *testing.T) *fakePlugin {
 	mux.HandleFunc("/getLogs", p.getLogs)
 	mux.HandleFunc("/delete", p.delete)
 	mux.HandleFunc("/createPodGroup", p.createPodGroup)
+	mux.HandleFunc("/estimate", p.estimate)
 	p.srv = httptest.NewServer(mux)
 	t.Cleanup(p.srv.Close)
 	return p
@@ -152,6 +161,21 @@ func (p *fakePlugin) createPodGroup(w http.ResponseWriter, r *http.Request) {
 		out = p.groupAnswer(out)
 	}
 	writeTestJSON(w, out)
+}
+
+func (p *fakePlugin) estimate(w http.ResponseWriter, r *http.Request) {
+	var req EstimateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		p.t.Errorf("fake plugin: decoding /estimate: %v", err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.estimates = append(p.estimates, req)
+	if p.estimateCode != 0 {
+		http.Error(w, p.estimateText, p.estimateCode)
+		return
+	}
+	writeTestJSON(w, EstimateResponse{Start: p.estimateStart, Raw: "sbatch: Job 77 to start at " + p.estimateStart.Format("2006-01-02T15:04:05")})
 }
 
 func (p *fakePlugin) statusHandler(w http.ResponseWriter, r *http.Request) {
@@ -249,6 +273,13 @@ func (p *fakePlugin) createdPods() []v1.Pod {
 		pods = append(pods, d.Pod)
 	}
 	return pods
+}
+
+// estimateCalls returns the /estimate bodies, in arrival order.
+func (p *fakePlugin) estimateCalls() []EstimateRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]EstimateRequest(nil), p.estimates...)
 }
 
 // podGroupCalls returns the /createPodGroup bodies, in arrival order.

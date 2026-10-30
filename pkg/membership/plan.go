@@ -199,7 +199,7 @@ func contains(list []string, v string) bool {
 	return false
 }
 
-func splitAccounts(v string) []string {
+func splitList(v string) []string {
 	var out []string
 	for _, a := range strings.Split(v, ",") {
 		if a = strings.TrimSpace(a); a != "" {

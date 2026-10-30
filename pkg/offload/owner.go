@@ -22,6 +22,7 @@ import (
 	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
 
 	"github.com/matbun/kueue-offload/api/v1alpha1"
+	"github.com/matbun/kueue-offload/pkg/shadow"
 )
 
 // Reasons written on the owner's conditions and on the owner pods.
@@ -31,11 +32,15 @@ const (
 )
 
 // workloadOwner is what a Workload finishes through: its controller, a
-// batch/v1 Job, a JobSet or a TrainJob, or the pods of Kueue's
-// pod integration, one pod or a pod group.
+// batch/v1 Job, a JobSet, a TrainJob, a RayJob or a RayCluster, or the pods of
+// Kueue's pod integration, one pod or a pod group.
 type workloadOwner struct {
 	ref  *metav1.OwnerReference
 	pods []metav1.OwnerReference
+	// workload is the Workload's key and uid its UID: a RayCluster's run ends
+	// by deactivating it.
+	workload types.NamespacedName
+	uid      types.UID
 }
 
 // ownerKind is a controller owner the offload controller finishes through its status.
@@ -48,10 +53,12 @@ type ownerKind struct {
 }
 
 var (
-	jobKind      = ownerKind{gvk: batchv1.SchemeGroupVersion.WithKind("Job")}
-	jobSetKind   = ownerKind{gvk: schema.GroupVersionKind{Group: "jobset.x-k8s.io", Version: "v1alpha2", Kind: "JobSet"}, complete: "Completed", failed: "Failed", terminalState: true}
-	trainJobKind = ownerKind{gvk: schema.GroupVersionKind{Group: "trainer.kubeflow.org", Version: "v1alpha1", Kind: "TrainJob"}, complete: "Complete", failed: "Failed"}
-	ownerKinds   = []ownerKind{jobKind, jobSetKind, trainJobKind}
+	jobKind        = ownerKind{gvk: batchv1.SchemeGroupVersion.WithKind("Job")}
+	jobSetKind     = ownerKind{gvk: schema.GroupVersionKind{Group: "jobset.x-k8s.io", Version: "v1alpha2", Kind: "JobSet"}, complete: "Completed", failed: "Failed", terminalState: true}
+	trainJobKind   = ownerKind{gvk: schema.GroupVersionKind{Group: "trainer.kubeflow.org", Version: "v1alpha1", Kind: "TrainJob"}, complete: "Complete", failed: "Failed"}
+	rayJobKind     = ownerKind{gvk: schema.GroupVersionKind{Group: "ray.io", Version: "v1", Kind: "RayJob"}}
+	rayClusterKind = ownerKind{gvk: schema.GroupVersionKind{Group: "ray.io", Version: "v1", Kind: "RayCluster"}}
+	ownerKinds     = []ownerKind{jobKind, jobSetKind, trainJobKind, rayJobKind, rayClusterKind}
 )
 
 func kindOf(ref *metav1.OwnerReference) (ownerKind, bool) {
@@ -66,10 +73,11 @@ func kindOf(ref *metav1.OwnerReference) (ownerKind, bool) {
 // ownerOf returns the Workload's owner, or nil and a message saying why the
 // offload controller cannot handle it.
 func ownerOf(wl *kueue.Workload) (*workloadOwner, string) {
+	key := types.NamespacedName{Namespace: wl.Namespace, Name: wl.Name}
 	c := metav1.GetControllerOf(wl)
 	if c != nil {
 		if _, ok := kindOf(c); ok {
-			return &workloadOwner{ref: c}, ""
+			return &workloadOwner{ref: c, workload: key, uid: wl.UID}, ""
 		}
 	}
 	if c != nil && !isPod(c) {
@@ -88,7 +96,7 @@ func ownerOf(wl *kueue.Workload) (*workloadOwner, string) {
 	if len(pods) == 0 {
 		return nil, unsupportedOwner(nil)
 	}
-	return &workloadOwner{pods: pods}, ""
+	return &workloadOwner{pods: pods, workload: key, uid: wl.UID}, ""
 }
 
 // singlePod is the pod of a Workload of one plain pod, its controller, or nil.
@@ -109,7 +117,7 @@ func unsupportedOwner(ref *metav1.OwnerReference) string {
 		what = fmt.Sprintf("owner %s %s", ref.APIVersion, ref.Kind)
 	}
 	return "kueue-offload handles only batch/v1 Job, jobset.x-k8s.io/v1alpha2 JobSet, " +
-		"trainer.kubeflow.org/v1alpha1 TrainJob and v1 Pod workloads, this one has " + what
+		"trainer.kubeflow.org/v1alpha1 TrainJob, ray.io/v1 RayJob and RayCluster, and v1 Pod workloads, this one has " + what
 }
 
 // readOwner returns the owner the executor is told about and the object it
@@ -149,17 +157,27 @@ func readOwner(ctx context.Context, r client.Reader, namespace string, o *worklo
 	return nil, nil, nil
 }
 
-// finishOwner writes the terminal state on the Workload's owner.
+// finishOwner writes the terminal state on the Workload's owner. A RayCluster
+// has none that Kueue reads: when its job ends its Workload is deactivated, and
+// when it is rejected Kueue deactivates it.
 func finishOwner(ctx context.Context, c client.Client, r client.Reader, namespace string, o *workloadOwner, out jobOutcome, now time.Time) error {
 	if o.ref == nil {
 		return finishPods(ctx, c, r, namespace, o.pods, out, now)
 	}
 	key := types.NamespacedName{Namespace: namespace, Name: o.ref.Name}
-	k, _ := kindOf(o.ref)
-	if k == jobKind {
+	switch k, _ := kindOf(o.ref); k {
+	case jobKind:
 		return finishJob(ctx, c, r, key, o.ref.UID, out, now)
+	case rayJobKind:
+		return finishRayJob(ctx, c, r, key, o.ref.UID, out, now)
+	case rayClusterKind:
+		if out.reason == ReasonRejected {
+			return nil
+		}
+		return deactivateWorkload(ctx, c, r, o.workload, o.uid)
+	default:
+		return finishConditions(ctx, c, r, k, key, o.ref.UID, out, now)
 	}
-	return finishConditions(ctx, c, r, k, key, o.ref.UID, out, now)
 }
 
 // jobOutcome is the terminal state written on the owner.
@@ -308,8 +326,9 @@ func finishConditions(ctx context.Context, c client.Client, r client.Reader, k o
 
 // finishPods sets every owner pod's phase to Succeeded or Failed, with a
 // terminated status for each of its containers and Ready False, so a workflow
-// engine that reads the main container sees how the step ended. Kueue then removes
-// its finalizers and marks the Workload Finished. A failed pod of a group is
+// engine that reads the main container sees how the step ended; the message
+// ends with the logs command of a pod that has one (LogsAnnotation). Kueue then
+// removes its finalizers and marks the Workload Finished. A failed pod of a group is
 // first annotated retriable-in-group "false": without it Kueue waits for
 // replacement pods and never finishes the group. The pods stay gated:
 // spec.nodeName is never set. Pods already terminal or gone are skipped.
@@ -329,6 +348,10 @@ func finishPods(ctx context.Context, c client.Client, r client.Reader, namespace
 		if pod.UID != ref.UID || podFinished(pod) {
 			continue
 		}
+		msg := o.message
+		if cmd := pod.Annotations[LogsAnnotation]; cmd != "" {
+			msg += "; logs: " + cmd
+		}
 		if !o.succeeded && pod.Labels[podconstants.GroupNameLabel] != "" &&
 			pod.Annotations[podconstants.RetriableInGroupAnnotationKey] != podconstants.RetriableInGroupAnnotationValue {
 			annotated := pod.DeepCopy()
@@ -342,7 +365,7 @@ func finishPods(ctx context.Context, c client.Client, r client.Reader, namespace
 			pod = annotated
 		}
 		done := pod.DeepCopy()
-		done.Status.Phase, done.Status.Reason, done.Status.Message = phase, o.reason, o.message
+		done.Status.Phase, done.Status.Reason, done.Status.Message = phase, o.reason, msg
 		for _, ty := range []corev1.PodConditionType{corev1.ContainersReady, corev1.PodReady} {
 			done.Status.Conditions = setPodCondition(done.Status.Conditions, ty, corev1.ConditionFalse, ReasonOffload, "", now)
 		}
@@ -358,12 +381,29 @@ func finishPods(ctx context.Context, c client.Client, r client.Reader, namespace
 // kubeletConditions are the pod conditions a kubelet sets on a pod it runs.
 var kubeletConditions = []corev1.PodConditionType{corev1.PodInitialized, corev1.ContainersReady, corev1.PodReady}
 
+// LogsAnnotation on an owner pod is the command that prints its job's logs:
+// kubectl logs cannot, since the pod never runs on a node, and the shadow's
+// job-logs container streams them.
+const LogsAnnotation = "offload.interlink.eu/logs"
+
+// logsCommand is the command that prints the logs of q's job, empty when the
+// job has no shadow. --tail=-1: with a selector kubectl prints the last 10
+// lines only.
+func logsCommand(q *v1alpha1.OffloadRequest) string {
+	if q.Status.Shadow == nil || q.Status.Shadow.Deployment == "" {
+		return ""
+	}
+	return fmt.Sprintf("kubectl logs -n %s -l %s=%s -c %s --tail=-1", q.Namespace, shadow.LabelShadowOf, q.Spec.Workload.UID, shadow.JobLogsContainer)
+}
+
 // syncSinglePod shows the job of a Workload of one plain pod on that pod, as a
 // kubelet reports a pod it runs and as MultiKueue copies a worker's pod status
 // onto the manager's gated pod. While q is Admitted: phase Running, init
 // containers terminated and containers running since the job's start, Ready and
-// ContainersReady while the shadow is ready and the job is not staging out, and
-// the shadow pod's IP. With no running job (q nil or not Admitted) a pod shown
+// ContainersReady while the shadow is ready, the job is not staging out and
+// every container with a readiness probe is ready at the site, the shadow pod's
+// IP, and the command that prints the job's logs, in the status message and in
+// LogsAnnotation. With no running job (q nil or not Admitted) a pod shown
 // Running goes back to Pending, a gated pod's status. The pod stays gated, so
 // Kueue's pod controller keeps counting it suspended; terminal pods are
 // finishPods'.
@@ -379,15 +419,26 @@ func syncSinglePod(ctx context.Context, c client.Client, r client.Reader, namesp
 	if pod.UID != ref.UID || podFinished(pod) {
 		return nil
 	}
+	running := q != nil && meta.IsStatusConditionTrue(q.Status.Conditions, v1alpha1.OffloadRequestAdmitted)
+	if running {
+		if cmd := logsCommand(q); cmd != "" && pod.Annotations[LogsAnnotation] != cmd {
+			annotated := pod.DeepCopy()
+			metav1.SetMetaDataAnnotation(&annotated.ObjectMeta, LogsAnnotation, cmd)
+			if err := c.Patch(ctx, annotated, client.MergeFrom(pod)); err != nil {
+				return client.IgnoreNotFound(err)
+			}
+			pod = annotated
+		}
+	}
 	done := pod.DeepCopy()
 	st := &done.Status
 	switch {
-	case q != nil && meta.IsStatusConditionTrue(q.Status.Conditions, v1alpha1.OffloadRequestAdmitted):
+	case running:
 		runningStatus(done, q, now)
 	case st.Phase == corev1.PodRunning:
 		st.Phase = corev1.PodPending
 		st.Conditions = slices.DeleteFunc(st.Conditions, func(c corev1.PodCondition) bool { return slices.Contains(kubeletConditions, c.Type) })
-		st.PodIP, st.PodIPs, st.StartTime = "", nil, nil
+		st.PodIP, st.PodIPs, st.StartTime, st.Message = "", nil, nil, ""
 		st.InitContainerStatuses, st.ContainerStatuses = nil, nil
 	}
 	if equality.Semantic.DeepEqual(pod.Status, done.Status) {
@@ -396,15 +447,30 @@ func syncSinglePod(ctx context.Context, c client.Client, r client.Reader, namesp
 	return client.IgnoreNotFound(c.Status().Patch(ctx, done, client.MergeFrom(pod)))
 }
 
-// runningStatus sets pod's status to that of a pod running q's job.
+// runningStatus sets pod's status to that of a pod running q's job. A
+// container with a readiness probe is ready once the head rank's container of
+// that name is: the site runs the probe in the job, for example a notebook's
+// test of the socket its server listens on.
 func runningStatus(pod *corev1.Pod, q *v1alpha1.OffloadRequest, now time.Time) {
 	st, sh := &pod.Status, q.Status.Shadow
-	notReady := ""
+	// jobNotReady holds every container back, a probe at the site only its own.
+	jobNotReady := ""
 	switch {
 	case meta.IsStatusConditionTrue(q.Status.Conditions, v1alpha1.OffloadRequestStagingOut):
-		notReady = jobOf(q) + " ended, staging out"
+		jobNotReady = jobOf(q) + " ended, staging out"
 	case sh == nil || !sh.Ready:
-		notReady = "the shadow of " + jobOf(q) + " is not ready"
+		jobNotReady = "the shadow of " + jobOf(q) + " is not ready"
+	}
+	probed := siteReadiness(pod, q)
+	ctrReady := func(name string) bool {
+		r, ok := probed[name]
+		return jobNotReady == "" && (!ok || r)
+	}
+	notReady := jobNotReady
+	for _, ctr := range pod.Spec.Containers {
+		if notReady == "" && !ctrReady(ctr.Name) {
+			notReady = "container " + ctr.Name + " of " + jobOf(q) + " is not ready"
+		}
 	}
 	ready, readyStatus, reason := notReady == "", corev1.ConditionTrue, ""
 	if !ready {
@@ -419,6 +485,10 @@ func runningStatus(pod *corev1.Pod, q *v1alpha1.OffloadRequest, now time.Time) {
 	}
 
 	st.Phase, st.StartTime = corev1.PodRunning, start.DeepCopy()
+	st.Message = ""
+	if cmd := logsCommand(q); cmd != "" {
+		st.Message = "logs: " + cmd
+	}
 	st.PodIP, st.PodIPs = "", nil
 	if sh != nil && net.ParseIP(sh.PodIP) != nil {
 		st.PodIP, st.PodIPs = sh.PodIP, []corev1.PodIP{{IP: sh.PodIP}}
@@ -431,10 +501,34 @@ func runningStatus(pod *corev1.Pod, q *v1alpha1.OffloadRequest, now time.Time) {
 	st.ContainerStatuses = make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
 	for _, ctr := range pod.Spec.Containers {
 		st.ContainerStatuses = append(st.ContainerStatuses, corev1.ContainerStatus{
-			Name: ctr.Name, Image: ctr.Image, Ready: ready, Started: ptr.To(true),
+			Name: ctr.Name, Image: ctr.Image, Ready: ctrReady(ctr.Name), Started: ptr.To(true),
 			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: *start}},
 		})
 	}
+}
+
+// siteReadiness is, for each of pod's containers with a readiness probe,
+// whether the head rank's container of that name is ready at the site.
+func siteReadiness(pod *corev1.Pod, q *v1alpha1.OffloadRequest) map[string]bool {
+	var out map[string]bool
+	for _, ctr := range pod.Spec.Containers {
+		if ctr.ReadinessProbe == nil {
+			continue
+		}
+		if out == nil {
+			out = map[string]bool{}
+		}
+		out[ctr.Name] = false
+		if len(q.Status.Ranks) == 0 {
+			continue
+		}
+		for _, cs := range q.Status.Ranks[0].Containers {
+			if cs.Name == ctr.Name {
+				out[ctr.Name] = cs.Ready
+			}
+		}
+	}
+	return out
 }
 
 // setPodCondition sets the condition of type ty, moving its lastTransitionTime

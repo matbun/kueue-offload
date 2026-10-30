@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"maps"
 	"os/exec"
 	"reflect"
 	"slices"
@@ -13,9 +15,11 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/kubernetes/fake"
 )
 
@@ -359,6 +363,130 @@ func TestShadowCarriesServiceLabels(t *testing.T) {
 	if _, ok := d.Spec.Template.Labels["statefulset"]; ok {
 		t.Errorf("the logs-only shadow carries the pod's labels: %v", d.Spec.Template.Labels)
 	}
+}
+
+// Without a pod of its own, the shadow stands for rank 0's pod by its template:
+// a RayCluster's head template carries the labels KubeRay's head Service
+// <name>-head-svc selects. The shadow carries none of them, which KubeRay counts
+// its pods by, and is published to that Service with an EndpointSlice of the
+// ports it forwards; a Service it forwards no port of gets none.
+func TestShadowPublishedToServicesOfTemplate(t *testing.T) {
+	head := map[string]string{
+		"ray.io/cluster": testName, "ray.io/node-type": "head", "ray.io/identifier": testName + "-head",
+		"app.kubernetes.io/name": "kuberay", "app.kubernetes.io/created-by": "kuberay-operator",
+	}
+	headSvc := service(testName+"-head-svc", head)
+	headSvc.Spec.ClusterIP, headSvc.Spec.PublishNotReadyAddresses = corev1.ClusterIPNone, true
+	headSvc.Spec.Ports = []corev1.ServicePort{
+		{Name: "client", Port: 10001}, {Name: "dashboard", Port: 8265}, {Name: "gcs-server", Port: 6379},
+		{Name: "metrics", Port: 8080, TargetPort: intstr.FromString("metrics")},
+	}
+	metricsOnly := service("metrics", map[string]string{"ray.io/cluster": testName})
+	metricsOnly.Spec.Ports = []corev1.ServicePort{{Name: "metrics", Port: 8080}}
+	shadowPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: testShadow + "-abc", Namespace: testNamespace, UID: "pod-uid",
+			Labels: map[string]string{"app.kubernetes.io/component": testShadow, LabelShadowOf: testUID}},
+		Spec:   corev1.PodSpec{NodeName: "worker-3"},
+		Status: corev1.PodStatus{PodIP: "10.0.0.7"},
+	}
+	client, m := newTestManager(t, testConfig(), headSvc, metricsOnly,
+		service("workers", map[string]string{"ray.io/cluster": testName, "ray.io/node-type": "worker"}),
+		shadowPod,
+	)
+	spec := notebookSpec()
+	spec.Template = podTemplate(8265, 10001)
+	maps.Copy(spec.Template.Labels, head)
+	spec.Template.Labels["ray.io/group"] = "headgroup"
+	if _, err := m.Ensure(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"app.kubernetes.io/component": testShadow, LabelShadow: "true", LabelShadowOf: testUID}
+	if got := getDeployment(t, client, testShadow).Spec.Template.Labels; !reflect.DeepEqual(got, want) {
+		t.Errorf("pod template labels %v, want %v", got, want)
+	}
+	published := endpointSlices(t, client)
+	if len(published) != 1 {
+		t.Fatalf("endpoint slices %v, want one for the head Service", published)
+	}
+	es := published[0]
+	if es.Name != testShadow+"-"+headSvc.Name || es.Labels["kubernetes.io/service-name"] != headSvc.Name ||
+		es.Labels["endpointslice.kubernetes.io/managed-by"] != endpointSliceManager || es.Labels[LabelShadowOf] != testUID {
+		t.Errorf("endpoint slice %s labels %v", es.Name, es.Labels)
+	}
+	var ports []string
+	for _, p := range es.Ports {
+		ports = append(ports, fmt.Sprintf("%s:%d", *p.Name, *p.Port))
+	}
+	if !slices.Equal(ports, []string{"client:10001", "dashboard:8265"}) {
+		t.Errorf("ports %v, want those the shadow forwards", ports)
+	}
+	ep := es.Endpoints[0]
+	if es.AddressType != "IPv4" || len(es.Endpoints) != 1 || !slices.Equal(ep.Addresses, []string{"10.0.0.7"}) || ep.TargetRef.Name != shadowPod.Name ||
+		*ep.NodeName != "worker-3" || !*ep.Conditions.Ready || *ep.Conditions.Serving {
+		t.Errorf("endpoint %+v, want the shadow pod, ready as the Service publishes not ready addresses, not serving", ep)
+	}
+
+	// Unchanged, nothing is written; a new pod IP is.
+	client.ClearActions()
+	if _, err := m.Ensure(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if w := writes(client); len(w) != 0 {
+		t.Fatalf("re-applying the same spec wrote %v", w)
+	}
+	shadowPod.Status.PodIP = "10.0.0.8"
+	if _, err := client.CoreV1().Pods(testNamespace).UpdateStatus(t.Context(), shadowPod, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	client.ClearActions()
+	if _, err := m.Ensure(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if w := writes(client); !slices.Equal(w, []string{"update endpointslices"}) {
+		t.Errorf("writes %v, want the endpoint slice updated", w)
+	}
+	if got := endpointSlices(t, client)[0].Endpoints[0].Addresses; !slices.Equal(got, []string{"10.0.0.8"}) {
+		t.Errorf("addresses %v after the pod IP changed", got)
+	}
+
+	// Ended, the shadow forwards nothing: its endpoint slices go.
+	spec.Terminal = true
+	if _, err := m.Ensure(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if got := endpointSlices(t, client); len(got) != 0 {
+		t.Errorf("endpoint slices %v left on a logs-only shadow", got)
+	}
+
+	// The owner pod's labels, when there is one, are what Services select.
+	spec.Terminal = false
+	spec.Labels = map[string]string{"statefulset": testName}
+	if _, err := m.Ensure(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if got := endpointSlices(t, client); len(got) != 0 {
+		t.Errorf("endpoint slices %v for a shadow of an owner pod", got)
+	}
+
+	spec.Labels = nil
+	if _, err := m.Ensure(t.Context(), spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Delete(t.Context(), testUID); err != nil {
+		t.Fatal(err)
+	}
+	if got := endpointSlices(t, client); len(got) != 0 {
+		t.Errorf("endpoint slices %v left after Delete", got)
+	}
+}
+
+func endpointSlices(t *testing.T, client *fake.Clientset) []discoveryv1.EndpointSlice {
+	t.Helper()
+	list, err := client.DiscoveryV1().EndpointSlices(testNamespace).List(t.Context(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return list.Items
 }
 
 func TestEnsureReportsShadowPod(t *testing.T) {

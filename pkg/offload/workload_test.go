@@ -623,18 +623,18 @@ func TestNonJobOwnerRejected(t *testing.T) {
 	e := newEnv(t, func(objs *[]client.Object, _ *interceptor.Funcs) {
 		for _, o := range *objs {
 			if wl, ok := o.(*kueue.Workload); ok {
-				wl.OwnerReferences[0] = metav1.OwnerReference{APIVersion: "ray.io/v1", Kind: "RayJob",
-					Name: "train", UID: "rj", Controller: ptr.To(true)}
+				wl.OwnerReferences[0] = metav1.OwnerReference{APIVersion: "kubeflow.org/v1", Kind: "MPIJob",
+					Name: "train", UID: "mj", Controller: ptr.To(true)}
 			}
 		}
 	})
 	e.reconcile()
 	st := e.check("hpc-a")
-	if st.State != kueue.CheckStateRejected || !strings.Contains(st.Message, "only batch/v1 Job") || !strings.Contains(st.Message, "ray.io/v1 RayJob") {
+	if st.State != kueue.CheckStateRejected || !strings.Contains(st.Message, "only batch/v1 Job") || !strings.Contains(st.Message, "kubeflow.org/v1 MPIJob") {
 		t.Errorf("check = %s %q", st.State, st.Message)
 	}
 	if len(e.requests()) != 0 {
-		t.Errorf("a request for a RayJob workload")
+		t.Errorf("a request for an MPIJob workload")
 	}
 	if len(e.job().Status.Conditions) != 0 {
 		t.Errorf("an unrelated Job was patched")

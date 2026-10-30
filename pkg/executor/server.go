@@ -27,6 +27,7 @@ import (
 	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -54,6 +55,7 @@ type jobRequest struct {
 	OwnerLabels  map[string]string
 	Site         string
 	Account      string
+	Attempt      int32
 	PodSets      []v1alpha1.PodSet
 }
 
@@ -66,6 +68,7 @@ func jobRequestOf(q *v1alpha1.OffloadRequest) jobRequest {
 		OwnerLabels:  q.Spec.OwnerLabels,
 		Site:         q.Spec.Site,
 		Account:      q.Spec.Account,
+		Attempt:      q.Spec.Attempt,
 	}
 	for _, ps := range q.Spec.PodSets {
 		ps := *ps.DeepCopy()
@@ -100,9 +103,12 @@ type Executor struct {
 	Shadow ShadowManager
 
 	// shadowsEnded holds the requests whose shadow was rendered for the job's
-	// end. It is not kept across restarts: rendering it once more is idempotent.
+	// end, cancelled the deleted requests whose job, shadow and stage-in Job are
+	// gone while their copy back runs. They are not kept across restarts: doing
+	// either once more is idempotent.
 	mu           sync.Mutex
 	shadowsEnded map[types.UID]bool
+	cancelled    map[types.UID]bool
 	// healthyUntil is when the last successful ping stops answering /healthz;
 	// caps are the capabilities that ping listed, once capsKnown.
 	healthMu     sync.Mutex
@@ -116,7 +122,8 @@ var workloadUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4
 
 // New returns an Executor. c and reader may be the same client.
 func New(cfg Config, il *InterLink, kube kubernetes.Interface, c client.Client, reader client.Reader, shadow ShadowManager) *Executor {
-	return &Executor{Config: cfg, InterLink: il, Kube: kube, Client: c, Reader: reader, Shadow: shadow, shadowsEnded: map[types.UID]bool{}}
+	return &Executor{Config: cfg, InterLink: il, Kube: kube, Client: c, Reader: reader, Shadow: shadow,
+		shadowsEnded: map[types.UID]bool{}, cancelled: map[types.UID]bool{}}
 }
 
 // RegisterRoutes adds the executor's HTTP API, for the shadows, to mux.
@@ -204,6 +211,12 @@ func (d *Executor) validateSubmit(req jobRequest) *refusal {
 	if total > maxWorkloadMembers {
 		return permanentError("the workload has %d members, more than %d", total, maxWorkloadMembers)
 	}
+	if aerr := validateResources(req, site.Resources); aerr != nil {
+		return aerr
+	}
+	if aerr := validateFlags(req, site.AllowedFlags); aerr != nil {
+		return aerr
+	}
 	if podGroup(req) {
 		if aerr := validatePodSetsShareAllocation(req.PodSets); aerr != nil {
 			return aerr
@@ -216,6 +229,80 @@ func (d *Executor) validateSubmit(req jobRequest) *refusal {
 		return aerr
 	}
 	return d.validateStaging(req)
+}
+
+// Annotations of a template that ask Slurm for options of the workload's own.
+const (
+	SlurmFlagsAnnotation  = "slurm-job.vk.io/flags"
+	SlurmFlavorAnnotation = "slurm-job.vk.io/flavor"
+)
+
+// validateResources refuses a template whose members the site cannot size: one
+// node each, with 1 to GPUsPerMember GPUs and either no CPU or CPUsPerGPU per GPU.
+// Kueue charged the Workload by its templates, so the executor adds no GPU and
+// changes no CPU the user set.
+func validateResources(req jobRequest, res *SiteResources) *refusal {
+	if res == nil {
+		return nil
+	}
+	for _, ps := range req.PodSets {
+		gpus := templateGPUs(ps.Template.Spec, res)
+		if gpus < 1 || gpus > res.GPUsPerMember {
+			return permanentError("PodSet %s asks for %d %s: a pod gets at most one node, %d GPUs: ask for 1 to %d %s",
+				ps.Name, gpus, res.GPUResource, res.GPUsPerMember, res.GPUsPerMember, res.GPUResource)
+		}
+		want := res.CPUsPerGPU * gpus
+		if cpu, set := templateCPU(ps.Template.Spec); set && cpu.Cmp(*resource.NewQuantity(want, resource.DecimalSI)) != 0 {
+			return permanentError("PodSet %s asks for %s CPUs with %d %s: resources are allocated automatically, %d cores per GPU: leave cpu out or set it to %d",
+				ps.Name, cpu.String(), gpus, res.GPUResource, res.CPUsPerGPU, want)
+		}
+	}
+	return nil
+}
+
+// validateFlags refuses Slurm options a workload gives itself, in its owner's or
+// templates' annotations, beyond what the site allows. The options of its Kueue
+// flavor, the PodSets' own annotations, are the site's.
+func validateFlags(req jobRequest, allowed *AllowedFlags) *refusal {
+	if allowed == nil {
+		return nil
+	}
+	for _, ps := range req.PodSets {
+		ann := ps.Template.Annotations
+		if unlistedFlag(ann[SlurmFlagsAnnotation], allowed.Flags) != "" {
+			return permanentError("the Slurm options come from the site, the pod's GPUs and its time limit: %s may set %s; PodSet %s has %q",
+				SlurmFlagsAnnotation, onlyOrNone(allowed.Flags, "no option"), ps.Name, ann[SlurmFlagsAnnotation])
+		}
+		if f := ann[SlurmFlavorAnnotation]; f != "" && !slices.Contains(allowed.Flavors, f) {
+			return permanentError("the Slurm options come from the site, the pod's GPUs and its time limit: %s may name %s; PodSet %s has %q",
+				SlurmFlavorAnnotation, onlyOrNone(allowed.Flavors, "no flavor"), ps.Name, f)
+		}
+	}
+	return nil
+}
+
+// unlistedFlag returns the first option of flags whose name is not allowed, or a
+// value that follows no option.
+func unlistedFlag(flags string, allowed []string) string {
+	for i, tok := range strings.Fields(flags) {
+		name, _, _ := strings.Cut(tok, "=")
+		switch {
+		case !strings.HasPrefix(tok, "-"):
+			if i == 0 {
+				return tok
+			}
+		case !slices.Contains(allowed, name):
+			return tok
+		}
+	}
+	return ""
+}
+
+func onlyOrNone(list []string, none string) string {
+	if len(list) == 0 {
+		return none
+	}
+	return "only " + strings.Join(list, ", ")
 }
 
 // validateTunnels refuses the tunnels of a site whose Shadow block names no login
@@ -262,11 +349,13 @@ func validatePodSetsShareAllocation(podSets []v1alpha1.PodSet) *refusal {
 	return nil
 }
 
-// submitRequest is the request's workload as its members are built: with the
-// ServiceAccount directory the API server would add to its pods.
+// submitRequest is the request's workload as its members are built: sized for
+// the site, with the ServiceAccount directory the API server would add to its pods.
 func (d *Executor) submitRequest(q *v1alpha1.OffloadRequest) jobRequest {
 	req := jobRequestOf(q)
+	res := d.Config.Sites[req.Site].Resources
 	for p := range req.PodSets {
+		withSiteResources(&req.PodSets[p], res)
 		withServiceAccountDir(&req.PodSets[p], d.Config.Executor.AutomountServiceAccountToken)
 	}
 	return req
@@ -274,7 +363,9 @@ func (d *Executor) submitRequest(q *v1alpha1.OffloadRequest) jobRequest {
 
 // submit runs the workload of q, staging it in first, and records the job in
 // q's status: its ID and every rank, a rank without a podUID waiting for the
-// site to take it. The caller writes the status.
+// site to take it. On a plugin that answers estimates, the first call of an
+// attempt records the site's start estimate instead and submits nothing
+// (estimate). The caller writes the status.
 func (d *Executor) submit(ctx context.Context, q *v1alpha1.OffloadRequest) *refusal {
 	// A caller that gives up does not stop a submit halfway.
 	ctx = context.WithoutCancel(ctx)
@@ -296,6 +387,9 @@ func (d *Executor) submit(ctx context.Context, q *v1alpha1.OffloadRequest) *refu
 		if refs[p], aerr = d.fetchRefs(ctx, req.Namespace, ps); aerr != nil {
 			return aerr
 		}
+	}
+	if d.estimate(ctx, q, req) {
+		return nil
 	}
 	if aerr := d.stageIn(ctx, q, req); aerr != nil {
 		return aerr
@@ -386,6 +480,93 @@ func (d *Executor) submit(ctx context.Context, q *v1alpha1.OffloadRequest) *refu
 	setCondition(q, v1alpha1.OffloadRequestAdmitted, metav1.ConditionFalse, reasonQueued, "")
 	log.L.Infof("executor: request %s/%s submitted as job %s (%d member(s), %d waiting for the site)", q.Namespace, q.Name, jobID, count, pending)
 	return nil
+}
+
+// submitLimitPattern finds, in a site's refusal to estimate a job, a limit on
+// the jobs a user or account may have submitted at once, in Slurm's names
+// (QOSMaxSubmitJobPerUserLimit, AssocMaxSubmitJobLimit): the site takes the job
+// once one of those ended.
+var submitLimitPattern = regexp.MustCompile(`(QOS|Assoc)MaxSubmitJob[A-Za-z]*|MaxSubmitJobs?Limit`)
+
+// estimate asks the site when it would start the job of req, on a plugin that
+// lists capability estimate, until it answers or something of the attempt is
+// created: its stage-in started or its job submitted. It records the answer in
+// q's status: the start time, or that the site gives none while a submit limit
+// holds. It then reports true, and the submit waits for the next poll: in
+// between, the offload controller gives the attempt up when the start is
+// further away than its OffloadConfig's maxStartDelay. Any other failure to
+// answer, an API server without /estimate included, is logged, and the job goes
+// without an estimate.
+func (d *Executor) estimate(ctx context.Context, q *v1alpha1.OffloadRequest, req jobRequest) bool {
+	staging := meta.FindStatusCondition(q.Status.Conditions, v1alpha1.OffloadRequestStagingIn) != nil
+	if q.Status.Estimate != nil || staging || !d.estimates(ctx) {
+		return false
+	}
+	shape := estimateShape(req, d.Config.Sites[req.Site].Resources, q.Spec.MaximumExecutionTimeSeconds)
+	e := &v1alpha1.StartEstimate{ProbeTime: metav1.Now().Rfc3339Copy(), Nodes: int32(shape.Nodes)}
+	answer, err := d.InterLink.Estimate(ctx, req.WorkloadUID, shape)
+	var pe *PluginError
+	switch {
+	case err == nil && !answer.Start.IsZero():
+		start := metav1.NewTime(answer.Start).Rfc3339Copy()
+		e.StartTime = &start
+		log.L.Infof("executor: request %s/%s: the site expects to start %d node(s) at %s", q.Namespace, q.Name, shape.Nodes, start.UTC().Format(time.RFC3339))
+	case errors.As(err, &pe) && submitLimitPattern.MatchString(pe.Message):
+		e.Reason, e.Message = submitLimitPattern.FindString(pe.Message), pe.Message
+		log.L.Infof("executor: request %s/%s: the site gives no start time (%s)", q.Namespace, q.Name, e.Reason)
+	default:
+		if err == nil {
+			err = errors.New("the answer has no start time")
+		}
+		log.L.Warningf("executor: request %s/%s goes without a start estimate: %v", q.Namespace, q.Name, err)
+		return false
+	}
+	q.Status.Estimate = e
+	q.Status.Reason, q.Status.Message = "", ""
+	return true
+}
+
+// estimateShape is the job of req as /estimate takes it: one node per member of
+// a pod group, else the one node of its first job; the most GPUs and CPUs a
+// PodSet's member asks for; the head member's scheduler flags, its flavor's
+// included; and the wall time in whole minutes, as the flavors round it.
+func estimateShape(req jobRequest, res *SiteResources, wallSeconds *int32) EstimateRequest {
+	shape := EstimateRequest{Nodes: 1}
+	if podGroup(req) {
+		shape.Nodes = workloadMembers(req)
+	}
+	for _, ps := range req.PodSets {
+		shape.GPUsPerNode = max(shape.GPUsPerNode, int(siteGPUs(ps.Template.Spec, res)))
+		if cpu, set := templateCPU(ps.Template.Spec); set {
+			shape.CPUsPerNode = max(shape.CPUsPerNode, int(cpu.Value()))
+		}
+	}
+	shape.Flags = buildMember(req, 0).Annotations[SlurmFlagsAnnotation]
+	if wallSeconds != nil && *wallSeconds > 0 {
+		minutes := (*wallSeconds + 59) / 60
+		shape.Time = fmt.Sprintf("%02d:%02d:00", minutes/60, minutes%60)
+	}
+	return shape
+}
+
+// siteGPUs is the GPUs a template asks for: under the site's GPUResource or its
+// aliases with Resources, else under any <vendor>/gpu resource, as the Slurm
+// plugin counts nvidia.com/gpu and amd.com/gpu.
+func siteGPUs(spec v1.PodSpec, res *SiteResources) int64 {
+	if res != nil {
+		return templateGPUs(spec, res)
+	}
+	var n int64
+	for _, c := range spec.Containers {
+		r := c.Resources.DeepCopy()
+		requestsAsLimits(r)
+		for name, q := range r.Limits {
+			if strings.HasSuffix(string(name), "/gpu") {
+				n += q.Value()
+			}
+		}
+	}
+	return n
 }
 
 // memberCreate builds rank i of the workload and its /create request.
@@ -901,8 +1082,9 @@ func (d *Executor) shadowEnded(uid types.UID) bool {
 }
 
 // cancel deletes the members of q, which cancels its job unless it ended, and
-// removes its shadow and its stage Jobs. On an error the caller keeps the
-// executor's finalizer, so that it is tried again.
+// removes its shadow and its stage-in Job; its stage-out Job stays, for the copy
+// back and its log. On an error the caller keeps the executor's finalizer, so
+// that it is tried again.
 func (d *Executor) cancel(ctx context.Context, q *v1alpha1.OffloadRequest) error {
 	req := jobRequestOf(q)
 	uid := req.WorkloadUID
@@ -913,10 +1095,11 @@ func (d *Executor) cancel(ctx context.Context, q *v1alpha1.OffloadRequest) error
 		return fmt.Errorf("deleting the shadow of workload %s: %w", uid, err)
 	}
 	if err := d.deleteStageJobs(ctx, uid); err != nil {
-		return fmt.Errorf("deleting the stage Jobs of workload %s: %w", uid, err)
+		return fmt.Errorf("deleting the stage-in Job of workload %s: %w", uid, err)
 	}
 	d.mu.Lock()
 	delete(d.shadowsEnded, q.UID)
+	d.cancelled[q.UID] = true
 	d.mu.Unlock()
 	log.L.Infof("executor: request %s/%s deleted (job %s)", q.Namespace, q.Name, q.Status.JobID)
 	return nil

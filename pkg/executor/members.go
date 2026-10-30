@@ -214,6 +214,79 @@ func requestsAsLimits(r *v1.ResourceRequirements) {
 	}
 }
 
+// resourceAsked is what r asks of a resource: its limit, else its request.
+func resourceAsked(r v1.ResourceRequirements, name v1.ResourceName) (resource.Quantity, bool) {
+	if q, ok := r.Limits[name]; ok {
+		return q, true
+	}
+	q, ok := r.Requests[name]
+	return q, ok
+}
+
+// templateGPUs is the GPUs a template's containers ask for, under the site's
+// GPUResource or one of its aliases: the plugin adds them up into the job's.
+func templateGPUs(spec v1.PodSpec, res *SiteResources) int64 {
+	names := append([]string{res.GPUResource}, res.GPUAliases...)
+	var n int64
+	for _, c := range spec.Containers {
+		for _, name := range names {
+			if q, ok := resourceAsked(c.Resources, v1.ResourceName(name)); ok {
+				n += q.Value()
+			}
+		}
+	}
+	return n
+}
+
+// templateCPU is the most CPU a container of the template asks for, which the
+// plugin makes the job's CPUs; set is false when no container asks for any.
+func templateCPU(spec v1.PodSpec) (cpu resource.Quantity, set bool) {
+	for _, c := range spec.Containers {
+		if q, ok := resourceAsked(c.Resources, v1.ResourceCPU); ok && (!set || q.Cmp(cpu) > 0) {
+			cpu, set = q, true
+		}
+	}
+	return cpu, set
+}
+
+// withSiteResources sizes a PodSet's template for a site with Resources, whose
+// shape validateResources checked: its GPU aliases become GPUResource again, so the
+// plugin asks the site for them, and a template that sets no CPU gets CPUsPerGPU
+// per GPU as its first container's CPU limit, which the plugin makes the job's CPUs.
+// Kueue charged the Workload by the template as it is.
+func withSiteResources(ps *v1alpha1.PodSet, res *SiteResources) {
+	if res == nil {
+		return
+	}
+	spec := &ps.Template.Spec
+	gpus := templateGPUs(*spec, res)
+	gpu := v1.ResourceName(res.GPUResource)
+	for _, list := range [][]v1.Container{spec.InitContainers, spec.Containers} {
+		for c := range list {
+			for _, rl := range []v1.ResourceList{list[c].Resources.Requests, list[c].Resources.Limits} {
+				for _, alias := range res.GPUAliases {
+					q, ok := rl[v1.ResourceName(alias)]
+					if !ok {
+						continue
+					}
+					if have, ok := rl[gpu]; ok {
+						q.Add(have)
+					}
+					rl[gpu] = q
+					delete(rl, v1.ResourceName(alias))
+				}
+			}
+		}
+	}
+	if _, set := templateCPU(*spec); !set && len(spec.Containers) > 0 {
+		r := &spec.Containers[0].Resources
+		if r.Limits == nil {
+			r.Limits = v1.ResourceList{}
+		}
+		r.Limits[v1.ResourceCPU] = *resource.NewQuantity(res.CPUsPerGPU*gpus, resource.DecimalSI)
+	}
+}
+
 // serviceAccountDir is where the API server mounts a pod's ServiceAccount files.
 const serviceAccountDir = "/var/run/secrets/kubernetes.io/serviceaccount"
 

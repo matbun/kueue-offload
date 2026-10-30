@@ -81,15 +81,28 @@ spec:
                 type: string
               attempt:
                 description: |-
-                  attempt counts the check's attempts from 1. Retries spent are attempt-1.
+                  attempt counts the check's attempts from 1. Retries spent are
+                  attempt-1-deferrals.
                   It lives here because Kueue drops the state of a check that covers only
                   some flavors, retryCount included, when it evicts the Workload.
                 format: int32
                 minimum: 1
                 type: integer
+              deferrals:
+                description: |-
+                  deferrals counts the check's earlier attempts set to Retry by the site's
+                  start estimate (the OffloadConfig's maxStartDelay), which are not retries:
+                  the previous attempt's deferrals, plus one when that attempt submitted no
+                  job and its status.estimate has no startTime or one further than
+                  maxStartDelay from its probeTime.
+                format: int32
+                minimum: 0
+                type: integer
               maximumExecutionTimeSeconds:
-                description: maximumExecutionTimeSeconds is the Workload's, the job's
-                  wall time.
+                description: |-
+                  maximumExecutionTimeSeconds is the job's wall time: the Workload's, else
+                  the longest interlink.eu/time-limit of its PodSets, a template's own value
+                  winning over the owner's.
                 format: int32
                 type: integer
               owner:
@@ -8892,6 +8905,38 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              estimate:
+                description: |-
+                  estimate is the site's start estimate for the job, asked before it is
+                  submitted, which the OffloadConfig's maxStartDelay is held against.
+                properties:
+                  message:
+                    maxLength: 4096
+                    type: string
+                  nodes:
+                    description: nodes is the number of nodes the job asked for.
+                    format: int32
+                    minimum: 0
+                    type: integer
+                  probeTime:
+                    description: probeTime is when the executor asked.
+                    format: date-time
+                    type: string
+                  reason:
+                    description: |-
+                      reason and message say why the site gave no start time, for example that
+                      it takes no further job of the user now (for Slurm,
+                      QOSMaxSubmitJobPerUserLimit).
+                    type: string
+                  startTime:
+                    description: |-
+                      startTime is when the site expects to start the job; unset when it gave
+                      none, as reason and message say.
+                    format: date-time
+                    type: string
+                required:
+                - probeTime
+                type: object
               jobID:
                 description: |-
                   jobID is the batch job ID; for independent pods every rank's job,

@@ -21,9 +21,9 @@ virtual kubelet makes, so any batch system reachable through an interLink plugin
 
 | Component | Where | What it does |
 | --- | --- | --- |
-| offload controller (`cmd/offload-controller`) | one Deployment for every site, namespace `kueue-offload` | Kueue admission check controller (`controllerName: interlink.eu/offload`), each check with its own `OffloadConfig`: hands a Workload whose quota is reserved to the user's executor as an `OffloadRequest` per attempt, keeps the check `Pending` with the batch system's state in its message while the job is queued and running, and ends the owner (Job, JobSet, TrainJob or pods) when the job ends. Keeps each site's `OffloadWorker` `Active` from its login endpoint. Holds no Secret and creates no pod |
-| membership controller (`cmd/membership`) | one Deployment per site, namespace `kueue-offload-membership` | from the site's account associations and an `IdentityMap`: a ClusterQueue per project, the namespace labels Kueue's selectors match, a LocalQueue per membership, and each user's executor from a template. Never reads a Secret |
-| executor (`cmd/executor`) | the user's namespace, one pod with the interLink API server and the plugin | runs the `OffloadRequest`s of its namespace and reports on them in their status, turning a Workload's PodSets into member pods for the plugin, through the API server: resolves their Secrets, ConfigMaps, tokens and downward API, stages inputs and outputs, derives the job's state from the plugin's status, and renders the shadow (tunnel plus a `job-logs` container) once the job runs |
+| offload controller (`cmd/offload-controller`) | one Deployment for every site, namespace `kueue-offload` | Kueue admission check controller (`controllerName: interlink.eu/offload`), each check with its own `OffloadConfig`: hands a Workload whose quota is reserved to the user's executor as an `OffloadRequest` per attempt, keeps the check `Pending` with the batch system's state in its message while the job is queued and running, and ends the owner (Job, JobSet, TrainJob, RayJob, RayCluster or pods) when the job ends. Rejects a wall time above the flavor's queue limit, and releases the quota of a job the site would start too late (its start estimate). Keeps each site's `OffloadWorker` `Active` from its login endpoint. Holds no Secret and creates no pod |
+| membership controller (`cmd/membership`) | one Deployment per site, namespace `kueue-offload-membership` | from the site's account associations and an `IdentityMap`: a ClusterQueue per project, the namespace labels Kueue's selectors match, a LocalQueue per membership, and each user's executor from a template; offboards a namespace that leaves the site once nothing of it runs there. Reads Secrets' metadata only, to roll an executor whose Secret was replaced |
+| executor (`cmd/executor`) | the user's namespace, one pod with the interLink API server and the plugin | runs the `OffloadRequest`s of its namespace and reports on them in their status, turning a Workload's PodSets into member pods for the plugin, through the API server: sizes them by the site's rules, resolves their Secrets, ConfigMaps, tokens and downward API, asks the site's start estimate, stages inputs and outputs (also when a started job is deleted), derives the job's state from the plugin's status, and renders the shadow (tunnel plus a `job-logs` container) once the job runs |
 | interLink API server and plugin | next to the executor, stock images | run the members as one batch job with the user's own key (with Slurm, a pod group of N members is one `sbatch --nodes=N`); the flags of the flavor's queue come from the OffloadConfig |
 
 CRDs (group `interlink.eu`): `OffloadConfig`, `OffloadWorker` and `OffloadRequest` for the offload
@@ -34,8 +34,10 @@ the executor of the request's namespace the status, and a ValidatingAdmissionPol
 
 ## What a user writes
 
-A Job (or a JobSet, a TrainJob, a plain pod or a Kueue pod group) with a queue name, ordinary
-resource requests and no node selector:
+A Job (or a JobSet, a TrainJob, a KubeRay RayJob or RayCluster, a plain pod or a Kueue pod group)
+with a queue name, ordinary resource requests, optionally a wall time (Kueue's label
+`kueue.x-k8s.io/max-exec-time-seconds`, or the annotation `interlink.eu/time-limit: "HH:MM:SS"`) and
+no node selector:
 
 ```yaml
 apiVersion: batch/v1
@@ -60,7 +62,8 @@ spec:
 The Workload's check message follows the job (`job 123 queued`, `running on node07`,
 `completed`), the Job stays suspended (no pod is ever created) until it is `Complete` or `Failed`,
 and the shadow's `job-logs` container streams the output, `[rank N]` per rank, also after the job
-ended.
+ended: `kubectl logs -l interlink.eu/shadow-of=<workload uid> -c job-logs --tail=-1`, which a plain
+pod also shows in its status message.
 
 ## Build and deploy
 
@@ -80,12 +83,34 @@ associations and executor template ConfigMaps in `kueue-offload-membership`, an 
 optional `ProjectQuota`s, and the membership Deployment of `config/membership` with
 `--site=<site>`. `config/samples/membership` has a complete example.
 
+## Uninstall
+
+The reverse order, so that nothing is left behind and no job is lost:
+
+1. With no Workload running at the site and no pod on a claim the executor template made (the
+   claim would stay Terminating until the pod ends), take every tenant off: delete the
+   `IdentityMap`s (or their entries) and wait until each member namespace has lost its
+   `hpc.interlink.eu/<site>-accounts` and `hpc.interlink.eu/<site>-left` annotations. The
+   membership controller offboards each one ([docs/design.md](docs/design.md#offboarding)): the
+   OffloadRequests of finished Workloads, whose executor cleans up after their jobs, the
+   `offboardTemplate` Jobs, then its objects, labels and annotations. Namespaces and their Secrets
+   stay.
+2. Delete the membership and offload controllers, then the Cohorts and ClusterQueues labelled
+   `hpc.interlink.eu/managed-by=kueue-offload-membership`, then each site's objects (OffloadConfig,
+   OffloadWorker, AdmissionCheck, ResourceFlavors, the ConfigMaps in `kueue-offload-membership`).
+3. `kubectl delete -k config/admission`, `config/rbac/executor`, `config/rbac/membership`,
+   `config/rbac`, the namespaces of `config/manager` and `config/membership`, and last
+   `kubectl delete -f config/crd/bases`. An OffloadRequest left at that point keeps its executor's
+   finalizer and blocks the CRD: release it as [docs/design.md](docs/design.md#who-may-write-it)
+   says.
+
 ## Requirements
 
 Kubernetes 1.30 or later (ValidatingAdmissionPolicy v1). Kueue v0.16 or later (API
-`kueue.x-k8s.io/v1beta2`) with the `batch/job` integration, and the `pod` integration for plain
-pods. The reverse tunnel needs an interLink API server built with
-`PodStatus.SocketDir`. The Slurm plugin's job directory must be shared with the site's filesystem (a CSI
+`kueue.x-k8s.io/v1beta2`) with the `batch/job` integration, the `pod` integration for plain pods
+and the `ray.io/rayjob` and `ray.io/raycluster` integrations for KubeRay owners. The reverse tunnel
+needs an interLink API server built with `PodStatus.SocketDir`, and the start estimate one with the
+`/estimate` route and a plugin that lists the `estimate` capability. The Slurm plugin's job directory must be shared with the site's filesystem (a CSI
 volume such as csi-rclone works; see [docs/design.md](docs/design.md#job-directory)).
 
 ## License

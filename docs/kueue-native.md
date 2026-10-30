@@ -395,7 +395,9 @@ job per pod.
 
 ### 3.7 Identity stays in the tenant namespace
 
-Neither controller has Secret access. The tenant's executor runs in the tenant's namespace with a
+Neither controller reads a Secret's data: the offload controller has no Secret access, and the
+membership controller reads Secrets as metadata only, to roll an executor whose Secret was replaced
+(`design.md`, "Executor health"). The tenant's executor runs in the tenant's namespace with a
 RoleBinding there only and the tenant's own key, and it acts only on OffloadRequests there. The worker
 object (OffloadWorker, later the external MultiKueueCluster) is a router: it names the controller
 that serves the site. The namespace decides whose identity runs the request, from the site's own

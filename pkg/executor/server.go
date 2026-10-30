@@ -4,8 +4,8 @@
 // PodSets into member pods and sends each to an interLink API server's /create,
 // as a virtual kubelet sends a pod, so the plugin behind it runs them (one pod:
 // one job; several: one job of a pod group, or one job each for independent
-// pods). A plugin that lists podset-create gets a pod group's members in one
-// /createPodSets instead. On every poll it maps the members' /status to the
+// pods). A plugin that lists pod-group-create gets a pod group's members in one
+// /createPodGroup instead. On every poll it maps the members' /status to the
 // request's status, and once the request is deleted it deletes the members and
 // removes what it made for them. What it keeps about a request lives in the
 // request's status.
@@ -283,7 +283,7 @@ func (d *Executor) submit(ctx context.Context, q *v1alpha1.OffloadRequest) *refu
 	if aerr := d.checkShape(ctx, req); aerr != nil {
 		return aerr
 	}
-	podSets, aerr := d.createsPodSets(ctx, req)
+	groupCall, aerr := d.createsPodGroup(ctx, req)
 	if aerr != nil {
 		return aerr
 	}
@@ -320,24 +320,24 @@ func (d *Executor) submit(ctx context.Context, q *v1alpha1.OffloadRequest) *refu
 
 	// The members go in rank order. A plugin that runs a pod group as one job
 	// answers the members before the last with no job ID, or takes them all in
-	// one /createPodSets; independent members each get their own job.
+	// one /createPodGroup; independent members each get their own job.
 	group := podGroup(req)
 	ranks := make([]v1alpha1.RankStatus, count)
 	var jobIDs []string
 	pending, pendingMessage := 0, ""
-	if podSets {
-		jobID, aerr := d.createPodSets(ctx, req, members, creates)
+	if groupCall {
+		jobID, aerr := d.createPodGroup(ctx, req, members, creates)
 		if aerr != nil {
 			return aerr
 		}
-		podSets = jobID != ""
-		if podSets {
+		groupCall = jobID != ""
+		if groupCall {
 			jobIDs = append(jobIDs, jobID)
 		}
 	}
 	for i, create := range creates {
 		ranks[i] = v1alpha1.RankStatus{Rank: int32(i), State: v1alpha1.RankQueued}
-		if podSets {
+		if groupCall {
 			ranks[i].PodUID = string(members[i].UID)
 			continue
 		}
@@ -405,43 +405,35 @@ func (d *Executor) memberCreate(req jobRequest, refs []podRefs, reverse *shadow.
 	return pod, create, aerr
 }
 
-// createPodSets sends the members of a pod group in one /createPodSets call, by
-// PodSet in rank order, and returns the group's job ID. A failed call deletes
-// the members, as a failed /create does, and so does an answer that is not one
+// createPodGroup sends the members of a pod group in one /createPodGroup call,
+// in rank order, and returns the group's job ID. A failed call deletes the
+// members, as a failed /create does, and so does an answer that is not one
 // entry per member, in rank order, all with the same job ID. It returns no job
-// ID and no refusal when the call answers 404: the plugin lists podset-create,
-// but the API server in front of it has no such route and submitted nothing, so
-// the members go to /create one by one.
-func (d *Executor) createPodSets(ctx context.Context, req jobRequest, members []*v1.Pod, creates []commonIL.PodCreateRequests) (string, *refusal) {
-	body := PodSetsCreateRequests{GroupUID: req.WorkloadUID, PodSets: make([]PodSetCreateRequests, len(req.PodSets))}
-	for p, ps := range req.PodSets {
-		body.PodSets[p].Name = string(ps.Name)
-	}
-	for i, create := range creates {
-		p := memberPodSet(req, i)
-		body.PodSets[p].Pods = append(body.PodSets[p].Pods, create)
-	}
-	res, err := d.InterLink.CreatePodSets(ctx, req.WorkloadUID, body)
+// ID and no refusal when the call answers 404: the plugin lists
+// pod-group-create, but the API server in front of it has no such route and
+// submitted nothing, so the members go to /create one by one.
+func (d *Executor) createPodGroup(ctx context.Context, req jobRequest, members []*v1.Pod, creates []commonIL.PodCreateRequests) (string, *refusal) {
+	res, err := d.InterLink.CreatePodGroup(ctx, req.WorkloadUID, PodGroupCreateRequests{GroupUID: req.WorkloadUID, Pods: creates})
 	if pluginCode(err) == http.StatusNotFound {
-		log.L.Warning("executor: workload ", req.WorkloadUID, ": the interLink API server has no /createPodSets, the members go to /create")
+		log.L.Warning("executor: workload ", req.WorkloadUID, ": the interLink API server has no /createPodGroup, the members go to /create")
 		return "", nil
 	}
 	if err != nil {
 		d.deleteMembersQuietly(ctx, req.WorkloadUID, members)
 		return "", createRefusal(err)
 	}
-	jobID, problem := podSetsJobID(res, members)
+	jobID, problem := podGroupJobID(res, members)
 	if problem != "" {
 		d.deleteMembersQuietly(ctx, req.WorkloadUID, members)
-		return "", transientError("the job of workload %s was not submitted: the answer to /createPodSets %s", req.WorkloadUID, problem)
+		return "", transientError("the job of workload %s was not submitted: the answer to /createPodGroup %s", req.WorkloadUID, problem)
 	}
 	return jobID, nil
 }
 
-// podSetsJobID returns the job ID of an answer to /createPodSets, or what is
+// podGroupJobID returns the job ID of an answer to /createPodGroup, or what is
 // wrong with the answer: it lists every member once, in rank order, all with
 // the same job ID.
-func podSetsJobID(res []commonIL.CreateStruct, members []*v1.Pod) (jobID, problem string) {
+func podGroupJobID(res []commonIL.CreateStruct, members []*v1.Pod) (jobID, problem string) {
 	if len(res) != len(members) {
 		return "", fmt.Sprintf("lists %d pods, not the %d members", len(res), len(members))
 	}

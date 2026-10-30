@@ -16,7 +16,7 @@ ba9f7e85. `htc` is interlink-htcondor-plugin at 5f9ecdb. Kueue paths follow `kue
   and leaves the batch system to the plugin. It speaks only the interLink API.
 - The interLink API server sits in front of every plugin: in the tenant pod for in-cluster use, at
   the site for the edge. The executor uses the same calls as the virtual kubelet, plus
-  `/createPodSets` where the plugin lists it.
+  `/createPodGroup` where the plugin lists it.
 - Queue, account and wall time reach the plugin as annotations that OffloadConfig defines per
   flavor. The executor holds no Slurm flags.
 - A plugin lists `pod-group` in its ping answer when it runs N `/create` calls that share Kueue's
@@ -24,7 +24,7 @@ ba9f7e85. `htc` is interlink-htcondor-plugin at 5f9ecdb. Kueue paths follow `kue
   gang is refused, and a Workload marked `independent-pods` runs as one job per pod.
 - `/create` answers 503 for a transient refusal (submit limit, scheduler down) and 4xx for a
   permanent one.
-- A plugin that also lists `podset-create` gets a pod group in one `POST /createPodSets` and
+- A plugin that also lists `pod-group-create` gets a pod group in one `POST /createPodGroup` and
   submits it as one job without buffering. The executor uses it when listed and keeps per-pod
   `/create` otherwise, and when an API server without the route answers 404; the route is an
   upstream interLink proposal.
@@ -98,7 +98,7 @@ the `PodJID` of each answer. The job ID is the last non-empty one, as today
 (`executor.go:420-430`); for independent pods (3.6) every member must name its job, and the job ID
 lists them (`pkg/executor/server.go:367-368`). If a call fails, it sends `POST /delete` for the
 members created so far, which also drops buffered gang members (slurm `Delete.go:83`). A plugin
-that lists `podset-create` gets a pod group's members in one `POST /createPodSets` instead (3.3).
+that lists `pod-group-create` gets a pod group's members in one `POST /createPodGroup` instead (3.3).
 
 Status. The executor sends one `GET /status` with every member (name, namespace, UID, containers)
 and sets `status.phase` to `Pending` or `Running` on each one. The phase is required: the API
@@ -216,46 +216,44 @@ executor sends all members of a Workload in one pass and in rank order, as today
 (`executor.go:421-430`). A Workload with several PodSets, such as a JobSet's leader and workers,
 forms one group whose ranks are numbered across the PodSets.
 
-### 3.3 `podset-create`: a pod group in one call
+### 3.3 `pod-group-create`: a pod group in one call
 
-Issue 5 asks for the PodSet itself to reach the plugin. A plugin that lists `podset-create` takes
-the members of a pod group in one call, `POST /createPodSets`, and submits them as one job without
-buffering them. The executor sends:
+Issue 5 asks for the PodSet itself to reach the plugin. A plugin that lists `pod-group-create`
+takes the members of a pod group in one call, `POST /createPodGroup`, and submits them as one job
+without buffering them. The executor sends:
 
 ```go
-type PodSetsCreateRequests struct {
-	GroupUID string                 `json:"groupUID"` // the Workload UID, the pod-group label value
-	PodSets  []PodSetCreateRequests `json:"podSets"`
-}
-
-type PodSetCreateRequests struct {
-	Name string              `json:"name"`
-	Pods []PodCreateRequests `json:"pods"` // each member as /create takes it
+type PodGroupCreateRequests struct {
+	GroupUID string              `json:"groupUID"` // the Workload UID, the pod-group label value
+	Pods     []PodCreateRequests `json:"pods"`     // each member as /create takes it, in rank order
 }
 ```
 
-Ranks follow the order of the pods, PodSet after PodSet, and rank 0 is the head. Each rank is a
-whole pod, not a template and a count: its projected and downward API files differ (pod name, UID,
-rank annotations), and the plugin keeps its per-pod translation. The API server prepares each pod
-as for `/create` (`getData`, then the job script step) and sends the plugin the same shape with
-`RetrievedPodData` in place of `PodCreateRequests`. It relays the answer unchanged: 200 with a
-`[]CreateStruct`, one entry per pod in request order, every `PodJID` the group's job ID; 400 for a
-bad request or a permanent refusal and 503 for a transient one, as `/create` (3.4). Status, logs
-and delete stay per pod, so the shadow and the log relay do not change.
+The call is named after Kubernetes' own PodGroup (`scheduling.k8s.io` Workload and PodGroup,
+KEP-4671), the set of pods scheduled together; PodSet is Kueue's term. The Workload's PodSets are
+flattened in rank order, PodSet after PodSet, and rank 0 is the head; each member still carries
+its PodSet in its annotations. Each rank is a whole pod, not a template and a count: its projected
+and downward API files differ (pod name, UID, rank annotations), and the plugin keeps its per-pod
+translation. The API server prepares each pod as for `/create` (`getData`, then the job script
+step) and sends the plugin the same shape with `RetrievedPodData` in place of
+`PodCreateRequests`. It relays the answer unchanged: 200 with a `[]CreateStruct`, one entry per
+pod in request order, every `PodJID` the group's job ID; 400 for a bad request or a permanent
+refusal and 503 for a transient one, as `/create` (3.4). Status, logs and delete stay per pod, so
+the shadow and the log relay do not change.
 
-- interLink: the types and the route are on the fork's branch `feat/create-podsets`, an upstream
-  proposal. Until they land, the executor carries its own copy of the types
-  (`pkg/executor/interlink.go:114`).
+- interLink: the types and the route are an upstream draft,
+  https://github.com/interlink-hq/interLink/pull/606. Until it lands, the executor carries its
+  own copy of the type (`pkg/executor/interlink.go`, `PodGroupCreateRequests`).
 - Slurm plugin: the handler renders each pod as `/create` does and submits the group as the one
   `sbatch --nodes=N` job of the gang path, with no buffer and no timeout sweep. A retried call
-  whose pods already share a job gets that job again. It lists `podset-create` next to `pod-group`
-  (slurm at 0238623, `pkg/slurm/podsets.go:52`, `:96`, `Status.go:742`).
-- Executor: a pod group on a plugin that lists `podset-create` goes in one `/createPodSets`
-  (`pkg/executor/capabilities.go:121`, `server.go:415`). A failed call, or an answer that does not
-  list every member once in rank order with one job ID, deletes the members as a failed `/create`
-  does. A plugin with only `pod-group`, independent pods and a single pod keep the per-pod
-  `/create` path. So does a pod group whose `/createPodSets` answers 404: the ping that lists
-  `podset-create` passes through any API server, and one without the route submitted nothing.
+  whose pods already share a job gets that job again. It lists `pod-group-create`.
+- Executor: a pod group on a plugin that lists `pod-group-create` goes in one `/createPodGroup`
+  (`createsPodGroup` in `pkg/executor/capabilities.go`, `createPodGroup` in `server.go`). A failed
+  call, or an answer that does not list every member once in rank order with one job ID, deletes
+  the members as a failed `/create` does. A plugin with only `pod-group`, independent pods and a
+  single pod keep the per-pod `/create` path. So does a pod group whose `/createPodGroup` answers
+  404: the ping that lists `pod-group-create` passes through any API server, and one without the
+  route submitted nothing.
 
 It saves N round trips that each carry the Workload's Secrets, and the wait for the last member.
 
@@ -497,7 +495,7 @@ project. "Slurm e2e" below means that set of tests.
    the membership controller renders. One API server and plugin run per user on a test login host
    or in the mini container. Open an upstream issue for identity forwarding and per-caller scoping
    (section 4).
-10. **`podset-create`.** Done: the Slurm plugin's `/createPodSets` and the executor's choice by
-    capability (3.3). The API server route is an upstream interLink proposal on the fork's branch
-    `feat/create-podsets`. Test: executor tests against the fake plugin, with and without the
+10. **`pod-group-create`.** Done: the Slurm plugin's `/createPodGroup` and the executor's choice by
+    capability (3.3). The API server route is an upstream interLink draft,
+    https://github.com/interlink-hq/interLink/pull/606. Test: executor tests against the fake plugin, with and without the
     capability; plugin unit tests.

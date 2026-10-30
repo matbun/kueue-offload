@@ -22,8 +22,8 @@ const maxErrorText = 4096
 
 // InterLink calls an interLink API server, as the virtual kubelet does
 // (pkg/virtualkubelet/execute.go): /create, /status, /getLogs, /delete and
-// /pinglink, with interLink's own wire types, and /createPodSets for a plugin
-// that lists podset-create.
+// /pinglink, with interLink's own wire types, and /createPodGroup for a plugin
+// that lists pod-group-create.
 type InterLink struct {
 	URL  string
 	HTTP *http.Client
@@ -107,28 +107,21 @@ func (c *InterLink) Create(ctx context.Context, session string, req commonIL.Pod
 	return out, err
 }
 
-// PodSetsCreateRequests is the body of /createPodSets: the pods of one pod
-// group, by PodSet, each as /create takes it. Ranks follow the order of the pods,
-// PodSet after PodSet. It and PodSetCreateRequests are copies of interLink's
-// types until interLink has them (backends.md 3.3).
-type PodSetsCreateRequests struct {
+// PodGroupCreateRequests is the body of /createPodGroup: the pods of one pod
+// group in rank order, each as /create takes it, since projected and downward
+// API files differ from rank to rank. It is a copy of interLink's type until
+// interLink has it (backends.md 3.3).
+type PodGroupCreateRequests struct {
 	// GroupUID is the Workload UID, the members' pod group name.
-	GroupUID string                 `json:"groupUID"`
-	PodSets  []PodSetCreateRequests `json:"podSets"`
+	GroupUID string                       `json:"groupUID"`
+	Pods     []commonIL.PodCreateRequests `json:"pods"`
 }
 
-// PodSetCreateRequests is one PodSet of a pod group. Each pod carries its own
-// data: projected and downward API files differ from rank to rank.
-type PodSetCreateRequests struct {
-	Name string                       `json:"name"`
-	Pods []commonIL.PodCreateRequests `json:"pods"`
-}
-
-// CreatePodSets sends the pods of a pod group in one call. The plugin submits
+// CreatePodGroup sends the pods of a pod group in one call. The plugin submits
 // them as one job and answers one CreateStruct per pod, in request order.
-func (c *InterLink) CreatePodSets(ctx context.Context, session string, req PodSetsCreateRequests) ([]commonIL.CreateStruct, error) {
+func (c *InterLink) CreatePodGroup(ctx context.Context, session string, req PodGroupCreateRequests) ([]commonIL.CreateStruct, error) {
 	var out []commonIL.CreateStruct
-	err := c.call(ctx, http.MethodPost, "/createPodSets", session, req, &out)
+	err := c.call(ctx, http.MethodPost, "/createPodGroup", session, req, &out)
 	return out, err
 }
 

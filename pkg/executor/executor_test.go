@@ -128,7 +128,7 @@ func newExecutorEnv(t *testing.T, objects ...runtime.Object) *executorEnv {
 	c := ctrlfake.NewClientBuilder().WithScheme(testScheme(t)).
 		WithStatusSubresource(&kueue.Workload{}, &v1alpha1.OffloadRequest{}).Build()
 	shadow := &recordingShadow{}
-	d := New(testConfig(api), &InterLink{URL: api, HTTP: &http.Client{}}, kube, c, c, shadow)
+	d := New(testConfig(api), &InterLink{URL: api, HTTP: apiClient(t, api, plugin.srv.URL)}, kube, c, c, shadow)
 	mux := http.NewServeMux()
 	d.RegisterRoutes(mux)
 	return &executorEnv{t: t, d: d, kube: kube, c: c, shadow: shadow, mux: mux, plugin: plugin}

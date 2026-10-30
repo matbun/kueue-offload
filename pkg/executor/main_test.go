@@ -130,3 +130,42 @@ func startAPIServer(t *testing.T, pluginURL string) string {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// hasCreatePodSets reports whether the API server at api has /createPodSets,
+// which only the interLink fork's branch feat/create-podsets has: one without
+// answers 404 there.
+func hasCreatePodSets(t *testing.T, api string) bool {
+	t.Helper()
+	resp, err := http.Post(api+"/createPodSets", "application/json", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode != http.StatusNotFound
+}
+
+// apiClient is the executor's HTTP client for the API server at api. When the
+// API server has no /createPodSets, the client sends that call straight to the
+// plugin at pluginURL, in the API server's place.
+func apiClient(t *testing.T, api, pluginURL string) *http.Client {
+	t.Helper()
+	if hasCreatePodSets(t, api) {
+		return &http.Client{}
+	}
+	plugin, err := url.Parse(pluginURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &http.Client{Transport: routeTo{path: "/createPodSets", host: plugin.Host}}
+}
+
+// routeTo sends the requests for path to host instead.
+type routeTo struct{ path, host string }
+
+func (r routeTo) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Path == r.path {
+		req = req.Clone(req.Context())
+		req.URL.Host, req.Host = r.host, r.host
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}

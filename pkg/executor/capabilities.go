@@ -17,6 +17,11 @@ import (
 // annotation, rank from the completion index (backends.md 3.2).
 const CapabilityPodGroup = "pod-group"
 
+// CapabilityPodSetCreate is listed in a plugin's ping answer when it takes the
+// pods of one pod group in a single /createPodSets call, by PodSet in rank order,
+// and submits them as one job without buffering them (backends.md 3.3).
+const CapabilityPodSetCreate = "podset-create"
+
 // capabilitiesInterval is how often the executor reads the plugin's capabilities
 // again.
 var capabilitiesInterval = 5 * time.Minute
@@ -108,4 +113,18 @@ func (d *Executor) checkShape(ctx context.Context, req jobRequest) *refusal {
 	}
 	return permanentError("the workload's %d pods run as one allocation, but the site's plugin does not list capability %q; "+
 		"annotate the owner with %s: \"true\" to run one job per pod", workloadMembers(req), CapabilityPodGroup, executorapi.IndependentPodsAnnotation)
+}
+
+// createsPodSets reports whether submit sends the members of req in one
+// /createPodSets call: a pod group, on a plugin that lists podset-create. Any
+// other workload goes member by member to /create.
+func (d *Executor) createsPodSets(ctx context.Context, req jobRequest) (bool, *refusal) {
+	if !podGroup(req) {
+		return false, nil
+	}
+	caps, aerr := d.pluginCapabilities(ctx)
+	if aerr != nil {
+		return false, aerr
+	}
+	return slices.Contains(caps, CapabilityPodSetCreate), nil
 }

@@ -14,6 +14,8 @@ virtual kubelet makes, so any batch system reachable through an interLink plugin
 - [docs/kueue-native.md](docs/kueue-native.md): the shape it should take to follow Kueue and
   MultiKueue, and the upstream change that shape needs.
 - [docs/backends.md](docs/backends.md): the backends, and how one plugs in.
+- [docs/landscape.md](docs/landscape.md): what Kueue, MultiKueue and related projects offer for
+  sites without a Kubernetes API, and the path upstream.
 
 ## Components
 

@@ -2,9 +2,13 @@ package executor
 
 import (
 	"net/http"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -44,6 +48,9 @@ func TestSeveralPodSetsAreOnePodGroup(t *testing.T) {
 	pods := e.plugin.createdPods()
 	if len(pods) != 3 {
 		t.Fatalf("%d /create calls, want 3", len(pods))
+	}
+	if n := len(e.plugin.podSetCalls()); n != 0 {
+		t.Fatalf("%d /createPodSets calls to a plugin without %s", n, CapabilityPodSetCreate)
 	}
 	for i, want := range []struct{ podSet, role, command string }{
 		{"driver", GangRoleHead, "echo driver"}, {"driver", GangRoleWorker, "echo driver"}, {"worker", GangRoleWorker, "echo worker"},
@@ -166,5 +173,217 @@ func TestPodSetsResolveTheirOwnReferences(t *testing.T) {
 	}
 	if _, ok := envOf(pods[0].Spec.Containers[0])["HF_TOKEN"]; ok {
 		t.Fatalf("the driver got the worker's Secret")
+	}
+}
+
+// listPodSetCreate makes e's plugin list podset-create next to pod-group.
+func (e *executorEnv) listPodSetCreate() {
+	e.plugin.with(func(p *fakePlugin) { p.capabilities = []string{CapabilityPodGroup, CapabilityPodSetCreate} })
+}
+
+// memberUIDs are the UIDs of the workload's first n members, in rank order.
+func memberUIDs(n int) []string {
+	uids := make([]string, n)
+	for i := range uids {
+		uids[i] = memberUID(executorWorkload, i)
+	}
+	return uids
+}
+
+// A plugin that lists podset-create gets a pod group in one /createPodSets call,
+// its members by PodSet in rank order, and no /create. Status and delete stay per
+// member.
+func TestPodGroupInOneCreatePodSets(t *testing.T) {
+	e := newExecutorEnv(t)
+	e.listPodSetCreate()
+	q := e.submit(twoPodSetRequest(1, 2))
+	if q.Status.JobID != executorJobID || len(q.Status.Ranks) != 3 {
+		t.Fatalf("jobID %q, ranks %+v", q.Status.JobID, q.Status.Ranks)
+	}
+	for i, r := range q.Status.Ranks {
+		if r.Rank != int32(i) || r.PodUID != memberUID(executorWorkload, i) || r.JobID != "" || r.State != v1alpha1.RankQueued {
+			t.Errorf("rank %d: %+v", i, r)
+		}
+	}
+	if n := len(e.plugin.createdPods()); n != 0 {
+		t.Fatalf("%d /create calls besides /createPodSets", n)
+	}
+	calls := e.plugin.podSetCalls()
+	if len(calls) != 1 || calls[0].GroupUID != executorWorkload {
+		t.Fatalf("%d /createPodSets calls, want one for group %s", len(calls), executorWorkload)
+	}
+	var podSets []string
+	rank := 0
+	for _, ps := range calls[0].PodSets {
+		podSets = append(podSets, ps.Name+":"+strconv.Itoa(len(ps.Pods)))
+		for _, data := range ps.Pods {
+			pod, role := data.Pod, GangRoleWorker
+			if rank == 0 {
+				role = GangRoleHead
+			}
+			if string(pod.UID) != memberUID(executorWorkload, rank) || pod.Labels[JobCompletionIndexLabel] != strconv.Itoa(rank) ||
+				pod.Labels[PodGroupNameLabel] != executorWorkload || pod.Annotations[PodGroupTotalCountAnnotation] != "3" ||
+				pod.Annotations[PodSetAnnotation] != ps.Name || pod.Annotations[GangRoleAnnotation] != role {
+				t.Errorf("rank %d out of order or mislabelled: %s %v %v", rank, pod.UID, pod.Labels, pod.Annotations)
+			}
+			if env := envOf(pod.Spec.Containers[0]); env[RankEnv] != strconv.Itoa(rank) || env[WorldSizeEnv] != "3" {
+				t.Errorf("rank %d env %v", rank, env)
+			}
+			rank++
+		}
+	}
+	if got := strings.Join(podSets, ","); got != "driver:1,worker:2" {
+		t.Fatalf("PodSets %s, want driver:1,worker:2", got)
+	}
+
+	since := time.Now().Add(-time.Minute)
+	for i, ctn := range []string{executorCtn, workerCtn, workerCtn} {
+		e.setStatus(i, "node0"+strconv.Itoa(7+i), runningContainer(ctn, since))
+	}
+	if q := e.poll(); state(q) != "running" || q.Status.NodeName != "node07" || q.Status.Ranks[2].State != v1alpha1.RankRunning {
+		t.Fatalf("running: %s %+v", state(q), q.Status)
+	}
+	if err := e.remove(); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.plugin.deletedUIDs(); !slices.Equal(got, memberUIDs(3)) {
+		t.Fatalf("deleted %v, want every member", got)
+	}
+}
+
+// The plugin's ping answer reaches the executor through any API server, so a
+// plugin that lists podset-create can sit behind one without /createPodSets.
+// That one answers 404 and submits nothing: the members go to /create one by one,
+// as for a plugin without the capability.
+func TestPodGroupWithoutCreatePodSetsRoute(t *testing.T) {
+	e := newExecutorEnv(t)
+	if hasCreatePodSets(t, e.d.InterLink.URL) {
+		t.Skip("the interLink API server has /createPodSets")
+	}
+	e.d.InterLink.HTTP = &http.Client{}
+	e.listPodSetCreate()
+	q := e.submit(twoPodSetRequest(1, 2))
+	if q.Status.JobID != executorJobID || len(q.Status.Ranks) != 3 {
+		t.Fatalf("jobID %q, ranks %+v", q.Status.JobID, q.Status.Ranks)
+	}
+	for i, r := range q.Status.Ranks {
+		if r.PodUID != memberUID(executorWorkload, i) || r.JobID != "" || r.State != v1alpha1.RankQueued {
+			t.Errorf("rank %d: %+v", i, r)
+		}
+	}
+	if n := len(e.plugin.podSetCalls()); n != 0 {
+		t.Fatalf("%d /createPodSets calls reached the plugin", n)
+	}
+	var uids []string
+	for _, pod := range e.plugin.createdPods() {
+		uids = append(uids, string(pod.UID))
+	}
+	if !slices.Equal(uids, memberUIDs(3)) {
+		t.Fatalf("/create for %v, want every member in rank order", uids)
+	}
+	if got := e.plugin.deletedUIDs(); len(got) != 0 {
+		t.Fatalf("deleted %v after the 404", got)
+	}
+}
+
+// A refused /createPodSets deletes every member, as a refused /create does: a 503
+// leaves the request waiting and submits it again at the next poll, a 400 refuses
+// it.
+func TestCreatePodSetsRefusals(t *testing.T) {
+	tests := []struct {
+		name      string
+		code      int
+		text      string
+		permanent bool
+		want      string
+	}{
+		{"submit limit", http.StatusServiceUnavailable, "QOSMaxSubmitJobPerUserLimit", false, "the site takes no job now: QOSMaxSubmitJobPerUserLimit"},
+		{"refused", http.StatusBadRequest, "Invalid account", true, "Invalid account"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newExecutorEnv(t)
+			e.listPodSetCreate()
+			e.plugin.with(func(p *fakePlugin) { p.podSetsCodes, p.podSetsText = []int{tt.code}, tt.text })
+			q := e.take(twoPodSetRequest(1, 2))
+			if tt.permanent {
+				e.refusedWith(q, tt.want)
+			} else {
+				waitingWith(t, q, tt.want, true)
+			}
+			if got := e.plugin.deletedUIDs(); !slices.Equal(got, memberUIDs(3)) {
+				t.Fatalf("deleted %v, want every member", got)
+			}
+			if n := len(e.plugin.createdPods()); n != 0 {
+				t.Fatalf("%d /create calls besides /createPodSets", n)
+			}
+			if tt.permanent {
+				return
+			}
+			if q := e.poll(); q.Status.JobID != executorJobID || q.Status.Message != "" || len(e.plugin.podSetCalls()) != 2 {
+				t.Fatalf("submit after the refusal: %s %+v, %d calls", state(q), q.Status, len(e.plugin.podSetCalls()))
+			}
+		})
+	}
+}
+
+// An answer to /createPodSets that does not list every member once, in rank
+// order, with one job ID deletes the members and leaves the request waiting.
+func TestCreatePodSetsMalformedAnswer(t *testing.T) {
+	tests := []struct {
+		name   string
+		answer func([]commonIL.CreateStruct) []commonIL.CreateStruct
+		want   string
+	}{
+		{"a member missing", func(r []commonIL.CreateStruct) []commonIL.CreateStruct { return r[:2] }, "lists 2 pods, not the 3 members"},
+		{"members out of order", func(r []commonIL.CreateStruct) []commonIL.CreateStruct {
+			r[1], r[2] = r[2], r[1]
+			return r
+		}, `lists pod "` + memberUID(executorWorkload, 2) + `" at rank 1`},
+		{"two jobs", func(r []commonIL.CreateStruct) []commonIL.CreateStruct {
+			r[2].PodJID = "4243"
+			return r
+		}, "gives rank 2 job 4243 and rank 0 job 4242"},
+		{"no job ID", func(r []commonIL.CreateStruct) []commonIL.CreateStruct {
+			for i := range r {
+				r[i].PodJID = ""
+			}
+			return r
+		}, "gives rank 0 no job ID"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newExecutorEnv(t)
+			e.listPodSetCreate()
+			e.plugin.with(func(p *fakePlugin) { p.podSetsAnswer = tt.answer })
+			waitingWith(t, e.take(twoPodSetRequest(1, 2)), "the answer to /createPodSets "+tt.want, true)
+			if got := e.plugin.deletedUIDs(); !slices.Equal(got, memberUIDs(3)) {
+				t.Fatalf("deleted %v, want every member", got)
+			}
+		})
+	}
+}
+
+// A single pod and independent pods go member by member to /create, also on a
+// plugin that lists podset-create.
+func TestCreatePodSetsOnlyForPodGroups(t *testing.T) {
+	tests := []struct {
+		name  string
+		req   *v1alpha1.OffloadRequest
+		jobID string
+	}{
+		{"single pod", testRequest(1), "4242"},
+		{"independent pods", markIndependent(twoPodSetRequest(1, 2)), "4242,4243,4244"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			e := newExecutorEnv(t)
+			e.listPodSetCreate()
+			q := e.submit(tt.req)
+			if q.Status.JobID != tt.jobID || len(e.plugin.createdPods()) != len(q.Status.Ranks) || len(e.plugin.podSetCalls()) != 0 {
+				t.Fatalf("jobID %q, %d /create and %d /createPodSets calls for %d ranks",
+					q.Status.JobID, len(e.plugin.createdPods()), len(e.plugin.podSetCalls()), len(q.Status.Ranks))
+			}
+		})
 	}
 }

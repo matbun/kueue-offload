@@ -575,7 +575,9 @@ and `<count>` below is the total of every PodSet's count:
   `kueue.x-k8s.io/pod-group-total-count: "<count>"`, and the Slurm plugin's `interlink.eu/gang-rank`
   and `interlink.eu/gang-role` (member 0 of the first PodSet is the head), so the plugin's gang path
   buffers the members and submits one `sbatch --nodes=<count>`. It answers the members before the
-  last with no job ID; the job ID is the last non-empty one. Independent pods carry none of these
+  last with no job ID; the job ID is the last non-empty one. A plugin that lists `podset-create`
+  gets the members in one `/createPodSets`, by PodSet in rank order, and answers every one with the
+  job ID ([backends.md](backends.md) 3.3). Independent pods carry none of these
   keys, and each member's answer names its own job. When the site refuses an independent member
   for now (a 503, such as a per-user job limit), the members it took stay: the rest are recorded
   as ranks without a `podUID`, each later poll creates them in rank order, the request's reason
@@ -608,9 +610,12 @@ and `<count>` below is the total of every PodSet's count:
   container the data of the volumes it mounts, and the plugin writes them.
 
 A `/create` that fails makes the executor `/delete` the members created so far, which also drops
-the ones a pod group buffers. A 503 leaves the request waiting, with the plugin's text as message
-and a heartbeat; a 400, 403 or 422 refuses it (`Accepted=False`) with the plugin's text; anything
-else leaves it waiting without a heartbeat ([backends.md](backends.md) 3.4).
+the ones a pod group buffers; a `/createPodSets` that fails, or answers other than one job for
+every member in rank order, makes it `/delete` them all, except a 404 from an API server without
+the route, after which the members go to `/create`. A 503 leaves the request waiting, with the
+plugin's text as message and a heartbeat; a 400, 403 or 422 refuses it (`Accepted=False`) with
+the plugin's text; anything else leaves it waiting without a heartbeat ([backends.md](backends.md)
+3.4).
 
 `/status` sends every created member with `status.phase` `Pending` until a rank ran, then
 `Running`: the API server asks the plugin again only for pods in one of those phases. Values of

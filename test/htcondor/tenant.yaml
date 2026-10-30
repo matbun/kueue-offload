@@ -1,0 +1,138 @@
+# One tenant namespace of project proj42 with its executor, as the membership
+# controller renders it from an executor template (config/samples/membership), but
+# with the HTCondor plugin in place of the Slurm plugin. The tenant pod runs the
+# executor, a stock interLink API server and the plugin's own container: an
+# htcondor/mini pool with the plugin, which submits to that pool.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+  labels:
+    hpc.interlink.eu/hpc-a-proj42: "true"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: hpc-a-proj42
+  namespace: team-a
+spec:
+  clusterQueue: hpc-a-proj42
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kueue-offload-executor
+  namespace: team-a
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kueue-offload-executor
+  namespace: team-a
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kueue-offload-executor
+subjects:
+- kind: ServiceAccount
+  name: kueue-offload-executor
+  namespace: team-a
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kueue-offload-executor
+  namespace: team-a
+data:
+  executor.yaml: |
+    Listen: ":8000"
+    InterLink:
+      URL: http://127.0.0.1:3000
+    Executor:
+      PollInterval: 5s
+    Sites:
+      hpc-a:
+        AllowedAccounts: ["proj42"]
+    # No LoginHost: the pool's execute nodes cannot be reached over SSH, so the
+    # shadows only stream logs.
+    Shadow:
+      Enabled: true
+      AlwaysShadow: true
+      ExecutorURL: http://kueue-offload-executor.team-a.svc:8000
+  InterLinkConfig.yaml: |
+    InterlinkAddress: http://127.0.0.1
+    InterlinkPort: "3000"
+    SidecarURL: http://127.0.0.1
+    SidecarPort: "4000"
+    DataRootFolder: /tmp/interlink/
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kueue-offload-executor
+  namespace: team-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: kueue-offload-executor}
+  template:
+    metadata:
+      labels: {app: kueue-offload-executor}
+    spec:
+      serviceAccountName: kueue-offload-executor
+      containers:
+      - name: executor
+        image: kueue-offload-e2e/kueue-offload:dev
+        command: [/executor, --config, /etc/kueue-offload/executor.yaml]
+        env:
+        - {name: EXECUTOR_IMAGE, value: "kueue-offload-e2e/kueue-offload:dev"}
+        ports:
+        - {containerPort: 8000}
+        readinessProbe:
+          httpGet: {path: /healthz, port: 8000}
+          periodSeconds: 5
+        volumeMounts:
+        - {name: config, mountPath: /etc/kueue-offload/executor.yaml, subPath: executor.yaml, readOnly: true}
+      - name: interlink
+        image: kueue-offload-e2e/interlink:dev
+        env:
+        - {name: INTERLINKCONFIGPATH, value: /etc/interlink/InterLinkConfig.yaml}
+        volumeMounts:
+        - {name: config, mountPath: /etc/interlink/InterLinkConfig.yaml, subPath: InterLinkConfig.yaml, readOnly: true}
+      # The plugin's image runs the pool and the plugin, as in its own CI. Apptainer
+      # inside it needs a privileged container.
+      - name: plugin
+        image: kueue-offload-e2e/htcondor-plugin:dev
+        command: [/bin/sh, -c, "/start.sh & exec python3 handles.py --port 4000"]
+        securityContext:
+          privileged: true
+      volumes:
+      - name: config
+        configMap: {name: kueue-offload-executor}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kueue-offload-executor
+  namespace: team-a
+spec:
+  selector: {app: kueue-offload-executor}
+  ports:
+  - {port: 8000, targetPort: 8000}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kueue-offload-executor
+  namespace: team-a
+spec:
+  podSelector: {matchLabels: {app: kueue-offload-executor}}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kueue-offload}}
+      podSelector: {matchLabels: {app: kueue-offload}}
+    ports: [{port: 8000}]
+  - from:
+    - podSelector: {matchLabels: {interlink.eu/shadow: "true"}}
+    ports: [{port: 8000}]

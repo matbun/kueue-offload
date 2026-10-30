@@ -47,7 +47,7 @@ func deploymentAvailable(d *appsv1.Deployment) bool {
 }
 
 // checkCredentials records on the namespace whether an executor Deployment of
-// the site cannot start because a Secret it references is missing (D10). It
+// the site cannot start because a Secret it references is missing. It
 // reads Deployments, their pods and the pods' events, never a Secret. It
 // reports whether any executor Deployment is not available.
 func (r *Reconciler) checkCredentials(ctx context.Context, s site, nsName string) (bool, error) {

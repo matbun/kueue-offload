@@ -7,10 +7,10 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - namespaces
   - pods
   verbs:
   - get
+  - patch
 - apiGroups:
   - ""
   resources:
@@ -41,6 +41,7 @@ rules:
   - interlink.eu
   resources:
   - offloadconfigs
+  - offloadworkers
   verbs:
   - get
   - list
@@ -48,23 +49,21 @@ rules:
 - apiGroups:
   - interlink.eu
   resources:
-  - offloadrecords
+  - offloadrequests
   verbs:
   - create
   - delete
   - get
   - list
   - patch
-  - update
   - watch
 - apiGroups:
   - interlink.eu
   resources:
-  - offloadrecords/status
+  - offloadworkers/status
   verbs:
   - get
   - patch
-  - update
 - apiGroups:
   - jobset.x-k8s.io
   resources:
@@ -81,10 +80,11 @@ rules:
   - kueue.x-k8s.io
   resources:
   - admissionchecks
+  - clusterqueues
+  - workloads
   verbs:
   - get
   - list
-  - patch
   - watch
 - apiGroups:
   - kueue.x-k8s.io
@@ -93,15 +93,6 @@ rules:
   verbs:
   - get
   - patch
-- apiGroups:
-  - kueue.x-k8s.io
-  resources:
-  - clusterqueues
-  - workloads
-  verbs:
-  - get
-  - list
-  - watch
 - apiGroups:
   - kueue.x-k8s.io
   resources:

@@ -118,7 +118,7 @@ func buildPlan(s site, rows []Association, entries []v1alpha1.IdentityEntry, own
 			nsOf[e.HPCUser] = append(nsOf[e.HPCUser], ns)
 		}
 	}
-	// One executor per site holds one HPC user (D8), so a namespace mapped to
+	// One executor per site holds one HPC user, so a namespace mapped to
 	// two users of the same site gets neither.
 	conflict := map[string]bool{}
 	for ns, users := range userOf {

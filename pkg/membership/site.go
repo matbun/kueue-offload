@@ -23,11 +23,14 @@ const (
 	ManagedByValue = FieldManager
 	// TenantLabel marks a namespace that holds at least one membership.
 	TenantLabel = labelPrefix + "tenant"
-	// SiteLabel and AccountLabel say which membership an object belongs to.
+	// SiteLabel and AccountLabel say which membership an object belongs to. On
+	// a ClusterQueue, AccountLabel names the account the offload controller
+	// charges.
 	SiteLabel    = labelPrefix + "site"
-	AccountLabel = labelPrefix + "account"
+	AccountLabel = v1alpha1.AccountLabel
 
-	// MissingCredentials is the value of the executor annotation (D10).
+	// MissingCredentials is the value of the executor annotation when a Secret
+	// the executor references is missing.
 	MissingCredentials = "missing credentials"
 )
 
@@ -61,7 +64,6 @@ type site struct {
 	executorService string
 	executorPort    int32
 	executorImage   string
-	tokenReview     bool
 	associations    v1alpha1.ConfigMapKeyRef
 	template        *v1alpha1.ConfigMapKeyRef
 	defaultQuota    []kueue.ResourceGroup
@@ -82,7 +84,6 @@ func resolveSite(sc *v1alpha1.OffloadConfig) (site, error) {
 		executorService: sc.Spec.ExecutorService,
 		executorPort:    sc.Spec.ExecutorPort,
 		executorImage:   m.ExecutorImage,
-		tokenReview:     m.ExecutorTokenReview,
 		associations:    m.Associations,
 		template:        m.ExecutorTemplate,
 		defaultQuota:    m.DefaultProjectQuota,
@@ -95,11 +96,6 @@ func resolveSite(sc *v1alpha1.OffloadConfig) (site, error) {
 	}
 	if s.check == "" {
 		s.check = sc.Name
-	}
-	// The offload controller derives the account from the ClusterQueue name with the
-	// same rule, so queues are named with it.
-	if p := sc.Spec.AccountRule.StripPrefix; p != nil {
-		s.queuePrefix = *p
 	}
 	if d := m.SyncInterval; d != nil && d.Duration > 0 {
 		s.interval = d.Duration

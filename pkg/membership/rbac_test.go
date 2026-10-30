@@ -84,7 +84,9 @@ func TestMembershipRBAC(t *testing.T) {
 				if core && name == "pods" && (has(r.Verbs, "create") || has(r.Verbs, "get")) {
 					t.Errorf("%s %s grants %v on pods", d.Kind, d.Metadata.Name, r.Verbs)
 				}
-				if has(r.Verbs, "delete") && !(has(r.APIGroups, "kueue.x-k8s.io") && name == "localqueues") && !(d.Kind == "Role" && name == "leases") {
+				// Jobs: a Job whose pod template changed is replaced, since the template is immutable.
+				if has(r.Verbs, "delete") && !(has(r.APIGroups, "kueue.x-k8s.io") && name == "localqueues") && !(d.Kind == "Role" && name == "leases") &&
+					!(has(r.APIGroups, "batch") && name == "jobs") {
 					t.Errorf("%s %s grants delete on %s", d.Kind, d.Metadata.Name, res)
 				}
 				if name == "clusterroles" || name == "roles" {
@@ -101,8 +103,8 @@ func TestMembershipRBAC(t *testing.T) {
 			if has(r.Verbs, "bind") {
 				names := append([]string(nil), r.ResourceNames...)
 				sort.Strings(names)
-				if strings.Join(names, ",") != "kueue-offload-executor,system:auth-delegator" || strings.Join(r.Resources, ",") != "clusterroles" {
-					t.Errorf("bind on %v %v, want clusterroles kueue-offload-executor and system:auth-delegator only", r.Resources, r.ResourceNames)
+				if strings.Join(names, ",") != "kueue-offload-executor" || strings.Join(r.Resources, ",") != "clusterroles" {
+					t.Errorf("bind on %v %v, want clusterrole kueue-offload-executor only", r.Resources, r.ResourceNames)
 				}
 				sawBind = true
 			}
@@ -116,7 +118,9 @@ func TestMembershipRBAC(t *testing.T) {
 // TestExecutorClusterRole checks the role tenant RoleBindings point at: the executor
 // reads Secrets and ConfigMaps of its namespace and never writes Secrets, mints
 // ServiceAccount tokens without managing ServiceAccounts, and runs its staging
-// Jobs.
+// Jobs. Of the offload API it may only take OffloadRequests (finalizer) and
+// report on them (status), never create, replace or delete one, and of Kueue's
+// only read a Workload.
 func TestExecutorClusterRole(t *testing.T) {
 	docs := readRBAC(t, "../../config/rbac/executor/*.yaml")
 	if len(docs) != 1 || docs[0].Kind != "ClusterRole" || docs[0].Metadata.Name != "kueue-offload-executor" {
@@ -125,9 +129,17 @@ func TestExecutorClusterRole(t *testing.T) {
 	read := map[string]bool{}
 	patchPods, mintTokens := false, false
 	var jobVerbs []string
+	apiVerbs := map[string][]string{}
 	for _, r := range docs[0].Rules {
 		if has(r.APIGroups, "batch") && has(r.Resources, "jobs") {
 			jobVerbs = append(jobVerbs, r.Verbs...)
+		}
+		for _, g := range []string{"interlink.eu", "kueue.x-k8s.io"} {
+			if has(r.APIGroups, g) {
+				for _, res := range r.Resources {
+					apiVerbs[g+" "+res] = append(apiVerbs[g+" "+res], r.Verbs...)
+				}
+			}
 		}
 		if !has(r.APIGroups, "") {
 			continue
@@ -170,5 +182,21 @@ func TestExecutorClusterRole(t *testing.T) {
 	sort.Strings(jobVerbs)
 	if got := strings.Join(jobVerbs, ","); got != "create,delete,get,list,watch" {
 		t.Errorf("executor verbs on batch jobs = %s, want create,delete,get,list,watch", got)
+	}
+	want := map[string]string{
+		"interlink.eu offloadrequests":        "get,list,patch,watch",
+		"interlink.eu offloadrequests/status": "patch",
+		"kueue.x-k8s.io workloads":            "get",
+	}
+	for res, verbs := range apiVerbs {
+		sort.Strings(verbs)
+		if got := strings.Join(verbs, ","); got != want[res] {
+			t.Errorf("executor verbs on %s = %q, want %q", res, got, want[res])
+		}
+	}
+	for res := range want {
+		if _, ok := apiVerbs[res]; !ok {
+			t.Errorf("executor has no rule for %s", res)
+		}
 	}
 }

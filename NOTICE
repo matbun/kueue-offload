@@ -1,0 +1,11 @@
+kueue-offload
+Copyright 2026 CERN
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+In applying this licence, CERN does not waive the privileges and immunities
+granted to it by virtue of its status as an Intergovernmental Organization or
+submit itself to any jurisdiction.
+
+pkg/shadow derives from interLink (https://github.com/interlink-hq/interLink), Copyright 2023 INFN, licensed under the Apache License, Version 2.0.
+pkg/executor and pkg/shadow derive from the interLink Slurm plugin (https://github.com/interlink-hq/interlink-slurm-plugin), Copyright (c) 2023 interTwin Community, licensed under the MIT License.

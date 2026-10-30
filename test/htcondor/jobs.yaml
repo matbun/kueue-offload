@@ -1,0 +1,102 @@
+# The Jobs of the e2e cases. None of them ever runs a pod in the cluster: Kueue
+# keeps them suspended and kueue-offload runs them in the HTCondor pool.
+#
+# single: one pod. Its maximum execution time reaches the submit file as the wall
+# time; its output is read on the shadow.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: single
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: hpc-a-proj42
+    kueue.x-k8s.io/max-exec-time-seconds: "1200"
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: main
+        image: busybox:1.36
+        command: [sh, -c, 'echo "hello from rank $INTERLINK_RANK of $INTERLINK_WORLD_SIZE"; sleep 20']
+        resources: {requests: {cpu: "1", memory: 128Mi}}
+---
+# indep: three pods marked independent, one HTCondor job each.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: indep
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: hpc-a-proj42
+  annotations:
+    offload.interlink.eu/independent-pods: "true"
+spec:
+  parallelism: 3
+  completions: 3
+  completionMode: Indexed
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: main
+        image: busybox:1.36
+        command: [sh, -c, 'echo "independent rank $INTERLINK_RANK"; sleep 5']
+        resources: {requests: {cpu: "1", memory: 128Mi}}
+---
+# gang: two pods that must run as one allocation, which the plugin cannot do.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: gang
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: hpc-a-proj42
+spec:
+  parallelism: 2
+  completions: 2
+  completionMode: Indexed
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: main
+        image: busybox:1.36
+        command: [sh, -c, "true"]
+        resources: {requests: {cpu: "1", memory: 128Mi}}
+---
+# exit3: a job that fails with exit code 3.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: exit3
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: hpc-a-proj42
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: main
+        image: busybox:1.36
+        command: [sh, -c, 'echo "exiting with 3"; exit 3']
+        resources: {requests: {cpu: "1", memory: 128Mi}}
+---
+# removed: a long job that the case removes with condor_rm while it runs.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: removed
+  namespace: team-a
+  labels:
+    kueue.x-k8s.io/queue-name: hpc-a-proj42
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: main
+        image: busybox:1.36
+        command: [sh, -c, "sleep 600"]
+        resources: {requests: {cpu: "1", memory: 128Mi}}

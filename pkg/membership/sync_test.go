@@ -21,12 +21,14 @@ import (
 	"github.com/matbun/kueue-offload/api/v1alpha1"
 )
 
-// executorConfig parses the SlurmConfig.yaml the sample template renders.
+// executorConfig parses the executor.yaml the sample template renders.
 type executorConfig struct {
 	Sites map[string]struct {
-		User            string   `json:"User"`
 		AllowedAccounts []string `json:"AllowedAccounts"`
 	} `json:"Sites"`
+	Shadow struct {
+		User string `json:"User"`
+	} `json:"Shadow"`
 }
 
 func (e *env) executorConfig(ns string) executorConfig {
@@ -36,8 +38,8 @@ func (e *env) executorConfig(ns string) executorConfig {
 		e.t.Fatalf("executor ConfigMap missing in %s", ns)
 	}
 	var c executorConfig
-	if err := yaml.Unmarshal([]byte(cm.Data["SlurmConfig.yaml"]), &c); err != nil {
-		e.t.Fatalf("executor config of %s does not parse: %v\n%s", ns, err, cm.Data["SlurmConfig.yaml"])
+	if err := yaml.Unmarshal([]byte(cm.Data["executor.yaml"]), &c); err != nil {
+		e.t.Fatalf("executor config of %s does not parse: %v\n%s", ns, err, cm.Data["executor.yaml"])
 	}
 	return c
 }
@@ -85,7 +87,8 @@ func TestSyncCreatesMemberships(t *testing.T) {
 	if s := cq.Spec.AdmissionChecksStrategy; s == nil || len(s.AdmissionChecks) != 1 || s.AdmissionChecks[0].Name != "hpc-a" {
 		t.Errorf("admissionChecksStrategy %+v", s)
 	}
-	if cq.Labels[ManagedByLabel] != ManagedByValue {
+	// The offload controller charges the account the label names.
+	if cq.Labels[ManagedByLabel] != ManagedByValue || cq.Labels[v1alpha1.AccountLabel] != "proj42" {
 		t.Errorf("ClusterQueue labels %v", cq.Labels)
 	}
 	if g := gpuQuota(t, cq); g != 64 {
@@ -133,8 +136,8 @@ func TestSyncCreatesMemberships(t *testing.T) {
 	for ns, want := range map[string][]string{"alice": {"proj42", "proj99"}, "bob": {"proj42"}} {
 		c := e.executorConfig(ns)
 		got := c.Sites["hpc-a"]
-		if got.User != ns || !reflect.DeepEqual(got.AllowedAccounts, want) {
-			t.Errorf("%s executor config: user %q accounts %v, want %v", ns, got.User, got.AllowedAccounts, want)
+		if c.Shadow.User != ns || !reflect.DeepEqual(got.AllowedAccounts, want) {
+			t.Errorf("%s executor config: user %q accounts %v, want %v", ns, c.Shadow.User, got.AllowedAccounts, want)
 		}
 	}
 	d := &appsv1.Deployment{}
@@ -145,13 +148,10 @@ func TestSyncCreatesMemberships(t *testing.T) {
 		t.Errorf("executor Deployment labels %v image %q", d.Labels, d.Spec.Template.Spec.Containers[0].Image)
 	}
 
-	crb := &rbacv1.ClusterRoleBinding{}
-	if !e.get(types.NamespacedName{Name: "kueue-offload-executor.hpc-a.alice"}, crb) {
-		t.Fatal("token review binding missing")
-	}
-	wantSubj := []rbacv1.Subject{{Kind: "ServiceAccount", Name: "kueue-offload-executor", Namespace: "alice"}}
-	if crb.RoleRef.Name != "system:auth-delegator" || !reflect.DeepEqual(crb.Subjects, wantSubj) {
-		t.Errorf("token review binding %+v %+v", crb.RoleRef, crb.Subjects)
+	// The executor answers no token review: no ClusterRoleBinding is made.
+	crbs := &rbacv1.ClusterRoleBindingList{}
+	if err := e.c.List(context.Background(), crbs); err != nil || len(crbs.Items) != 0 {
+		t.Errorf("ClusterRoleBindings %v, %v; want none", crbs.Items, err)
 	}
 
 	// The user without identity and the other cluster's row are ignored.
@@ -398,24 +398,22 @@ func TestConfigMapOutsideOwnNamespaceRefused(t *testing.T) {
 	}
 }
 
-func TestQueueNamesFollowAccountRule(t *testing.T) {
+func TestCohortAndCheckFromMembership(t *testing.T) {
 	sc := offloadConfig()
-	sc.Spec.AccountRule.StripPrefix = new(string)
 	sc.Spec.Membership.Cohort = "pool"
 	sc.Spec.Membership.AdmissionCheck = "offload-a"
 	e := newEnv(t, sc, assocConfigMap("hpc-a|proj42|alice\nhpc-a|Bad_Account|alice\n"))
 	e.sync()
-	cq, ok := e.clusterQueues()["proj42"]
+	cq, ok := e.clusterQueues()["hpc-a-proj42"]
 	if !ok || cq.Spec.CohortName != "pool" || cq.Spec.AdmissionChecksStrategy.AdmissionChecks[0].Name != "offload-a" {
 		t.Fatalf("ClusterQueues %v", e.clusterQueues())
 	}
 	if len(e.clusterQueues()) != 1 {
 		t.Errorf("an account that is not a DNS label got a ClusterQueue")
 	}
-	if got := e.localQueues(); !reflect.DeepEqual(got, map[string]string{"alice/proj42": "proj42"}) {
+	if got := e.localQueues(); !reflect.DeepEqual(got, map[string]string{"alice/hpc-a-proj42": "hpc-a-proj42"}) {
 		t.Errorf("LocalQueues %v", got)
 	}
-	// The label always names the site, whatever the queue prefix.
 	if e.namespace("alice").Labels["hpc.interlink.eu/hpc-a-proj42"] != "true" {
 		t.Errorf("project label missing")
 	}

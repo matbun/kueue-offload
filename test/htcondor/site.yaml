@@ -1,0 +1,67 @@
+# One fake site, hpc-a, with one queue (flavor hpc-a-prod) and one project, proj42.
+# The flavor's submit lines carry the account and the wall time to HTCondor.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: hpc-a-prod
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: AdmissionCheck
+metadata:
+  name: hpc-a
+spec:
+  controllerName: interlink.eu/offload
+  parameters: {apiGroup: interlink.eu, kind: OffloadConfig, name: hpc-a}
+---
+apiVersion: interlink.eu/v1alpha1
+kind: OffloadConfig
+metadata:
+  name: hpc-a
+spec:
+  workers: [hpc-a]
+  executorService: kueue-offload-executor
+  executorPort: 8000
+  pollInterval: 5s
+  executorLostTimeout: 10m
+  retryStrategy:
+    backoffLimitCount: 3
+    backoffBaseSeconds: 60
+    backoffMaxSeconds: 600
+  flavors:
+    hpc-a-prod:
+      annotations:
+        htcondor-job.vk.io/submit-lines: |
+          accounting_group = group_{{.Account}}
+          +MaxWallTimeMins = {{or .MaxExecMinutes 60}}
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: hpc-a-proj42
+  labels: {hpc.interlink.eu/account: proj42}
+spec:
+  namespaceSelector:
+    matchLabels: {hpc.interlink.eu/hpc-a-proj42: "true"}
+  queueingStrategy: BestEffortFIFO
+  preemption:
+    withinClusterQueue: Never
+    reclaimWithinCohort: Never
+  admissionChecksStrategy:
+    admissionChecks:
+    - name: hpc-a
+  resourceGroups:
+  - coveredResources: [cpu, memory]
+    flavors:
+    - name: hpc-a-prod
+      resources:
+      - {name: cpu, nominalQuota: 16}
+      - {name: memory, nominalQuota: 16Gi}
+---
+# The site: its Active condition needs its login endpoint to answer TCP. The pool
+# runs in the tenant pod here, so the endpoint is that pod's Service.
+apiVersion: interlink.eu/v1alpha1
+kind: OffloadWorker
+metadata:
+  name: hpc-a
+spec:
+  loginEndpoint: kueue-offload-executor.team-a.svc:8000

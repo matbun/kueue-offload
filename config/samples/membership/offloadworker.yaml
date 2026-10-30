@@ -1,0 +1,8 @@
+# Site hpc-a. The offload controller keeps it Active while a TCP connection to
+# the login service succeeds; every OffloadConfig naming it follows.
+apiVersion: interlink.eu/v1alpha1
+kind: OffloadWorker
+metadata:
+  name: hpc-a
+spec:
+  loginEndpoint: login.hpc-a.example.org:22

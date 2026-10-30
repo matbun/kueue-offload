@@ -1,13 +1,14 @@
 package offload
 
 import (
-	"net/http"
+	"reflect"
 	"testing"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
-	"github.com/matbun/kueue-offload/pkg/executorapi"
+	"github.com/matbun/kueue-offload/api/v1alpha1"
 )
 
 var customKinds = []ownerKind{jobSetKind, trainJobKind}
@@ -40,23 +41,13 @@ func TestCustomOwnerSubmit(t *testing.T) {
 		t.Run(k.gvk.Kind, func(t *testing.T) {
 			e := newEnv(t, customOwned(k))
 			e.reconcile()
-			if s, _, _ := e.executor.counts(); s != 1 {
-				t.Fatalf("submits = %d, want 1", s)
+			sp := e.request(1).Spec
+			want := v1alpha1.OwnerReference{APIVersion: k.gvk.GroupVersion().String(), Kind: k.gvk.Kind, Name: "train", UID: customUID}
+			if sp.Owner != want {
+				t.Errorf("owner = %+v, want %+v", sp.Owner, want)
 			}
-			req := e.executor.submits[0]
-			want := executorapi.OwnerReference{APIVersion: k.gvk.GroupVersion().String(), Kind: k.gvk.Kind, Name: "train", UID: string(customUID)}
-			if req.Owner != want {
-				t.Errorf("owner = %+v, want %+v", req.Owner, want)
-			}
-			ann := req.PodSets[0].Template.Annotations
-			if ann["slurm-job.vk.io/flags"] != "--time=02:00:00" {
-				t.Errorf("owner annotations not merged: %v", ann)
-			}
-			if ann["interlink.eu/mode"] != "template" {
-				t.Errorf("template annotation must win over the owner's, got %q", ann["interlink.eu/mode"])
-			}
-			if _, ok := ann["example.org/unrelated"]; ok {
-				t.Errorf("annotation outside the forwarded prefixes was merged")
+			if want := map[string]string{"slurm-job.vk.io/flags": "--time=02:00:00", "interlink.eu/mode": "owner"}; !reflect.DeepEqual(sp.OwnerAnnotations, want) {
+				t.Errorf("ownerAnnotations = %v, want %v", sp.OwnerAnnotations, want)
 			}
 			if conds, _, _ := unstructured.NestedSlice(e.custom(k).Object, "status", "conditions"); len(conds) != 0 {
 				t.Errorf("owner patched while queued: %v", conds)
@@ -68,21 +59,20 @@ func TestCustomOwnerSubmit(t *testing.T) {
 func TestCustomOwnerTerminal(t *testing.T) {
 	cases := []struct {
 		name     string
-		job      executorapi.JobStatus
 		failed   bool
+		detail   string
 		terminal string
 		message  string
 	}{
-		{"completed", executorapi.JobStatus{State: executorapi.StateCompleted}, false, "Completed", "Slurm job 123 completed"},
-		{"failed", executorapi.JobStatus{State: executorapi.StateFailed, Message: "rank 1 exited 3"}, true, "Failed", "Slurm job 123 failed: rank 1 exited 3"},
+		{"completed", false, "", "Completed", "job 123 completed"},
+		{"failed", true, "rank 1 exited 3", "Failed", "job 123 failed: rank 1 exited 3"},
 	}
 	for _, k := range customKinds {
 		for _, tc := range cases {
 			t.Run(k.gvk.Kind+"/"+tc.name, func(t *testing.T) {
 				e := newEnv(t, customOwned(k))
-				e.reconcile()
-				tc.job.APIVersion, tc.job.JobID = executorapi.APIVersion, "123"
-				e.executor.set(func(a *fakeExecutor) { a.job = tc.job })
+				e.submitted()
+				e.report(1, e.finished(!tc.failed, tc.detail))
 				e.reconcile()
 				u := e.custom(k)
 				types := terminalTypes[k.gvk.Kind]
@@ -105,7 +95,7 @@ func TestCustomOwnerTerminal(t *testing.T) {
 					t.Errorf("%s got terminalState %q", k.gvk.Kind, state)
 				}
 				if st := e.check("hpc-a"); st.State != kueue.CheckStatePending {
-					t.Errorf("check = %s, want Pending (D1)", st.State)
+					t.Errorf("check = %s, want Pending until the Workload finishes", st.State)
 				}
 				if len(e.job().Status.Conditions) != 0 {
 					t.Errorf("an unrelated Job was patched")
@@ -120,9 +110,9 @@ func TestCustomOwnerRejected(t *testing.T) {
 	for _, k := range customKinds {
 		t.Run(k.gvk.Kind, func(t *testing.T) {
 			e := newEnv(t, customOwned(k))
-			e.executor.set(func(a *fakeExecutor) {
-				a.submitCode = http.StatusBadRequest
-				a.submitBody = executorapi.ErrorResponse{APIVersion: executorapi.APIVersion, Permanent: true, Message: msg}
+			e.reconcile()
+			e.report(1, func(st *v1alpha1.OffloadRequestStatus) {
+				e.condition(st, v1alpha1.OffloadRequestAccepted, metav1.ConditionFalse, "Refused", msg)
 			})
 			e.reconcile()
 			if st := e.check("hpc-a"); st.State != kueue.CheckStateRejected || st.Message != msg {

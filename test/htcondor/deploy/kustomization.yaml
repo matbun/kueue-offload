@@ -1,0 +1,8 @@
+# The repository's CRDs, RBAC and offload controller, with the image the e2e builds.
+resources:
+- ../../../config/default
+- ../../../config/rbac/executor
+images:
+- name: kueue-offload
+  newName: kueue-offload-e2e/kueue-offload
+  newTag: dev

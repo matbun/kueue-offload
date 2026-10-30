@@ -54,6 +54,7 @@ rules:
   - jobs
   verbs:
   - create
+  - delete
   - patch
 - apiGroups:
   - events.k8s.io
@@ -103,21 +104,19 @@ rules:
   - patch
 - apiGroups:
   - rbac.authorization.k8s.io
-  resources:
-  - clusterrolebindings
-  - rolebindings
-  verbs:
-  - create
-  - patch
-- apiGroups:
-  - rbac.authorization.k8s.io
   resourceNames:
   - kueue-offload-executor
-  - system:auth-delegator
   resources:
   - clusterroles
   verbs:
   - bind
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - rolebindings
+  verbs:
+  - create
+  - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

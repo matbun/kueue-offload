@@ -5,10 +5,25 @@ import (
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 )
 
-// OffloadConfigSpec configures the offload controller of one site. An AdmissionCheck with
-// controllerName interlink.eu/offload selects it through its parameters.
+// AccountLabel on a ClusterQueue names the site account its Workloads are
+// charged to. The membership controller sets it on the ClusterQueues it makes.
+const AccountLabel = "hpc.interlink.eu/account"
+
+// OffloadConfigSpec holds the parameters of the AdmissionChecks with
+// controllerName interlink.eu/offload that name it. One offload controller
+// serves every such check and reads each check's OffloadConfig separately.
 type OffloadConfigSpec struct {
-	// executorService is the name of the executor Service in every tenant namespace.
+	// workers names the OffloadWorkers the check may submit to. The check is
+	// Active while one of them is. A check submits to one site until a
+	// dispatcher chooses among several, so the list holds one name.
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=1
+	Workers []string `json:"workers"`
+
+	// executorService is the name of the executor Service in every tenant
+	// namespace, which the shadows read job logs from. The membership controller
+	// passes it to the executor template.
 	// +kubebuilder:default=kueue-offload-executor
 	// +optional
 	ExecutorService string `json:"executorService,omitempty"`
@@ -20,68 +35,70 @@ type OffloadConfigSpec struct {
 	// +optional
 	ExecutorPort int32 `json:"executorPort,omitempty"`
 
-	// pollInterval is how often the offload controller asks the executor for the state of
-	// a submitted job.
+	// pollInterval is how often each executor is expected to report on its
+	// OffloadRequests (their lastSyncTime heartbeat), and how often the offload
+	// controller looks at a Workload whose request did not change. A request
+	// with no heartbeat for twice this long shows "no executor answering" in the
+	// check message.
 	// +kubebuilder:default="15s"
 	// +optional
 	PollInterval *metav1.Duration `json:"pollInterval,omitempty"`
 
-	// executorLostTimeout is how long an executor may stay unreachable before the
-	// check is set to Retry.
+	// executorLostTimeout is how long an OffloadRequest may go without an
+	// executor heartbeat before the check is set to Retry, as MultiKueue's
+	// workerLostTimeout.
 	// +kubebuilder:default="10m"
 	// +optional
 	ExecutorLostTimeout *metav1.Duration `json:"executorLostTimeout,omitempty"`
 
-	// maxRetries bounds how many times a job cancelled on the site is
-	// resubmitted before the check is Rejected.
-	// +kubebuilder:default=3
-	// +kubebuilder:validation:Minimum=0
+	// maxQueueTime is how long a submitted job may wait in the site's queue
+	// before the check is set to Retry, which cancels it and lets Kueue requeue
+	// the Workload, possibly on another flavor. Kueue puts no timeout on a
+	// Pending check. Unset: no limit.
 	// +optional
-	MaxRetries *int32 `json:"maxRetries,omitempty"`
+	MaxQueueTime *metav1.Duration `json:"maxQueueTime,omitempty"`
 
-	// accountRule derives the Slurm account from the ClusterQueue name.
+	// retryStrategy bounds the new attempts after a job is lost: cancelled on
+	// the site, behind an executor without a heartbeat for executorLostTimeout,
+	// or queued for longer than maxQueueTime. Each loss sets the check to Retry
+	// with requeueAfterSeconds from Kueue's backoff, backoffBaseSeconds doubled
+	// per retry up to backoffMaxSeconds, and Kueue requeues the Workload after
+	// that delay. The retries are counted by the OffloadRequest's attempt; once
+	// backoffLimitCount retries were spent the check is Rejected, and 0 rejects
+	// at the first loss. A job that ran and failed is not retried, and a submit
+	// the executor refuses for now (a submit limit, an unreachable site) keeps
+	// the check Pending with the quota. The type and its defaults are
+	// ProvisioningRequestConfig's.
+	// +kubebuilder:default={backoffLimitCount:3,backoffBaseSeconds:60,backoffMaxSeconds:1800}
 	// +optional
-	AccountRule AccountRule `json:"accountRule,omitempty"`
+	RetryStrategy *kueue.ProvisioningRequestRetryStrategy `json:"retryStrategy,omitempty"`
 
-	// flavors maps a ResourceFlavor name to the Slurm queue its quota stands for:
-	// a partition and a QOS. A project with several queues on one machine (say a
+	// flavors maps a ResourceFlavor name to the batch queue its quota stands for,
+	// as annotations the backend's plugin reads (for Slurm, the sbatch flags in
+	// slurm-job.vk.io/flags). A project with several queues on one machine (say a
 	// debug, a production and an interactive QOS) is one ClusterQueue with one
 	// flavor each, and the flavor Kueue assigns decides where the job is submitted.
-	// A flavor that is not listed gives neither flag.
+	// A PodSet none of whose admitted flavors is listed is rejected: its job would
+	// carry no account.
 	// +optional
 	Flavors map[string]FlavorTarget `json:"flavors,omitempty"`
-
-	// alwaysShadow asks the executors to render a shadow for every job, also for
-	// jobs without exposed ports, so that logs are always reachable.
-	// +optional
-	AlwaysShadow bool `json:"alwaysShadow,omitempty"`
-
-	// mirrorPodStatus mirrors per-container status onto the owner object.
-	// +optional
-	MirrorPodStatus bool `json:"mirrorPodStatus,omitempty"`
 
 	// membership configures the membership sync controller for this site.
 	// +optional
 	Membership *Membership `json:"membership,omitempty"`
 }
 
-// FlavorTarget is the Slurm queue a ResourceFlavor stands for.
+// FlavorTarget is the batch queue a ResourceFlavor stands for.
 type FlavorTarget struct {
-	// partition is passed as --partition; empty gives no flag.
+	// annotations are added to every member pod of a PodSet admitted on this
+	// flavor. Each value is a Go text/template executed with .Account (the
+	// ClusterQueue's account label), .MaxExecSeconds (the Workload's
+	// maximumExecutionTimeSeconds, 0 when unset) and .MaxExecMinutes (the same in
+	// minutes, rounded up). The executor appends each value to the template's own
+	// value for that key, after a space, and never parses it, for example
+	// slurm-job.vk.io/flags: "--account={{.Account}} --qos=prod{{with .MaxExecMinutes}} --time={{.}}{{end}}".
 	// +optional
-	Partition string `json:"partition,omitempty"`
-	// qos is passed as --qos; empty gives no flag.
-	// +optional
-	QOS string `json:"qos,omitempty"`
-}
-
-// AccountRule derives a Slurm account from a ClusterQueue name.
-type AccountRule struct {
-	// stripPrefix is removed from the ClusterQueue name to give the account.
-	// Unset means "<site>-", where site is the OffloadConfig name. A ClusterQueue
-	// whose name does not start with the prefix is rejected.
-	// +optional
-	StripPrefix *string `json:"stripPrefix,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 // Membership holds the settings of the membership sync controller.
@@ -105,12 +122,6 @@ type Membership struct {
 	// executorImage is passed to the executor template as .Image.
 	// +optional
 	ExecutorImage string `json:"executorImage,omitempty"`
-
-	// executorTokenReview also binds every ServiceAccount the executor template
-	// renders to system:auth-delegator, with one ClusterRoleBinding per tenant
-	// namespace, so that the executor can validate the offload controller's token.
-	// +optional
-	ExecutorTokenReview bool `json:"executorTokenReview,omitempty"`
 
 	// cohort is the Kueue Cohort of the site's ClusterQueues. Unset means the
 	// site name.
@@ -148,11 +159,12 @@ type ConfigMapKeyRef struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Cluster
-// +kubebuilder:printcolumn:name="Executor",type=string,JSONPath=`.spec.executorService`
+// +kubebuilder:printcolumn:name="Workers",type=string,JSONPath=`.spec.workers`
 // +kubebuilder:printcolumn:name="Poll",type=string,JSONPath=`.spec.pollInterval`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
-// OffloadConfig is the configuration of one HPC site for the offload controller.
+// OffloadConfig holds the parameters of an offload AdmissionCheck and, for the
+// membership controller of its site, the membership settings.
 type OffloadConfig struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

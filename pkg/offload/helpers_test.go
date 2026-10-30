@@ -2,19 +2,14 @@ package offload
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -28,92 +23,22 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	podconstants "sigs.k8s.io/kueue/pkg/controller/jobs/pod/constants"
+	"sigs.k8s.io/kueue/pkg/util/admissioncheck"
 
 	"github.com/matbun/kueue-offload/api/v1alpha1"
-	"github.com/matbun/kueue-offload/pkg/executorapi"
 )
+
+// flagsKey is the Slurm plugin's annotation for extra sbatch flags.
+const flagsKey = "slurm-job.vk.io/flags"
 
 const (
-	testSite  = "hpc-a"
-	testNS    = "alice"
-	testDNS   = "kueue-offload"
-	wlName    = "job-train-5d565"
-	wlUID     = types.UID("0b6c-wl")
-	jobUID    = types.UID("0b6c-job")
-	testToken = "token-1"
+	testSite = "hpc-a"
+	testNS   = "alice"
+	wlName   = "job-train-5d565"
+	wlUID    = types.UID("0b6c-wl")
+	jobUID   = types.UID("0b6c-job")
 )
-
-// fakeExecutor is an httptest executor that records every call.
-type fakeExecutor struct {
-	t   *testing.T
-	srv *httptest.Server
-
-	mu         sync.Mutex
-	submits    []executorapi.SubmitRequest
-	submitHdrs []http.Header
-	deletes    []string
-	gets       int
-
-	submitCode int
-	submitBody any
-	jobCode    int
-	job        executorapi.JobStatus
-}
-
-func newFakeExecutor(t *testing.T) *fakeExecutor {
-	a := &fakeExecutor{t: t, submitCode: http.StatusCreated, jobCode: http.StatusOK,
-		submitBody: executorapi.SubmitResponse{APIVersion: executorapi.APIVersion, JobID: "123", Accepted: true},
-		job:        executorapi.JobStatus{APIVersion: executorapi.APIVersion, JobID: "123", State: executorapi.StateQueued, Reason: "Priority"},
-	}
-	a.srv = httptest.NewServer(http.HandlerFunc(a.serve))
-	t.Cleanup(a.srv.Close)
-	return a
-}
-
-func (a *fakeExecutor) serve(w http.ResponseWriter, r *http.Request) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	reply := func(code int, body any) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(code)
-		_ = json.NewEncoder(w).Encode(body)
-	}
-	switch {
-	case r.Method == http.MethodPost && r.URL.Path == "/submit":
-		var req executorapi.SubmitRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			a.t.Errorf("decoding submit: %v", err)
-		}
-		a.submits = append(a.submits, req)
-		a.submitHdrs = append(a.submitHdrs, r.Header.Clone())
-		reply(a.submitCode, a.submitBody)
-	case strings.HasPrefix(r.URL.Path, "/jobs/") && r.Method == http.MethodDelete:
-		a.deletes = append(a.deletes, strings.TrimPrefix(r.URL.Path, "/jobs/"))
-		w.WriteHeader(http.StatusNoContent)
-	case strings.HasPrefix(r.URL.Path, "/jobs/") && r.Method == http.MethodGet:
-		a.gets++
-		if a.jobCode != http.StatusOK {
-			reply(a.jobCode, executorapi.ErrorResponse{Permanent: a.jobCode == http.StatusNotFound, Message: "no job"})
-			return
-		}
-		reply(http.StatusOK, a.job)
-	default:
-		a.t.Errorf("unexpected executor call %s %s", r.Method, r.URL.Path)
-		w.WriteHeader(http.StatusNotFound)
-	}
-}
-
-func (a *fakeExecutor) counts() (submits, deletes, gets int) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return len(a.submits), len(a.deletes), a.gets
-}
-
-func (a *fakeExecutor) set(f func(a *fakeExecutor)) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	f(a)
-}
 
 // recordingChecks stands in for the server-side apply writer, which the fake
 // client cannot merge as a list keyed by name. It records each write and
@@ -135,6 +60,7 @@ func (w *recordingChecks) WriteCheck(ctx context.Context, wl *kueue.Workload, st
 			cur.Status.AdmissionChecks[i].State = st.State
 			cur.Status.AdmissionChecks[i].Message = st.Message
 			cur.Status.AdmissionChecks[i].LastTransitionTime = st.LastTransitionTime
+			cur.Status.AdmissionChecks[i].RequeueAfterSeconds = st.RequeueAfterSeconds
 			found = true
 		}
 	}
@@ -145,13 +71,12 @@ func (w *recordingChecks) WriteCheck(ctx context.Context, wl *kueue.Workload, st
 }
 
 type env struct {
-	t        *testing.T
-	c        client.Client
-	executor *fakeExecutor
-	checks   *recordingChecks
-	events   *events.FakeRecorder
-	r        *WorkloadReconciler
-	now      time.Time
+	t      *testing.T
+	c      client.Client
+	checks *recordingChecks
+	events *events.FakeRecorder
+	r      *WorkloadReconciler
+	now    time.Time
 }
 
 func testScheme(t *testing.T) *runtime.Scheme {
@@ -168,13 +93,16 @@ func offloadConfig() *v1alpha1.OffloadConfig {
 	return &v1alpha1.OffloadConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: testSite},
 		Spec: v1alpha1.OffloadConfigSpec{
+			Workers:             []string{testSite},
 			PollInterval:        &metav1.Duration{Duration: 15 * time.Second},
 			ExecutorLostTimeout: &metav1.Duration{Duration: 10 * time.Minute},
-			MaxRetries:          ptr.To[int32](2),
+			RetryStrategy: &kueue.ProvisioningRequestRetryStrategy{
+				BackoffLimitCount: ptr.To[int32](2), BackoffBaseSeconds: ptr.To[int32](60), BackoffMaxSeconds: ptr.To[int32](1800),
+			},
 			Flavors: map[string]v1alpha1.FlavorTarget{
-				"hpc-a-gpu":   {Partition: "gpu"},
-				"hpc-a-cpu":   {Partition: "cpu"},
-				"hpc-a-debug": {Partition: "gpu", QOS: "debug"},
+				"hpc-a-gpu":   {Annotations: map[string]string{flagsKey: "--account={{.Account}} --partition=gpu"}},
+				"hpc-a-cpu":   {Annotations: map[string]string{flagsKey: "--account={{.Account}} --partition=cpu"}},
+				"hpc-a-debug": {Annotations: map[string]string{flagsKey: "--account={{.Account}} --partition=gpu --qos=debug --time={{or .MaxExecMinutes 30}}"}},
 			},
 		},
 	}
@@ -192,7 +120,7 @@ func admissionCheck(name, controller, site string) *kueue.AdmissionCheck {
 
 func clusterQueue() *kueue.ClusterQueue {
 	return &kueue.ClusterQueue{
-		ObjectMeta: metav1.ObjectMeta{Name: "hpc-a-proj42"},
+		ObjectMeta: metav1.ObjectMeta{Name: "hpc-a-proj42", Labels: map[string]string{v1alpha1.AccountLabel: "proj42"}},
 		Spec: kueue.ClusterQueueSpec{
 			AdmissionChecksStrategy: &kueue.AdmissionChecksStrategy{
 				AdmissionChecks: []kueue.AdmissionCheckStrategyRule{{Name: "other-check"}, {Name: "hpc-a"}},
@@ -303,7 +231,7 @@ func ownerPod(i int, group bool) *corev1.Pod {
 	}
 	p.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: "kueue.x-k8s.io/admission"}}
 	if group {
-		p.Labels[podGroupNameLabel] = podGroup
+		p.Labels[podconstants.GroupNameLabel] = podGroup
 	}
 	return p
 }
@@ -375,38 +303,49 @@ func (e *env) custom(k ownerKind) *unstructured.Unstructured {
 	return u
 }
 
+// testClient builds the fake client with the indexes and status subresources
+// the reconcilers use.
+func testClient(t *testing.T, objs []client.Object, funcs interceptor.Funcs) client.Client {
+	t.Helper()
+	return fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objs...).
+		WithStatusSubresource(&kueue.Workload{}, &kueue.AdmissionCheck{}, &v1alpha1.OffloadRequest{}, &v1alpha1.OffloadWorker{},
+			&batchv1.Job{}, &corev1.Pod{}, newUnstructured(jobSetKind), newUnstructured(trainJobKind)).
+		WithIndex(&v1alpha1.OffloadRequest{}, RequestWorkloadKey, indexRequestWorkload).
+		WithIndex(&kueue.AdmissionCheck{}, AdmissionCheckUsingConfigKey,
+			admissioncheck.IndexerByConfigFunction(ControllerName, v1alpha1.GroupVersion.WithKind("OffloadConfig"))).
+		WithInterceptorFuncs(funcs).Build()
+}
+
 func newEnv(t *testing.T, opts ...envOption) *env {
 	t.Helper()
-	executor := newFakeExecutor(t)
-	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: testNS,
-		Annotations: map[string]string{ExecutorEndpointAnnotation: executor.srv.URL}}}
 	objs := []client.Object{
 		offloadConfig(), admissionCheck("hpc-a", ControllerName, testSite),
 		admissionCheck("other-check", "example.org/other", "x"),
-		clusterQueue(), ns, ownerJob(), workload(),
+		clusterQueue(), ownerJob(), workload(),
 	}
-	funcs := interceptor.Funcs{}
+	e := &env{t: t, events: events.NewFakeRecorder(100), now: time.Date(2026, 10, 29, 10, 0, 0, 0, time.UTC)}
+	// The fake client sets no creationTimestamp; the API server would.
+	funcs := interceptor.Funcs{
+		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+			if q, ok := obj.(*v1alpha1.OffloadRequest); ok {
+				q.CreationTimestamp = metav1.NewTime(e.now)
+			}
+			return c.Create(ctx, obj, opts...)
+		},
+	}
 	for _, o := range opts {
 		o(&objs, &funcs)
 	}
-	c := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(objs...).
-		WithStatusSubresource(&kueue.Workload{}, &kueue.AdmissionCheck{}, &v1alpha1.OffloadRecord{}, &batchv1.Job{}, &corev1.Pod{},
-			newUnstructured(jobSetKind), newUnstructured(trainJobKind)).
-		WithInterceptorFuncs(funcs).Build()
-
-	tokenFile := filepath.Join(t.TempDir(), "token")
-	if err := os.WriteFile(tokenFile, []byte(testToken+"\n"), 0o600); err != nil {
+	e.c = testClient(t, objs, funcs)
+	e.checks = &recordingChecks{c: e.c}
+	configs, err := NewConfigHelper(e.c)
+	if err != nil {
 		t.Fatal(err)
 	}
-	e := &env{t: t, c: c, executor: executor, checks: &recordingChecks{c: c}, events: events.NewFakeRecorder(100),
-		now: time.Date(2026, 10, 29, 10, 0, 0, 0, time.UTC)}
 	e.r = &WorkloadReconciler{
-		Client: c, APIReader: c, Checks: e.checks,
-		Executor:  &ExecutorClient{HTTP: &http.Client{Timeout: 5 * time.Second}, Token: &TokenSource{Path: tokenFile}},
-		Recorder:  e.events,
-		Site:      testSite,
-		Namespace: testDNS,
-		Now:       func() time.Time { return e.now },
+		Client: e.c, APIReader: e.c, Checks: e.checks, Configs: configs,
+		Recorder: e.events,
+		Now:      func() time.Time { return e.now },
 	}
 	return e
 }
@@ -456,13 +395,153 @@ func (e *env) pod(name string) *corev1.Pod {
 	return p
 }
 
-func (e *env) record() *v1alpha1.OffloadRecord {
+func findCheck(wl *kueue.Workload, name kueue.AdmissionCheckReference) *kueue.AdmissionCheckState {
+	return admissioncheck.FindAdmissionCheck(wl.Status.AdmissionChecks, name)
+}
+
+// requestOf is the name of the check hpc-a's request for an attempt.
+func requestOf(attempt int32) string { return requestName(wlName, "hpc-a", attempt) }
+
+// request reads an attempt's OffloadRequest of check hpc-a.
+func (e *env) request(attempt int32) *v1alpha1.OffloadRequest {
 	e.t.Helper()
-	rec := &v1alpha1.OffloadRecord{}
-	if err := e.c.Get(context.Background(), types.NamespacedName{Namespace: testDNS, Name: string(wlUID)}, rec); err != nil {
-		e.t.Fatalf("record: %v", err)
+	q := &v1alpha1.OffloadRequest{}
+	if err := e.c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: requestOf(attempt)}, q); err != nil {
+		e.t.Fatalf("request %d: %v", attempt, err)
 	}
-	return rec
+	return q
+}
+
+// requests lists every OffloadRequest of the namespace by name.
+func (e *env) requests() map[string]*v1alpha1.OffloadRequest {
+	e.t.Helper()
+	list := &v1alpha1.OffloadRequestList{}
+	if err := e.c.List(context.Background(), list, client.InNamespace(testNS)); err != nil {
+		e.t.Fatal(err)
+	}
+	out := map[string]*v1alpha1.OffloadRequest{}
+	for i := range list.Items {
+		out[list.Items[i].Name] = &list.Items[i]
+	}
+	return out
+}
+
+// takes is the executor taking an attempt: its finalizer, then Accepted and a
+// heartbeat.
+func (e *env) takes(attempt int32) {
+	e.t.Helper()
+	q := e.request(attempt)
+	q.Finalizers = append(q.Finalizers, v1alpha1.ExecutorFinalizer)
+	if err := e.c.Update(context.Background(), q); err != nil {
+		e.t.Fatal(err)
+	}
+	e.report(attempt, func(st *v1alpha1.OffloadRequestStatus) {
+		e.condition(st, v1alpha1.OffloadRequestAccepted, metav1.ConditionTrue, "Accepted", "")
+	})
+}
+
+// report is the executor writing an attempt's status, with a heartbeat now.
+func (e *env) report(attempt int32, f func(st *v1alpha1.OffloadRequestStatus)) {
+	e.t.Helper()
+	q := e.request(attempt)
+	f(&q.Status)
+	q.Status.LastSyncTime = &metav1.Time{Time: e.now}
+	if err := e.c.Status().Update(context.Background(), q); err != nil {
+		e.t.Fatal(err)
+	}
+}
+
+func (e *env) condition(st *v1alpha1.OffloadRequestStatus, ty string, status metav1.ConditionStatus, reason, msg string) {
+	meta.SetStatusCondition(&st.Conditions, metav1.Condition{Type: ty, Status: status, Reason: reason, Message: msg,
+		LastTransitionTime: metav1.NewTime(e.now)})
+}
+
+// queued, running, finished and evicted are the executor's reports for a job.
+func (e *env) queued(job, reason, msg string) func(st *v1alpha1.OffloadRequestStatus) {
+	return func(st *v1alpha1.OffloadRequestStatus) {
+		st.JobID, st.Reason, st.Message = job, reason, msg
+		e.condition(st, v1alpha1.OffloadRequestQuotaReserved, metav1.ConditionTrue, "Submitted", "")
+	}
+}
+
+func (e *env) running(node string, start *metav1.Time) func(st *v1alpha1.OffloadRequestStatus) {
+	return func(st *v1alpha1.OffloadRequestStatus) {
+		st.NodeName, st.StartTime, st.Reason, st.Message = node, start, "", ""
+		e.condition(st, v1alpha1.OffloadRequestAdmitted, metav1.ConditionTrue, "Running", "")
+	}
+}
+
+func (e *env) finished(succeeded bool, msg string) func(st *v1alpha1.OffloadRequestStatus) {
+	return func(st *v1alpha1.OffloadRequestStatus) {
+		reason := v1alpha1.OffloadRequestSucceeded
+		if !succeeded {
+			reason = v1alpha1.OffloadRequestFailed
+		}
+		e.condition(st, v1alpha1.OffloadRequestFinished, metav1.ConditionTrue, reason, msg)
+	}
+}
+
+func (e *env) evicted(msg string) func(st *v1alpha1.OffloadRequestStatus) {
+	return func(st *v1alpha1.OffloadRequestStatus) {
+		e.condition(st, v1alpha1.OffloadRequestEvicted, metav1.ConditionTrue, "Cancelled", msg)
+	}
+}
+
+// submitted reconciles the first attempt into existence and has the executor
+// take it and submit job 123, queued for Priority.
+func (e *env) submitted() {
+	e.t.Helper()
+	e.reconcile()
+	e.takes(1)
+	e.report(1, e.queued("123", "Priority", ""))
+	e.reconcile()
+}
+
+// evictAndReserve does what Kueue does after a Retry: it resets the check to
+// Pending, counting the retry in retryCount and keeping requeueAfterSeconds
+// (resetChecksOnEviction in pkg/workload/admissionchecks.go), then reserves
+// quota again.
+func (e *env) evictAndReserve(name kueue.AdmissionCheckReference) {
+	e.t.Helper()
+	e.mutateWorkload(func(wl *kueue.Workload) {
+		st := findCheck(wl, name)
+		if st.State == kueue.CheckStateRetry {
+			st.RetryCount = ptr.To(ptr.Deref(st.RetryCount, 0) + 1)
+		}
+		st.State, st.Message = kueue.CheckStatePending, "Reset to Pending after eviction. Previously: Retry"
+	})
+}
+
+// evictPerFlavor does what Kueue does after a Retry of a check that covers
+// only some flavors: eviction clears the admission and with it the check's
+// state, retryCount included, and the next reservation adds it again as new.
+func (e *env) evictPerFlavor(name kueue.AdmissionCheckReference) {
+	e.t.Helper()
+	e.mutateWorkload(func(wl *kueue.Workload) {
+		st := findCheck(wl, name)
+		*st = kueue.AdmissionCheckState{Name: name, State: kueue.CheckStatePending, LastTransitionTime: metav1.NewTime(e.now)}
+	})
+}
+
+// loseReservation does what Kueue does when it evicts the Workload.
+func (e *env) loseReservation() {
+	e.t.Helper()
+	e.mutateWorkload(func(wl *kueue.Workload) {
+		meta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionFalse, Reason: "Pending"})
+		meta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadEvicted, Status: metav1.ConditionTrue, Reason: "Preempted"})
+		wl.Status.Admission = nil
+	})
+}
+
+// reserveAgain does what Kueue does when it reserves quota again.
+func (e *env) reserveAgain() {
+	e.t.Helper()
+	admission := workload().Status.Admission
+	e.mutateWorkload(func(wl *kueue.Workload) {
+		meta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadQuotaReserved, Status: metav1.ConditionTrue, Reason: "QuotaReserved"})
+		meta.RemoveStatusCondition(&wl.Status.Conditions, kueue.WorkloadEvicted)
+		wl.Status.Admission = admission
+	})
 }
 
 // mutateWorkload changes the stored Workload, as Kueue would.
@@ -471,15 +550,6 @@ func (e *env) mutateWorkload(f func(wl *kueue.Workload)) {
 	wl := e.workload()
 	f(wl)
 	if err := e.c.Status().Update(context.Background(), wl); err != nil {
-		e.t.Fatal(err)
-	}
-}
-
-func (e *env) mutateRecord(f func(rec *v1alpha1.OffloadRecord)) {
-	e.t.Helper()
-	rec := e.record()
-	f(rec)
-	if err := e.c.Status().Update(context.Background(), rec); err != nil {
 		e.t.Fatal(err)
 	}
 }

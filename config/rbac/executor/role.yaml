@@ -1,11 +1,27 @@
 # The executor's permissions in its tenant namespace. The membership controller
 # binds the executor's ServiceAccount to this ClusterRole with a RoleBinding in
-# that namespace only.
+# that namespace only. The interLink API server and the plugin next to the
+# executor in the tenant pod call no Kubernetes API.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: kueue-offload-executor
 rules:
+# The OffloadRequests of the namespace: watched, held with the executor's
+# finalizer, and reported on in their status. Every write is a patch, and no
+# owner reference points at a request, so neither update nor
+# offloadrequests/finalizers is needed. config/admission limits the patches to
+# the status and the executor's finalizer.
+- apiGroups: [interlink.eu]
+  resources: [offloadrequests]
+  verbs: [get, list, watch, patch]
+- apiGroups: [interlink.eu]
+  resources: [offloadrequests/status]
+  verbs: [patch]
+# Before a submit, the request is checked against the Workload it names.
+- apiGroups: [kueue.x-k8s.io]
+  resources: [workloads]
+  verbs: [get]
 - apiGroups: [""]
   resources: [secrets, configmaps]
   verbs: [get, list]
@@ -16,7 +32,7 @@ rules:
   resources: [deployments]
   verbs: [create, update, patch, delete, get, list, watch]
 # patch: a node change annotates the shadow's pods so the kubelet refreshes
-# the node ConfigMap at once.
+# the node ConfigMap at once. list: the IP and readiness of the shadow's pod.
 - apiGroups: [""]
   resources: [pods]
   verbs: [get, list, watch, patch]

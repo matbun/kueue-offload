@@ -11,7 +11,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -63,7 +62,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result
 	return ctrl.Result{RequeueAfter: after}, nil
 }
 
-// Sync runs one pass of the white paper's reconcile for the site and returns
+// Sync runs one pass of the site's reconcile and returns
 // when the next pass is due.
 func (r *Reconciler) Sync(ctx context.Context) (time.Duration, error) {
 	logger := log.FromContext(ctx).WithValues("site", r.Site)
@@ -265,6 +264,18 @@ func (r *Reconciler) apply(ctx context.Context, obj client.Object, gvk schema.Gr
 }
 
 func (r *Reconciler) applyUnstructured(ctx context.Context, u *unstructured.Unstructured) error {
+	err := r.Client.Apply(ctx, client.ApplyConfigurationFromUnstructured(u), client.FieldOwner(FieldManager), client.ForceOwnership)
+	if !apierrors.IsInvalid(err) || u.GroupVersionKind().GroupKind() != (schema.GroupKind{Group: "batch", Kind: "Job"}) {
+		return err
+	}
+	// A Job's pod template is immutable, so a changed template replaces the Job.
+	old := &unstructured.Unstructured{}
+	old.SetGroupVersionKind(u.GroupVersionKind())
+	old.SetNamespace(u.GetNamespace())
+	old.SetName(u.GetName())
+	if err := r.Client.Delete(ctx, old, client.PropagationPolicy(metav1.DeletePropagationBackground)); client.IgnoreNotFound(err) != nil {
+		return err
+	}
 	return r.Client.Apply(ctx, client.ApplyConfigurationFromUnstructured(u), client.FieldOwner(FieldManager), client.ForceOwnership)
 }
 
@@ -362,37 +373,13 @@ func (r *Reconciler) applyExecutor(ctx context.Context, sc *v1alpha1.OffloadConf
 		r.warn(sc, EventTemplateRefused, fmt.Sprintf("namespace %s: %v", t.Namespace, err))
 		return fmt.Errorf("executor objects of namespace %s: %w", t.Namespace, err)
 	}
-	var subjects []rbacv1.Subject
 	for _, u := range objs {
 		if err := r.applyUnstructured(ctx, u); err != nil {
 			return fmt.Errorf("applying %s %s/%s: %w", u.GetKind(), t.Namespace, u.GetName(), err)
 		}
-		if u.GroupVersionKind().GroupKind() == (schema.GroupKind{Kind: "ServiceAccount"}) {
-			subjects = append(subjects, rbacv1.Subject{Kind: rbacv1.ServiceAccountKind, Name: u.GetName(), Namespace: t.Namespace})
-		}
-	}
-	if !s.tokenReview {
-		return nil
-	}
-	if len(subjects) == 0 {
-		log.FromContext(ctx).Info("executorTokenReview is set but the template renders no ServiceAccount", "namespace", t.Namespace)
-		return nil
-	}
-	crb := &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{Name: tokenReviewBinding(s.name, t.Namespace), Labels: managedLabels(s.name)},
-		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "system:auth-delegator"},
-		Subjects:   subjects,
-	}
-	if err := r.apply(ctx, crb, rbacv1.SchemeGroupVersion.WithKind("ClusterRoleBinding")); err != nil {
-		return fmt.Errorf("ClusterRoleBinding %s: %w", crb.Name, err)
 	}
 	return nil
 }
-
-// tokenReviewBinding names the per-tenant system:auth-delegator binding. Dots
-// cannot occur in site or namespace names, so names of different tenants
-// never collide.
-func tokenReviewBinding(site, ns string) string { return "kueue-offload-executor." + site + "." + ns }
 
 // prepareObjects refuses Secrets, cluster-scoped objects and objects in
 // another namespace, and labels the rest.

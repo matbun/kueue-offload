@@ -1,22 +1,19 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: kueue-offload-hpc-a
+  name: kueue-offload
   namespace: kueue-offload
   labels:
     app: kueue-offload
-    interlink.eu/site: hpc-a
 spec:
   replicas: 1
   selector:
     matchLabels:
       app: kueue-offload
-      interlink.eu/site: hpc-a
   template:
     metadata:
       labels:
         app: kueue-offload
-        interlink.eu/site: hpc-a
     spec:
       serviceAccountName: kueue-offload
       securityContext:
@@ -28,9 +25,7 @@ spec:
         image: kueue-offload:latest
         command: [/offload-controller]
         args:
-        - --site=hpc-a
         - --namespace=kueue-offload
-        - --token-file=/var/run/secrets/interlink/token
         - --metrics-bind-address=:8080
         - --health-probe-bind-address=:8081
         - --leader-elect
@@ -49,15 +44,3 @@ spec:
           readOnlyRootFilesystem: true
           capabilities:
             drop: [ALL]
-        volumeMounts:
-        - name: interlink-token
-          mountPath: /var/run/secrets/interlink
-          readOnly: true
-      volumes:
-      - name: interlink-token
-        projected:
-          sources:
-          - serviceAccountToken:
-              audience: kueue-offload-executor
-              expirationSeconds: 3600
-              path: token

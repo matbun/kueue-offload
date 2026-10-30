@@ -1,0 +1,72 @@
+# Who may write an OffloadRequest. Its executor submits a job as the namespace's user once the
+# request matches a Workload, so RBAC (tenants get no write on offloadrequests) is not trusted
+# alone: anyone else with write on the kind is held to the same split.
+#   - only the offload controller creates a request, changes its spec or its site label (the
+#     executors select on that label), and adds or removes its finalizer offload.interlink.eu/attempt;
+#   - only the executor of the request's own namespace writes its status and adds or removes its
+#     finalizer offload.interlink.eu/executor.
+# Other metadata changes stay open, so the garbage collector can drop an owner reference or its
+# own finalizers. Deletion is not matched: the controller and the garbage collector delete, and
+# deleting cancels the job.
+#
+# The ServiceAccounts are the controller's (config/rbac/service_account.yaml) and the one the
+# executor template renders in each tenant namespace, named after OffloadConfig executorService
+# (default kueue-offload-executor); a site that names it otherwise edits the variable executor.
+# To release a request whose executor is gone for good, an administrator deletes the binding,
+# removes the finalizer and applies the binding again.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kueue-offload-offloadrequests
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [interlink.eu]
+      apiVersions: ["*"]
+      operations: [CREATE, UPDATE]
+      resources: [offloadrequests, offloadrequests/status]
+  variables:
+  - name: controller
+    expression: request.userInfo.username == 'system:serviceaccount:kueue-offload:kueue-offload'
+  - name: executor
+    expression: request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':kueue-offload-executor'
+  # oldObject is null on CREATE
+  - name: finalizers
+    expression: "has(object.metadata.finalizers) ? object.metadata.finalizers : []"
+  - name: oldFinalizers
+    expression: "oldObject != null && has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []"
+  - name: attemptChanged
+    expression: "('offload.interlink.eu/attempt' in variables.finalizers) != ('offload.interlink.eu/attempt' in variables.oldFinalizers)"
+  - name: executorChanged
+    expression: "('offload.interlink.eu/executor' in variables.finalizers) != ('offload.interlink.eu/executor' in variables.oldFinalizers)"
+  - name: site
+    expression: "has(object.metadata.labels) && 'offload.interlink.eu/site' in object.metadata.labels ? object.metadata.labels['offload.interlink.eu/site'] : ''"
+  - name: oldSite
+    expression: "oldObject != null && has(oldObject.metadata.labels) && 'offload.interlink.eu/site' in oldObject.metadata.labels ? oldObject.metadata.labels['offload.interlink.eu/site'] : ''"
+  validations:
+  - expression: request.operation != 'CREATE' || variables.controller
+    message: only the offload controller creates OffloadRequests
+    reason: Forbidden
+  # A status write cannot change the spec: the API server keeps the old one before validation.
+  - expression: "request.operation != 'UPDATE' || variables.controller || (object.spec == oldObject.spec && variables.site == variables.oldSite)"
+    message: only the offload controller changes an OffloadRequest's spec or its offload.interlink.eu/site label
+    reason: Forbidden
+  # subResource is absent from the request of the main resource
+  - expression: "!has(request.subResource) || request.subResource != 'status' || variables.executor"
+    message: only the executor of the OffloadRequest's namespace writes its status
+    reason: Forbidden
+  - expression: "!variables.attemptChanged || variables.controller"
+    message: only the offload controller adds or removes the finalizer offload.interlink.eu/attempt
+    reason: Forbidden
+  - expression: "!variables.executorChanged || variables.executor"
+    message: only the executor of the OffloadRequest's namespace adds or removes the finalizer offload.interlink.eu/executor
+    reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kueue-offload-offloadrequests
+spec:
+  policyName: kueue-offload-offloadrequests
+  validationActions: [Deny]

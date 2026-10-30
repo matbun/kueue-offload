@@ -15,8 +15,8 @@ spec:
   scope: Cluster
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.executorService
-      name: Executor
+    - jsonPath: .spec.workers
+      name: Workers
       type: string
     - jsonPath: .spec.pollInterval
       name: Poll
@@ -27,8 +27,9 @@ spec:
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: OffloadConfig is the configuration of one HPC site for the offload
-          controller.
+        description: |-
+          OffloadConfig holds the parameters of an offload AdmissionCheck and, for the
+          membership controller of its site, the membership settings.
         properties:
           apiVersion:
             description: |-
@@ -49,30 +50,16 @@ spec:
             type: object
           spec:
             description: |-
-              OffloadConfigSpec configures the offload controller of one site. An AdmissionCheck with
-              controllerName interlink.eu/offload selects it through its parameters.
+              OffloadConfigSpec holds the parameters of the AdmissionChecks with
+              controllerName interlink.eu/offload that name it. One offload controller
+              serves every such check and reads each check's OffloadConfig separately.
             properties:
-              accountRule:
-                description: accountRule derives the Slurm account from the ClusterQueue
-                  name.
-                properties:
-                  stripPrefix:
-                    description: |-
-                      stripPrefix is removed from the ClusterQueue name to give the account.
-                      Unset means "<site>-", where site is the OffloadConfig name. A ClusterQueue
-                      whose name does not start with the prefix is rejected.
-                    type: string
-                type: object
-              alwaysShadow:
-                description: |-
-                  alwaysShadow asks the executors to render a shadow for every job, also for
-                  jobs without exposed ports, so that logs are always reachable.
-                type: boolean
               executorLostTimeout:
                 default: 10m
                 description: |-
-                  executorLostTimeout is how long an executor may stay unreachable before the
-                  check is set to Retry.
+                  executorLostTimeout is how long an OffloadRequest may go without an
+                  executor heartbeat before the check is set to Retry, as MultiKueue's
+                  workerLostTimeout.
                 type: string
               executorPort:
                 default: 8000
@@ -83,37 +70,45 @@ spec:
                 type: integer
               executorService:
                 default: kueue-offload-executor
-                description: executorService is the name of the executor Service in
-                  every tenant namespace.
+                description: |-
+                  executorService is the name of the executor Service in every tenant
+                  namespace, which the shadows read job logs from. The membership controller
+                  passes it to the executor template.
                 type: string
               flavors:
                 additionalProperties:
-                  description: FlavorTarget is the Slurm queue a ResourceFlavor stands
+                  description: FlavorTarget is the batch queue a ResourceFlavor stands
                     for.
                   properties:
-                    partition:
-                      description: partition is passed as --partition; empty gives
-                        no flag.
-                      type: string
-                    qos:
-                      description: qos is passed as --qos; empty gives no flag.
-                      type: string
+                    annotations:
+                      additionalProperties:
+                        type: string
+                      description: |-
+                        annotations are added to every member pod of a PodSet admitted on this
+                        flavor. Each value is a Go text/template executed with .Account (the
+                        ClusterQueue's account label), .MaxExecSeconds (the Workload's
+                        maximumExecutionTimeSeconds, 0 when unset) and .MaxExecMinutes (the same in
+                        minutes, rounded up). The executor appends each value to the template's own
+                        value for that key, after a space, and never parses it, for example
+                        slurm-job.vk.io/flags: "--account={{.Account}} --qos=prod{{with .MaxExecMinutes}} --time={{.}}{{end}}".
+                      type: object
                   type: object
                 description: |-
-                  flavors maps a ResourceFlavor name to the Slurm queue its quota stands for:
-                  a partition and a QOS. A project with several queues on one machine (say a
+                  flavors maps a ResourceFlavor name to the batch queue its quota stands for,
+                  as annotations the backend's plugin reads (for Slurm, the sbatch flags in
+                  slurm-job.vk.io/flags). A project with several queues on one machine (say a
                   debug, a production and an interactive QOS) is one ClusterQueue with one
                   flavor each, and the flavor Kueue assigns decides where the job is submitted.
-                  A flavor that is not listed gives neither flag.
+                  A PodSet none of whose admitted flavors is listed is rejected: its job would
+                  carry no account.
                 type: object
-              maxRetries:
-                default: 3
+              maxQueueTime:
                 description: |-
-                  maxRetries bounds how many times a job cancelled on the site is
-                  resubmitted before the check is Rejected.
-                format: int32
-                minimum: 0
-                type: integer
+                  maxQueueTime is how long a submitted job may wait in the site's queue
+                  before the check is set to Retry, which cancels it and lets Kueue requeue
+                  the Workload, possibly on another flavor. Kueue puts no timeout on a
+                  Pending check. Unset: no limit.
+                type: string
               membership:
                 description: membership configures the membership sync controller
                   for this site.
@@ -303,12 +298,6 @@ spec:
                     - name
                     - namespace
                     type: object
-                  executorTokenReview:
-                    description: |-
-                      executorTokenReview also binds every ServiceAccount the executor template
-                      renders to system:auth-delegator, with one ClusterRoleBinding per tenant
-                      namespace, so that the executor can validate the offload controller's token.
-                    type: boolean
                   slurmCluster:
                     description: |-
                       slurmCluster is the value of the cluster column of the associations that
@@ -325,16 +314,81 @@ spec:
                 - associations
                 - slurmCluster
                 type: object
-              mirrorPodStatus:
-                description: mirrorPodStatus mirrors per-container status onto the
-                  owner object.
-                type: boolean
               pollInterval:
                 default: 15s
                 description: |-
-                  pollInterval is how often the offload controller asks the executor for the state of
-                  a submitted job.
+                  pollInterval is how often each executor is expected to report on its
+                  OffloadRequests (their lastSyncTime heartbeat), and how often the offload
+                  controller looks at a Workload whose request did not change. A request
+                  with no heartbeat for twice this long shows "no executor answering" in the
+                  check message.
                 type: string
+              retryStrategy:
+                default:
+                  backoffBaseSeconds: 60
+                  backoffLimitCount: 3
+                  backoffMaxSeconds: 1800
+                description: |-
+                  retryStrategy bounds the new attempts after a job is lost: cancelled on
+                  the site, behind an executor without a heartbeat for executorLostTimeout,
+                  or queued for longer than maxQueueTime. Each loss sets the check to Retry
+                  with requeueAfterSeconds from Kueue's backoff, backoffBaseSeconds doubled
+                  per retry up to backoffMaxSeconds, and Kueue requeues the Workload after
+                  that delay. The retries are counted by the OffloadRequest's attempt; once
+                  backoffLimitCount retries were spent the check is Rejected, and 0 rejects
+                  at the first loss. A job that ran and failed is not retried, and a submit
+                  the executor refuses for now (a submit limit, an unreachable site) keeps
+                  the check Pending with the quota. The type and its defaults are
+                  ProvisioningRequestConfig's.
+                properties:
+                  backoffBaseSeconds:
+                    default: 60
+                    description: |-
+                      backoffBaseSeconds defines the base for the exponential backoff for
+                      re-queuing an evicted workload.
+
+                      Defaults to 60.
+                    format: int32
+                    type: integer
+                  backoffLimitCount:
+                    default: 3
+                    description: |-
+                      backoffLimitCount defines the maximum number of re-queuing retries.
+                      Once the number is reached, the workload is deactivated (`.spec.activate`=`false`).
+
+                      Every backoff duration is about "b*2^(n-1)+Rand" where:
+                      - "b" represents the base set by "BackoffBaseSeconds" parameter,
+                      - "n" represents the "workloadStatus.requeueState.count",
+                      - "Rand" represents the random jitter.
+                      During this time, the workload is taken as an inadmissible and
+                      other workloads will have a chance to be admitted.
+                      By default, the consecutive requeue delays are around: (60s, 120s, 240s, ...).
+
+                      Defaults to 3.
+                    format: int32
+                    type: integer
+                  backoffMaxSeconds:
+                    default: 1800
+                    description: |-
+                      backoffMaxSeconds defines the maximum backoff time to re-queue an evicted workload.
+
+                      Defaults to 1800.
+                    format: int32
+                    type: integer
+                type: object
+              workers:
+                description: |-
+                  workers names the OffloadWorkers the check may submit to. The check is
+                  Active while one of them is. A check submits to one site until a
+                  dispatcher chooses among several, so the list holds one name.
+                items:
+                  type: string
+                maxItems: 1
+                minItems: 1
+                type: array
+                x-kubernetes-list-type: set
+            required:
+            - workers
             type: object
         type: object
     served: true

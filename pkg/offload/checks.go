@@ -41,23 +41,26 @@ type checkApplyStatus struct {
 }
 
 type checkApplyEntry struct {
-	Name               string `json:"name"`
-	State              string `json:"state"`
-	Message            string `json:"message"`
-	LastTransitionTime string `json:"lastTransitionTime"`
+	Name                string `json:"name"`
+	State               string `json:"state"`
+	Message             string `json:"message"`
+	LastTransitionTime  string `json:"lastTransitionTime"`
+	RequeueAfterSeconds *int32 `json:"requeueAfterSeconds,omitempty"`
 }
 
-// checkApplyBody is the apply configuration for one check entry.
+// checkApplyBody is the apply configuration for one check entry. It leaves out
+// retryCount, which Kueue owns.
 func checkApplyBody(wl *kueue.Workload, st kueue.AdmissionCheckState) ([]byte, error) {
 	return json.Marshal(checkApply{
 		APIVersion: kueue.GroupVersion.String(),
 		Kind:       "Workload",
 		Metadata:   checkApplyMeta{Name: wl.Name, Namespace: wl.Namespace},
 		Status: checkApplyStatus{AdmissionChecks: []checkApplyEntry{{
-			Name:               string(st.Name),
-			State:              string(st.State),
-			Message:            st.Message,
-			LastTransitionTime: st.LastTransitionTime.UTC().Format("2006-01-02T15:04:05Z"),
+			Name:                string(st.Name),
+			State:               string(st.State),
+			Message:             st.Message,
+			LastTransitionTime:  st.LastTransitionTime.UTC().Format("2006-01-02T15:04:05Z"),
+			RequeueAfterSeconds: st.RequeueAfterSeconds,
 		}}},
 	})
 }

@@ -3,20 +3,31 @@ kind: OffloadConfig
 metadata:
   name: hpc-a
 spec:
+  # The OffloadWorker this check submits to; the check is Active while it is.
+  workers: [hpc-a]
   executorService: kueue-offload-executor
   executorPort: 8000
   pollInterval: 15s
   executorLostTimeout: 10m
-  maxRetries: 3
+  retryStrategy:
+    backoffLimitCount: 3
+    backoffBaseSeconds: 60
+    backoffMaxSeconds: 1800
+  # One flavor per batch queue. The values are Go templates with .Account,
+  # .MaxExecSeconds and .MaxExecMinutes (the Workload's
+  # maximumExecutionTimeSeconds); the executor appends them to the job's own.
   flavors:
-    hpc-a-gpu: {partition: gpu}
-    hpc-a-cpu: {partition: cpu}
+    hpc-a-gpu:
+      annotations:
+        slurm-job.vk.io/flags: "--account={{.Account}} --partition=gpu{{with .MaxExecMinutes}} --time={{.}}{{end}}"
+    hpc-a-cpu:
+      annotations:
+        slurm-job.vk.io/flags: "--account={{.Account}} --partition=cpu{{with .MaxExecMinutes}} --time={{.}}{{end}}"
   membership:
     slurmCluster: hpc-a
     associations: {namespace: kueue-offload-membership, name: hpc-a-associations, key: associations}
     executorTemplate: {namespace: kueue-offload-membership, name: hpc-a-executor-template, key: template.yaml}
-    executorImage: ghcr.io/interlink-hq/interlink-slurm-plugin:0.6.3-pre2
-    executorTokenReview: true
+    executorImage: registry.example.org/kueue-offload:latest
     syncInterval: 15m
     defaultProjectQuota:
     - coveredResources: [cpu, memory, nvidia.com/gpu]

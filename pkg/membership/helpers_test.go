@@ -95,7 +95,6 @@ func offloadConfig() *v1alpha1.OffloadConfig {
 			Associations:        v1alpha1.ConfigMapKeyRef{Namespace: ownNS, Name: "assoc", Key: "associations"},
 			ExecutorTemplate:    &v1alpha1.ConfigMapKeyRef{Namespace: ownNS, Name: "hpc-a-executor-template", Key: "template.yaml"},
 			ExecutorImage:       "executor:1",
-			ExecutorTokenReview: true,
 			DefaultProjectQuota: quota(8),
 		}},
 	}

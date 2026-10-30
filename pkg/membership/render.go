@@ -26,7 +26,8 @@ type TemplateData struct {
 	Accounts []string
 	// Image is membership.executorImage of the OffloadConfig.
 	Image string
-	// ExecutorService and ExecutorPort are where the offload controller calls the executor.
+	// ExecutorService and ExecutorPort are where the shadows read job logs from
+	// the executor.
 	ExecutorService string
 	ExecutorPort    int32
 }

@@ -1,4 +1,5 @@
 IMG ?= kueue-offload:latest
+VERSION ?= $(shell git describe --tags --always)
 GO ?= go
 CONTROLLER_GEN ?= $(shell command -v controller-gen 2>/dev/null || echo $(HOME)/go/bin/controller-gen)
 
@@ -24,4 +25,4 @@ manifests:
 	$(CONTROLLER_GEN) rbac:roleName=kueue-offload-membership paths=./pkg/membership/... output:rbac:artifacts:config=config/rbac/membership
 
 docker-build:
-	docker build -t $(IMG) .
+	docker build --build-arg VERSION=$(VERSION) -t $(IMG) .

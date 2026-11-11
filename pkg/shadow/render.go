@@ -21,7 +21,7 @@ var sshTemplate string
 var parsedSSHTemplate = template.Must(template.New("shadow").Parse(sshTemplate))
 
 // sshTunnel carries the fields of the virtual kubelet's Network.SSH block the
-// template reads. The executor supports public key authentication only.
+// template reads.
 type sshTunnel struct {
 	LoginHost           string
 	Port                int
@@ -60,7 +60,7 @@ type templateData struct {
 }
 
 func (cfg Config) sshTunnel() sshTunnel {
-	return sshTunnel{
+	t := sshTunnel{
 		LoginHost:           cfg.LoginHost,
 		Port:                cfg.Port,
 		User:                cfg.User,
@@ -75,6 +75,11 @@ func (cfg Config) sshTunnel() sshTunnel {
 		KnownHostsConfigMap: cfg.KnownHostsConfigMap,
 		NodeWaitTimeout:     cfg.NodeWaitTimeout,
 	}
+	if k := cfg.Kerberos; k != nil {
+		t.Auth = "kerberos"
+		t.KeytabSecret, t.KeytabSecretKey, t.Principal, t.Krb5ConfigMap = k.KeytabSecret, k.KeytabKey, k.Principal, k.Krb5ConfigMap
+	}
+	return t
 }
 
 // executeTemplate renders the SSH template and decodes its documents.

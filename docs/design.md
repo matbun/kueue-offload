@@ -62,7 +62,7 @@ and makes its pods as on any cluster. For each PodSet sent to the site the updat
 
 Kueue holds `podSetUpdates` immutable while the check stays `Ready` (its Workload webhook), so every
 `Ready` write carries the same ones, built from the Workload alone (`podSetUpdates` in
-`pkg/offload/admit.go`). `<node>` is `kueue-offload-<OffloadConfig name>`, the site's virtual
+`pkg/offload/admit.go`). `<node>` is `<OffloadConfig name>-vk`, the site's virtual
 node: the controller binds the pods to it, the node shows on each the state of its member, and
 owners end from their pods ([Owners](#owners), [Virtual node](#virtual-node)).
 
@@ -617,6 +617,11 @@ Shadow:
   Port: 22                 # 0: 22
   KeySecret: hpc-a-tunnel-key
   KeySecretKey: ssh-privatekey
+  Kerberos:                # set: a ticket from this keytab instead of KeySecret
+    KeytabSecret: alice-keytab
+    KeytabKey: user.keytab
+    Principal: alice@HPC-A.EXAMPLE.ORG
+    Krb5ConfigMap: krb5-config   # key krb5.conf; empty: the image's
   KnownHostsConfigMap: hpc-a-known-hosts
   NodeHostKeys: verify
   ForwardTarget: node
@@ -923,7 +928,7 @@ only rank 0's pod carries an IP.
 
 ## Virtual node
 
-One node per site, named `kueue-offload-<OffloadConfig name>` (`v1alpha1.NodeName`), run inside the
+One node per site, named `<OffloadConfig name>-vk` (`v1alpha1.NodeName`), run inside the
 offload controller by `pkg/node` on the leader: no Deployment, image or credential of its own.
 The pods of a Workload admitted through the site's check are bound to it, and it shows on each the
 state of the member of the job it stands for, as a kubelet shows a pod it runs, and serves its
@@ -940,6 +945,7 @@ status loop and the kubelet API's routes, not its pod controller.
 | capacity | `cpu: 1`, `memory: 1Gi`, `pods: 1000`: nothing is scheduled by fit, and autoscalers that count node cores (CoreDNS's) do not grow with the site |
 | addresses, port | `InternalIP` the controller pod's IP (`POD_IP`), kubelet port 10250 |
 | Lease | `kube-node-lease/<name>`, 40 s |
+| kubelet version | the kueue-offload release (`pkg/node.KubeletVersion`, set at build), the VERSION column of `kubectl get nodes` |
 | conditions | `Ready`, no pressure, network available |
 
 Binding (`pkg/offload/bind.go`): a pod with the annotation `offload.interlink.eu/workload`, no
@@ -1020,7 +1026,7 @@ What the node needs in the cluster:
 | pods | the Workload's own, made by its owner once Kueue admits and bound to the node; none runs a container in the cluster |
 | shadow | one per job that exposes ports or tunnels back; a batch job has no cluster pod but its own |
 | mutating admission rules | three: `schedulerName` and untimed node tolerations on pods, `backoffLimit: 0` on Jobs |
-| node RBAC by name | patch and delete of the node, patch of its status, granted by the deployment for `kueue-offload-<OffloadConfig>` |
+| node RBAC by name | patch and delete of the node, patch of its status, granted by the deployment for `<OffloadConfig>-vk` |
 
 The node has no Deployment, image, CRD or credential of its own: it runs in the offload
 controller's process, reads logs from the executor through the Service the executor already has,
@@ -1028,7 +1034,7 @@ and keeps the pod to member mapping in pod annotations.
 
 RBAC of the node (markers in `pkg/node/doc.go`): nodes `get`, `list`, `watch`, `create` and
 `nodes/status` `get`; patch and delete of the node and patch of its status, the only writes the
-controller and the virtual-kubelet library make to it, are the deployment's to grant by name, one `kueue-offload-<OffloadConfig>` per site, since
+controller and the virtual-kubelet library make to it, are the deployment's to grant by name, one `<OffloadConfig>-vk` per site, since
 `resourceNames` cannot name a node before it exists: the controller cannot repoint a node it does
 not run, so the serving certificate it approves for itself is of no use for another node. Leases in
 `kube-node-lease`; pods `get`, `list`, `watch`, `patch`, `delete`, `pods/status`, `pods/binding`

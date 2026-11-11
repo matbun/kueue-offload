@@ -145,8 +145,8 @@ case_single() {
 	fi
 	local node line
 	node=$(job_pod_node single)
-	if [ "$node" != kueue-offload-hpc-a ]; then
-		fail single "Job Complete, but its pod ran on node \"$node\", not kueue-offload-hpc-a"
+	if [ "$node" != hpc-a-vk ]; then
+		fail single "Job Complete, but its pod ran on node \"$node\", not hpc-a-vk"
 		return
 	fi
 	if ! until_ok 120 job_log_shows single 'hello from rank 0 of 1'; then

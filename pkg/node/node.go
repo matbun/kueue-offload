@@ -30,8 +30,9 @@ import (
 	"github.com/matbun/kueue-offload/api/v1alpha1"
 )
 
-// KubeletVersion is the kubelet version the virtual nodes report.
-const KubeletVersion = "kueue-offload"
+// KubeletVersion is the kubelet version the virtual nodes report: the kueue-offload release,
+// set at build time (-ldflags -X .../pkg/node.KubeletVersion=<release>).
+var KubeletVersion = "dev"
 
 // DefaultKubeletPort is the port of the virtual nodes' kubelet API.
 const DefaultKubeletPort = 10250

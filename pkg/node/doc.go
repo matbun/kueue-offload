@@ -6,7 +6,7 @@ package node
 
 // Patch and delete of nodes, and patch of nodes/status, the only writes the
 // controller and the virtual-kubelet library make to a node it runs, are the
-// deployment's to grant by name, one kueue-offload-<OffloadConfig> per site
+// deployment's to grant by name, one <OffloadConfig>-vk per site
 // (resourceNames cannot name a node before it exists, and create takes none):
 // the controller then cannot repoint a node it does not run, so a serving
 // certificate for another node's name is of no use.

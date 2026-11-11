@@ -120,17 +120,19 @@ type ShadowConfig struct {
 	Enabled bool   `yaml:"Enabled"`
 	Image   string `yaml:"Image"`
 	// LoginHost, User and Port are the site's login node, which the tunnel
-	// reaches with the key of KeySecret. Empty LoginHost: no shadows, and
-	// requests with exposed ports or reverse forwards are refused.
-	LoginHost           string `yaml:"LoginHost"`
-	User                string `yaml:"User"`
-	Port                int    `yaml:"Port"`
-	KeySecret           string `yaml:"KeySecret"`
-	KeySecretKey        string `yaml:"KeySecretKey"`
-	KnownHostsConfigMap string `yaml:"KnownHostsConfigMap"`
-	NodeHostKeys        string `yaml:"NodeHostKeys"`
-	ForwardTarget       string `yaml:"ForwardTarget"`
-	ForwardMode         string `yaml:"ForwardMode"`
+	// reaches with the key of KeySecret, or with a ticket when Kerberos is set.
+	// Empty LoginHost: no shadows, and requests with exposed ports or reverse
+	// forwards are refused.
+	LoginHost           string                 `yaml:"LoginHost"`
+	User                string                 `yaml:"User"`
+	Port                int                    `yaml:"Port"`
+	KeySecret           string                 `yaml:"KeySecret"`
+	KeySecretKey        string                 `yaml:"KeySecretKey"`
+	Kerberos            *shadow.KerberosConfig `yaml:"Kerberos"`
+	KnownHostsConfigMap string                 `yaml:"KnownHostsConfigMap"`
+	NodeHostKeys        string                 `yaml:"NodeHostKeys"`
+	ForwardTarget       string                 `yaml:"ForwardTarget"`
+	ForwardMode         string                 `yaml:"ForwardMode"`
 	// ExecConnectCommand relays a connection in ForwardMode exec. Empty: nc.
 	ExecConnectCommand string `yaml:"ExecConnectCommand"`
 	NodeWaitTimeout    string `yaml:"NodeWaitTimeout"`

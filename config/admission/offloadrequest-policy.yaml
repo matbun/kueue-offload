@@ -11,7 +11,8 @@
 #
 # The ServiceAccounts are the controller's (config/rbac/service_account.yaml) and the one the
 # executor template renders in each tenant namespace, named after OffloadConfig executorService
-# (default kueue-offload-executor); a site that names it otherwise edits the variable executor.
+# (default kueue-offload-executor). With several OffloadConfigs, list every executorService in
+# the variable executor.
 # To release a request whose executor is gone for good, an administrator deletes the binding,
 # removes the finalizer and applies the binding again.
 apiVersion: admissionregistration.k8s.io/v1
@@ -30,7 +31,7 @@ spec:
   - name: controller
     expression: request.userInfo.username == 'system:serviceaccount:kueue-offload:kueue-offload'
   - name: executor
-    expression: request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':kueue-offload-executor'
+    expression: "['kueue-offload-executor'].exists(n, request.userInfo.username == 'system:serviceaccount:' + request.namespace + ':' + n)"
   # oldObject is null on CREATE
   - name: finalizers
     expression: "has(object.metadata.finalizers) ? object.metadata.finalizers : []"

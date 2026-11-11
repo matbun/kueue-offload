@@ -125,6 +125,41 @@ func rayPodSets(c *metav1.OwnerReference, podSets []v1alpha1.PodSet) error {
 	return nil
 }
 
+// RequestPodSets is what an OffloadRequest for wl carries of the Workload's
+// PodSets, as the offload controller prepares them: those that run
+// (runPodSets), with the templates a Ray owner's launcher needs (rayPodSets) and
+// a RayJob's entrypoint (ownerPodSets), and the admission of each. The executor
+// checks a request against them. get reads the Workload's controller, which only
+// a RayJob needs.
+func RequestPodSets(wl *kueue.Workload, get func(*metav1.OwnerReference) (metav1.Object, error)) ([]kueue.PodSet, []kueue.PodSetAssignment, error) {
+	podSets, admitted := runPodSets(wl)
+	c := rayOwnerOf(wl)
+	if c == nil {
+		return podSets, admitted, nil
+	}
+	prepared := make([]v1alpha1.PodSet, len(podSets))
+	for i, ps := range podSets {
+		prepared[i] = v1alpha1.PodSet{Name: ps.Name, Count: ps.Count, Template: *ps.Template.DeepCopy()}
+	}
+	if err := rayPodSets(c, prepared); err != nil {
+		return nil, nil, err
+	}
+	if c.Kind == rayJobKind.gvk.Kind {
+		owner, err := get(c)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := ownerPodSets(owner, prepared); err != nil {
+			return nil, nil, err
+		}
+	}
+	out := slices.Clone(podSets)
+	for i := range out {
+		out[i].Template = prepared[i].Template
+	}
+	return out, admitted, nil
+}
+
 // rayHeadLabels are the labels KubeRay gives the head pod of cluster
 // (ray-operator common.labelPod): the template's, over KubeRay's own except
 // ray.io/cluster, ray.io/node-type and ray.io/group.

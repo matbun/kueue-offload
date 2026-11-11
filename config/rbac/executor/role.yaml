@@ -50,3 +50,15 @@ rules:
 - apiGroups: [batch]
   resources: [jobs]
   verbs: [create, get, list, watch, delete]
+# Before staging, a path on a volume is checked against the namespace's claim.
+- apiGroups: [""]
+  resources: [persistentvolumeclaims]
+  verbs: [get]
+# Staging and copy back are reported as events on the request.
+- apiGroups: [""]
+  resources: [events]
+  verbs: [create]
+# A RayJob's entrypoint is part of the PodSets a request is checked against.
+- apiGroups: [ray.io]
+  resources: [rayjobs]
+  verbs: [get]

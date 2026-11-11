@@ -397,7 +397,10 @@ again. Before it
 submits, also before a stage-in, it checks the request against the Workload it names, read from
 the API server (`get` on workloads): the request's controller owner is that Workload by name and
 UID, the Workload has the check, and its PodSets (name, template) and their admission (count,
-flavors) are the request's; otherwise it refuses the request. A Workload without its reservation
+flavors) are the request's; otherwise it refuses the request. The PodSets it compares are those
+the controller prepares (`offload.RequestPodSets`): for a Ray owner without a RayJob's submitter,
+with the launcher, a RayCluster head's ports and labels, and a RayJob's entrypoint, which the
+executor reads from the RayJob (`get` on rayjobs). A Workload without its reservation
 (`QuotaReserved` not `True`, evicted, inactive or finished) or with the check not `Pending` makes
 the request wait, since the controller deletes it. A request also waits while an earlier attempt
 of its Workload still carries the executor's finalizer: both attempts' members, shadow and stage

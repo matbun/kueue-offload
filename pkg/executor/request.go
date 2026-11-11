@@ -13,6 +13,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -26,6 +27,7 @@ import (
 	kueueworkload "sigs.k8s.io/kueue/pkg/workload"
 
 	"github.com/matbun/kueue-offload/api/v1alpha1"
+	"github.com/matbun/kueue-offload/pkg/offload"
 )
 
 // Reasons of the conditions the executor writes, besides Kueue's Succeeded and
@@ -254,27 +256,42 @@ func (d *Executor) checkWorkload(ctx context.Context, q *v1alpha1.OffloadRequest
 	if st.State != kueue.CheckStatePending {
 		return transientError("admission check %s of Workload %s is %s, not %s", st.Name, ref.Name, st.State, kueue.CheckStatePending)
 	}
-	if why := podSetsDiffer(wl, q.Spec.PodSets); why != "" {
+	// The PodSets as the offload controller prepares them from the Workload, and
+	// from a RayJob owner, read here as well
+	want, admitted, err := offload.RequestPodSets(wl, func(c *metav1.OwnerReference) (metav1.Object, error) {
+		u := &unstructured.Unstructured{}
+		u.SetAPIVersion(c.APIVersion)
+		u.SetKind(c.Kind)
+		if err := d.Reader.Get(ctx, types.NamespacedName{Namespace: wl.Namespace, Name: c.Name}, u); err != nil {
+			return nil, err
+		}
+		if u.GetUID() != c.UID {
+			return nil, fmt.Errorf("%s %s has UID %s, not %s", c.Kind, c.Name, u.GetUID(), c.UID)
+		}
+		return u, nil
+	})
+	if err != nil {
+		return transientError("preparing the PodSets of Workload %s: %v", ref.Name, err)
+	}
+	if why := podSetsDiffer(want, admitted, q.Spec.PodSets); why != "" {
 		return permanentError("OffloadRequest %s does not match Workload %s: %s", q.Name, ref.Name, why)
 	}
 	return nil
 }
 
-// podSetsDiffer says how the request's PodSets differ from the Workload's
-// PodSets and their admission, or nothing when they are equal.
-func podSetsDiffer(wl *kueue.Workload, podSets []v1alpha1.PodSet) string {
-	if len(podSets) != len(wl.Spec.PodSets) {
-		return fmt.Sprintf("%d PodSets, the Workload has %d", len(podSets), len(wl.Spec.PodSets))
+// podSetsDiffer says how the request's PodSets differ from want, the Workload's
+// as the offload controller prepares them, and their admission, or nothing when
+// they are equal.
+func podSetsDiffer(want []kueue.PodSet, admitted []kueue.PodSetAssignment, podSets []v1alpha1.PodSet) string {
+	if len(podSets) != len(want) {
+		return fmt.Sprintf("%d PodSets, the Workload has %d", len(podSets), len(want))
 	}
 	assignments := map[kueue.PodSetReference]*kueue.PodSetAssignment{}
-	if wl.Status.Admission != nil {
-		for i := range wl.Status.Admission.PodSetAssignments {
-			a := &wl.Status.Admission.PodSetAssignments[i]
-			assignments[a.Name] = a
-		}
+	for i := range admitted {
+		assignments[admitted[i].Name] = &admitted[i]
 	}
 	for i, ps := range podSets {
-		w := wl.Spec.PodSets[i]
+		w := want[i]
 		count := w.Count
 		var flavors map[v1.ResourceName]kueue.ResourceFlavorReference
 		if a := assignments[w.Name]; a != nil {

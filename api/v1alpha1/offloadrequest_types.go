@@ -97,7 +97,8 @@ type PodSet struct {
 	// that key, after a space, and never parses it.
 	// +optional
 	Annotations map[string]string `json:"annotations,omitempty"`
-	// template is the PodSet's pod template as the Workload holds it.
+	// template is the PodSet's pod template as the Workload holds it, prepared
+	// for a Ray owner's launcher (see offload.RequestPodSets).
 	Template corev1.PodTemplateSpec `json:"template"`
 	// secretRefs and configMapRefs are every Secret and ConfigMap the template
 	// names through volumes (secret, configMap, projected sources), envFrom and

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/utils/ptr"
@@ -439,5 +440,42 @@ func TestRayClusterRunEnds(t *testing.T) {
 	}
 	if wl := e.workload(); !ptr.Deref(wl.Spec.Active, true) {
 		t.Errorf("a rejected RayCluster's Workload deactivated by the offload controller")
+	}
+}
+
+// TestRequestPodSets: what the executor checks a request against is what the
+// controller sends, for every owner kind: names, counts and templates.
+func TestRequestPodSets(t *testing.T) {
+	rayJob := rayJobObject(map[string]any{"entrypoint": "python train.py"})
+	for _, wl := range []*kueue.Workload{workload(), rayWorkload(rayClusterKind, 2, false), rayWorkload(rayJobKind, 1, true)} {
+		// the owner the controller reads: the RayJob, or the Workload's other owner
+		var owner metav1.Object = ownerJob()
+		if c := metav1.GetControllerOf(wl); c != nil && c.Kind == rayJobKind.gvk.Kind {
+			owner = rayJob
+		}
+		sent, err := buildPodSets(wl, resolveSite(offloadConfig()), "proj42", nil)
+		if err == nil {
+			err = ownerPodSets(owner, sent)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, admitted, err := RequestPodSets(wl, func(c *metav1.OwnerReference) (metav1.Object, error) {
+			if c.Kind != rayJobKind.gvk.Kind {
+				t.Fatalf("%s read", c.Kind)
+			}
+			return rayJob, nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != len(sent) || len(admitted) != len(sent) {
+			t.Fatalf("%d PodSets and %d assignments, the controller sends %d", len(got), len(admitted), len(sent))
+		}
+		for i := range sent {
+			if got[i].Name != sent[i].Name || admitted[i].Name != sent[i].Name || !equality.Semantic.DeepEqual(got[i].Template, sent[i].Template) {
+				t.Fatalf("PodSet %d: %s %s, the controller sends %s with another template", i, got[i].Name, admitted[i].Name, sent[i].Name)
+			}
+		}
 	}
 }

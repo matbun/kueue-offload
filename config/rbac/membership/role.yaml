@@ -13,6 +13,7 @@ rules:
   - services
   verbs:
   - create
+  - deletecollection
   - patch
 - apiGroups:
   - ""
@@ -39,11 +40,18 @@ rules:
   verbs:
   - list
 - apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+- apiGroups:
   - apps
   resources:
   - deployments
   verbs:
   - create
+  - deletecollection
   - get
   - list
   - patch
@@ -55,6 +63,8 @@ rules:
   verbs:
   - create
   - delete
+  - deletecollection
+  - get
   - patch
 - apiGroups:
   - events.k8s.io
@@ -73,6 +83,13 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - interlink.eu
+  resources:
+  - offloadrequests
+  verbs:
+  - delete
+  - list
 - apiGroups:
   - kueue.x-k8s.io
   resources:
@@ -96,11 +113,18 @@ rules:
   - patch
   - watch
 - apiGroups:
+  - kueue.x-k8s.io
+  resources:
+  - workloads
+  verbs:
+  - get
+- apiGroups:
   - networking.k8s.io
   resources:
   - networkpolicies
   verbs:
   - create
+  - deletecollection
   - patch
 - apiGroups:
   - rbac.authorization.k8s.io
@@ -116,6 +140,7 @@ rules:
   - rolebindings
   verbs:
   - create
+  - deletecollection
   - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1

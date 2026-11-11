@@ -4,13 +4,11 @@ import (
 	"bytes"
 	_ "embed"
 	"fmt"
-	"maps"
 	"strings"
 	"text/template"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/kubernetes/scheme"
 )
@@ -60,11 +58,6 @@ type templateData struct {
 	SSHNodeWaitSeconds int
 	Reverse            *ReverseTunnel
 }
-
-const (
-	jobLogsContainer = "job-logs"
-	jobLogsCommand   = "/executor"
-)
 
 func (cfg Config) sshTunnel() sshTunnel {
 	return sshTunnel{
@@ -117,83 +110,45 @@ func executeTemplate(data templateData) (*appsv1.Deployment, *corev1.Service, er
 }
 
 // render builds the shadow's Deployment and, when it forwards ports, its Service.
-// A logs-only shadow forwards nothing: no ssh-forward, no ssh-reverse, no init
-// containers, no Service, only job-logs.
-func render(cfg Config, spec Spec, name string, ports []portMapping, logsOnly bool) (*appsv1.Deployment, *corev1.Service, error) {
+func render(cfg Config, spec Spec, name string, ports []portMapping) (*appsv1.Deployment, *corev1.Service, error) {
 	data := templateData{
 		Name:               name,
 		Namespace:          spec.Namespace,
+		ExposedPorts:       ports,
+		ReadinessPort:      firstTCPPort(ports),
 		NodeConfigMap:      nodeConfigMapName(name),
 		NodeNameKey:        nodeNameKey,
 		SocketDirKey:       socketDirKey,
+		NeedsSocketDir:     hasSocketPorts(ports),
 		SSH:                cfg.sshTunnel(),
 		SSHNodeWaitSeconds: cfg.nodeWaitSeconds(),
 	}
-	if !logsOnly {
-		data.ExposedPorts = ports
-		data.ReadinessPort = firstTCPPort(ports)
-		data.NeedsSocketDir = hasSocketPorts(ports)
-		if spec.Reverse != nil {
-			data.Reverse = spec.Reverse
-			data.NeedsSocketDir = true
-		}
+	if spec.Reverse != nil {
+		data.Reverse = spec.Reverse
+		data.NeedsSocketDir = true
 	}
 	deployment, service, err := executeTemplate(data)
 	if err != nil {
 		return nil, nil, err
 	}
-	if logsOnly {
-		service = nil
-	}
+	// One pod at a time: a rolling update would run two ssh-reverse binding the
+	// same sockets on the node.
+	deployment.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
 
 	labels := ownerLabels(spec.WorkloadUID)
 	setLabels(&deployment.ObjectMeta, labels)
-	if !logsOnly && len(spec.Labels) > 0 {
-		// The template's own labels win: the Deployment selects its pods by them.
-		inherited := maps.Clone(spec.Labels)
-		maps.Copy(inherited, deployment.Spec.Template.Labels)
-		deployment.Spec.Template.Labels = inherited
-	}
 	setLabels(&deployment.Spec.Template.ObjectMeta, labels)
 	if service != nil {
 		setLabels(&service.ObjectMeta, labels)
 	}
 
 	pod := &deployment.Spec.Template.Spec
-	if logsOnly {
-		pod.InitContainers = nil
-	}
-	pod.Containers = append(pod.Containers, jobLogs(cfg, spec.WorkloadUID))
 	pod.Volumes = mountedVolumes(pod)
 	return deployment, service, nil
 }
 
-// jobLogs is the container that streams the job's output from the executor.
-func jobLogs(cfg Config, workloadUID string) corev1.Container {
-	noEscalation := false
-	return corev1.Container{
-		Name:    jobLogsContainer,
-		Image:   cfg.ExecutorImage,
-		Command: []string{jobLogsCommand, "logs", "--executor", cfg.ExecutorURL, "--workload", workloadUID, "--follow"},
-		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("10m"),
-				corev1.ResourceMemory: resource.MustParse("32Mi"),
-			},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse("100m"),
-				corev1.ResourceMemory: resource.MustParse("64Mi"),
-			},
-		},
-		SecurityContext: &corev1.SecurityContext{
-			AllowPrivilegeEscalation: &noEscalation,
-			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-		},
-	}
-}
-
-// mountedVolumes drops the volumes no container mounts, so a logs-only shadow does
-// not wait for the tunnel key or the known hosts it never reads.
+// mountedVolumes drops the volumes no container mounts, so the shadow does not
+// wait for a Secret or ConfigMap it never reads.
 func mountedVolumes(pod *corev1.PodSpec) []corev1.Volume {
 	mounted := map[string]bool{}
 	for _, c := range append(append([]corev1.Container{}, pod.InitContainers...), pod.Containers...) {

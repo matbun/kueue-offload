@@ -14,7 +14,6 @@ import (
 	"github.com/matbun/kueue-offload/api/v1alpha1"
 	"github.com/matbun/kueue-offload/pkg/membership"
 	"github.com/matbun/kueue-offload/pkg/offload"
-	"github.com/matbun/kueue-offload/pkg/shadow"
 )
 
 // referenceFlavorsBefore is the reference OffloadConfig's flavors as they were
@@ -109,7 +108,6 @@ func TestMultiLineAnnotationsJoinByNewline(t *testing.T) {
 
 // The sample executor template renders a configuration the executor accepts.
 func TestSampleExecutorConfigLoads(t *testing.T) {
-	t.Setenv(shadow.ExecutorImageEnv, "")
 	raw, err := os.ReadFile(filepath.Join("..", "..", "config", "samples", "membership", "executor-template.yaml"))
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +116,7 @@ func TestSampleExecutorConfigLoads(t *testing.T) {
 	if err := yaml.Unmarshal(raw, cm); err != nil {
 		t.Fatal(err)
 	}
-	tmpl, err := membership.ParseTemplate(cm.Data["template.yaml"])
+	tmpl, err := membership.ParseTemplate(cm.Data, "template.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +147,6 @@ func TestSampleExecutorConfigLoads(t *testing.T) {
 	old := serviceAccountNamespaceFile
 	serviceAccountNamespaceFile = nsFile
 	t.Cleanup(func() { serviceAccountNamespaceFile = old })
-	t.Setenv(shadow.ExecutorImageEnv, "registry.example.org/kueue-offload:test")
 	c, err := LoadConfig(path)
 	if err != nil {
 		t.Fatalf("the sample's executor.yaml is refused: %v\n%s", err, config)

@@ -1,8 +1,9 @@
 // Package shadow renders and maintains the shadow of an offloaded job: a Deployment
 // in the job's namespace that tunnels the job's exposed ports from the cluster to
-// the compute node over SSH and streams the job's logs, plus the Service in front
-// of the ports and the ConfigMap telling the tunnel which node to reach. It is the
-// virtual kubelet's SSH shadow, moved into the executor with its template intact.
+// the compute node over SSH, and the job's reverse forwards back, plus the Service
+// in front of the ports and the ConfigMap telling the tunnel which node to reach.
+// It is the virtual kubelet's SSH shadow, moved into the executor with its
+// template intact.
 package shadow
 
 import (
@@ -14,7 +15,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"maps"
-	"strings"
 	"sync"
 
 	"github.com/containerd/containerd/log"
@@ -39,8 +39,9 @@ const (
 	// specHashAnnotation records what a Deployment or Service was rendered from, so
 	// that applying the same Spec again writes nothing and restarts nothing.
 	specHashAnnotation = "interlink.eu/shadow-spec-hash"
-	// nodeAnnotation is set on the shadow's pods when the compute node changes.
-	nodeAnnotation = "interlink.eu/shadow-node"
+	// nodeAnnotation is set on the shadow's pods when the compute node changes, under
+	// kueue-offload's prefix: site policies may freeze interlink.eu/ pod annotations.
+	nodeAnnotation = "offload.interlink.eu/shadow-node"
 )
 
 // ErrNameTaken is returned by Ensure when an object with a shadow's name exists
@@ -56,18 +57,13 @@ type Spec struct {
 	Template     corev1.PodTemplateSpec // rank 0's template: ports, annotations, labels
 	NodeName     string                 // empty until running
 	SocketDir    string
-	Terminal     bool // job ended: logs-only shadow
 	// Reverse is the job's tunnel back into the cluster, nil unless it asked for
 	// one (ParseReverseTunnel).
 	Reverse *ReverseTunnel
-	// Labels are the owner pod's, for a workload of one plain pod. A shadow that
-	// tunnels carries those a Service selects the pod by (serviceLabels), so that
-	// the Service selects the shadow too.
-	Labels map[string]string
 }
 
 // Ref names the objects of a shadow, and the IP and readiness of its pod. Service
-// is empty when it forwards no port.
+// is empty when it forwards no port, and Ref is empty when nothing tunnels.
 type Ref struct {
 	Deployment    string `json:"deployment,omitempty"`
 	Service       string `json:"service,omitempty"`
@@ -79,8 +75,9 @@ type Ref struct {
 // Manager creates, updates and deletes shadows.
 type Manager interface {
 	// Ensure creates or updates the shadow for spec: Deployment, Service (only with exposed
-	// ports), node ConfigMap with compute-node and socket-dir. Idempotent; called on every poll
-	// once the job runs.
+	// ports) and node ConfigMap with compute-node and socket-dir. A spec that forwards no
+	// port and has no reverse tunnel gets none. Idempotent; called on every poll while the
+	// job runs.
 	Ensure(ctx context.Context, spec Spec) (Ref, error)
 	// Delete removes every object labelled for this workload. Idempotent.
 	Delete(ctx context.Context, workloadUID string) error
@@ -162,29 +159,18 @@ func (m *manager) Ensure(ctx context.Context, spec Spec) (Ref, error) {
 		return Ref{}, fmt.Errorf("shadow of %s/%s: a reverse tunnel, but Shadow.Reverse.Enabled is false", spec.Namespace, spec.WorkloadName)
 	}
 	ports := exposedPorts(spec.Template)
-	forwards := hasTCPPort(ports)
-	tunnels := forwards || spec.Reverse != nil
-	if !tunnels && !m.cfg.alwaysShadow() {
+	if !hasTCPPort(ports) && spec.Reverse == nil {
 		return Ref{}, nil
 	}
-	logsOnly := spec.Terminal || !tunnels
-	if !logsOnly && m.cfg.LoginHost == "" {
-		return Ref{}, fmt.Errorf("shadow of %s/%s: Shadow.LoginHost is empty, so the shadow streams logs only and cannot tunnel", spec.Namespace, spec.WorkloadName)
+	if m.cfg.LoginHost == "" {
+		return Ref{}, fmt.Errorf("shadow of %s/%s: Shadow.LoginHost is empty, so the shadow cannot tunnel", spec.Namespace, spec.WorkloadName)
 	}
-	if !logsOnly {
-		if err := markSocketPorts(spec.Template.Annotations[annSocketPorts], m.cfg.ForwardTarget, ports); err != nil {
-			return Ref{}, fmt.Errorf("shadow of %s/%s: %w", spec.Namespace, spec.WorkloadName, err)
-		}
+	if err := markSocketPorts(spec.Template.Annotations[annSocketPorts], m.cfg.ForwardTarget, ports); err != nil {
+		return Ref{}, fmt.Errorf("shadow of %s/%s: %w", spec.Namespace, spec.WorkloadName, err)
 	}
 
-	var err error
-	if !logsOnly {
-		if spec.Labels, err = m.serviceLabels(ctx, spec.Labels); err != nil {
-			return Ref{}, err
-		}
-	}
 	name := resourceName(spec.WorkloadName, spec.Namespace)
-	deployment, service, err := render(m.cfg, spec, name, ports, logsOnly)
+	deployment, service, err := render(m.cfg, spec, name, ports)
 	if err != nil {
 		return Ref{}, err
 	}
@@ -206,64 +192,39 @@ func (m *manager) Ensure(ctx context.Context, spec Spec) (Ref, error) {
 	} else if err := m.deleteService(ctx, spec.WorkloadUID, name); err != nil {
 		return Ref{}, err
 	}
-	if ref.PodIP, ref.Ready, err = m.podState(ctx, spec.WorkloadUID, name); err != nil {
+	pod, err := m.shadowPod(ctx, spec.WorkloadUID, name)
+	if err != nil {
 		return Ref{}, err
+	}
+	if pod != nil {
+		ref.PodIP, ref.Ready = pod.Status.PodIP, podReady(pod)
 	}
 	return ref, nil
 }
 
-// kueueLabelPrefix marks Kueue's labels. Kueue gates a pod that carries its queue
-// label, so the shadow carries none of them.
-const kueueLabelPrefix = "kueue.x-k8s.io/"
-
-// serviceLabels are the labels by which the namespace's Services select a pod
-// labelled pod, less Kueue's. The shadow carries no other label of the pod: a
-// PodDefault or a policy that selects the pod by one would change the shadow too.
-func (m *manager) serviceLabels(ctx context.Context, pod map[string]string) (map[string]string, error) {
-	if len(pod) == 0 {
-		return nil, nil
-	}
-	list, err := m.client.CoreV1().Services(m.namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list the services of %s: %w", m.namespace, err)
-	}
-	out := map[string]string{}
-	for _, svc := range list.Items {
-		selector := svc.Spec.Selector
-		if len(selector) == 0 || !labels.SelectorFromSet(selector).Matches(labels.Set(pod)) {
-			continue
-		}
-		for k, v := range selector {
-			if !strings.HasPrefix(k, kueueLabelPrefix) {
-				out[k] = v
-			}
-		}
-	}
-	return out, nil
-}
-
-// podState is the IP and readiness of the shadow's pod: a ready one if there is
-// one, else one with an IP. Pods being deleted do not count.
-func (m *manager) podState(ctx context.Context, workloadUID, name string) (string, bool, error) {
+// shadowPod is the shadow's pod: a ready one if there is one, else one with an
+// IP, else nil. Pods being deleted do not count.
+func (m *manager) shadowPod(ctx context.Context, workloadUID, name string) (*corev1.Pod, error) {
 	list, err := m.client.CoreV1().Pods(m.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: labels.Set{componentLabel: name, LabelShadowOf: workloadUID}.String(),
 	})
 	if err != nil {
-		return "", false, fmt.Errorf("failed to list the pods of shadow %s/%s: %w", m.namespace, name, err)
+		return nil, fmt.Errorf("failed to list the pods of shadow %s/%s: %w", m.namespace, name, err)
 	}
-	ip := ""
-	for _, pod := range list.Items {
+	var found *corev1.Pod
+	for i := range list.Items {
+		pod := &list.Items[i]
 		if pod.DeletionTimestamp != nil || pod.Status.PodIP == "" {
 			continue
 		}
-		if podReady(&pod) {
-			return pod.Status.PodIP, true, nil
+		if podReady(pod) {
+			return pod, nil
 		}
-		if ip == "" {
-			ip = pod.Status.PodIP
+		if found == nil {
+			found = pod
 		}
 	}
-	return ip, false, nil
+	return found, nil
 }
 
 func podReady(pod *corev1.Pod) bool {

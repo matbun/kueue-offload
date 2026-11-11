@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -131,12 +133,30 @@ func startAPIServer(t *testing.T, pluginURL string) string {
 	}
 }
 
-// hasCreatePodSets reports whether the API server at api has /createPodSets,
+// syncBuffer is a bytes.Buffer safe to read while the command writes it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// hasCreatePodGroup reports whether the API server at api has /createPodGroup,
 // which only the interLink fork's branch feat/create-podsets has: one without
 // answers 404 there.
-func hasCreatePodSets(t *testing.T, api string) bool {
+func hasCreatePodGroup(t *testing.T, api string) bool {
 	t.Helper()
-	resp, err := http.Post(api+"/createPodSets", "application/json", http.NoBody)
+	resp, err := http.Post(api+"/createPodGroup", "application/json", http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,18 +165,18 @@ func hasCreatePodSets(t *testing.T, api string) bool {
 }
 
 // apiClient is the executor's HTTP client for the API server at api. When the
-// API server has no /createPodSets, the client sends that call straight to the
+// API server has no /createPodGroup, the client sends that call straight to the
 // plugin at pluginURL, in the API server's place.
 func apiClient(t *testing.T, api, pluginURL string) *http.Client {
 	t.Helper()
-	if hasCreatePodSets(t, api) {
+	if hasCreatePodGroup(t, api) {
 		return &http.Client{}
 	}
 	plugin, err := url.Parse(pluginURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &http.Client{Transport: routeTo{path: "/createPodSets", host: plugin.Host}}
+	return &http.Client{Transport: routeTo{path: "/createPodGroup", host: plugin.Host}}
 }
 
 // routeTo sends the requests for path to host instead.

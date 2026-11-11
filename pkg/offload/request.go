@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -139,16 +140,32 @@ func (r *WorkloadReconciler) deleteLive(ctx context.Context, reqs []v1alpha1.Off
 	return errors.Join(errs...)
 }
 
+// cancelUnended deletes the live requests of a finished Workload whose job
+// neither finished nor was evicted; the executor's finalizer cancels the job.
+func (r *WorkloadReconciler) cancelUnended(ctx context.Context, reqs []v1alpha1.OffloadRequest) error {
+	var errs []error
+	for i := range reqs {
+		q := &reqs[i]
+		conds := q.Status.Conditions
+		ended := meta.IsStatusConditionTrue(conds, v1alpha1.OffloadRequestFinished) || meta.IsStatusConditionTrue(conds, v1alpha1.OffloadRequestEvicted)
+		if q.DeletionTimestamp.IsZero() && !ended {
+			errs = append(errs, r.deleteRequest(ctx, q))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (r *WorkloadReconciler) deleteRequest(ctx context.Context, q *v1alpha1.OffloadRequest) error {
 	return client.IgnoreNotFound(r.Client.Delete(ctx, q))
 }
 
 // releaseAttempts drops the attempt finalizer from the requests no next
 // attempt will count from: every request of a Workload that is gone, replaced,
-// finished or deactivated, and the deleted requests a newer attempt of their
-// check superseded. The newest deleted request of a live Workload keeps it.
+// finished or deactivated other than by a deferral, and the deleted requests a
+// newer attempt of their check superseded. The newest deleted request of a
+// live Workload keeps it.
 func (r *WorkloadReconciler) releaseAttempts(ctx context.Context, wl *kueue.Workload, reqs []v1alpha1.OffloadRequest) error {
-	done := wl == nil || kueueworkload.IsFinished(wl) || !kueueworkload.IsActive(wl)
+	done := wl == nil || kueueworkload.IsFinished(wl) || (!kueueworkload.IsActive(wl) && wl.Annotations[DeferredUntilAnnotation] == "")
 	newest := map[kueue.AdmissionCheckReference]int32{}
 	if !done {
 		for _, q := range ownedBy(wl, reqs) {

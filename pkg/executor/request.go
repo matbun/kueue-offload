@@ -26,6 +26,7 @@ import (
 	kueueworkload "sigs.k8s.io/kueue/pkg/workload"
 
 	"github.com/matbun/kueue-offload/api/v1alpha1"
+	"github.com/matbun/kueue-offload/pkg/offload"
 )
 
 // Reasons of the conditions the executor writes, besides Kueue's Succeeded and
@@ -84,7 +85,7 @@ func (d *Executor) Reconcile(ctx context.Context, r ctrl.Request) (ctrl.Result, 
 		}
 	}
 	if !q.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, d.finalize(ctx, q)
+		return d.finalize(ctx, q)
 	}
 	if !controllerutil.ContainsFinalizer(q, v1alpha1.ExecutorFinalizer) {
 		orig := q.DeepCopy()
@@ -110,6 +111,9 @@ func (d *Executor) Reconcile(ctx context.Context, r ctrl.Request) (ctrl.Result, 
 func (d *Executor) take(ctx context.Context, q *v1alpha1.OffloadRequest) (ctrl.Result, error) {
 	orig := q.DeepCopy()
 	aerr := d.validateSubmit(jobRequestOf(q))
+	if aerr == nil {
+		aerr = d.checkStageClaims(ctx, jobRequestOf(q))
+	}
 	if aerr == nil {
 		aerr = d.checkWorkload(ctx, q)
 	}
@@ -174,38 +178,58 @@ func (d *Executor) poll(ctx context.Context, q *v1alpha1.OffloadRequest) (ctrl.R
 	return ctrl.Result{RequeueAfter: d.Config.Executor.pollInterval}, nil
 }
 
-// endShadow renders the shadow of an ended job for its end, unless that was
-// done since the executor started.
+// endShadow deletes the shadow of an ended job, unless that was done since the
+// executor started.
 func (d *Executor) endShadow(ctx context.Context, q *v1alpha1.OffloadRequest) {
 	if q.Status.JobID == "" || d.shadowEnded(q.UID) {
 		return
 	}
 	orig := q.DeepCopy()
-	d.syncShadow(ctx, q, jobRequestOf(q), jobState{State: jobCompleted, NodeName: q.Status.NodeName, SocketDir: q.Status.SocketDir})
+	d.syncShadow(ctx, q, jobRequestOf(q), jobState{State: jobCompleted})
 	if err := d.writeStatus(ctx, orig, q, false); err != nil {
 		log.L.Warningf("executor: request %s/%s: recording the shadow: %v", q.Namespace, q.Name, err)
 	}
 }
 
-// finalize cancels the job of a deleted request and removes the executor's
-// finalizer.
-func (d *Executor) finalize(ctx context.Context, q *v1alpha1.OffloadRequest) error {
+// finalize cancels the job of a deleted request, copies its outputs back
+// (stageOutDeleted), and then removes the executor's finalizer.
+func (d *Executor) finalize(ctx context.Context, q *v1alpha1.OffloadRequest) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(q, v1alpha1.ExecutorFinalizer) {
-		return nil
+		return ctrl.Result{}, nil
 	}
-	if err := d.cancel(ctx, q); err != nil {
-		return err
+	if !d.wasCancelled(q.UID) {
+		if err := d.cancel(ctx, q); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
+	if wait := d.stageOutDeleted(ctx, q); wait > 0 {
+		return ctrl.Result{RequeueAfter: wait}, nil
 	}
 	orig := q.DeepCopy()
 	controllerutil.RemoveFinalizer(q, v1alpha1.ExecutorFinalizer)
-	return client.IgnoreNotFound(d.Client.Patch(ctx, q, client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})))
+	if err := d.Client.Patch(ctx, q, client.MergeFromWithOptions(orig, client.MergeFromWithOptimisticLock{})); client.IgnoreNotFound(err) != nil {
+		return ctrl.Result{}, err
+	}
+	d.mu.Lock()
+	delete(d.cancelled, q.UID)
+	d.mu.Unlock()
+	return ctrl.Result{}, nil
+}
+
+// wasCancelled reports whether this process cancelled the job of the deleted
+// request with that UID.
+func (d *Executor) wasCancelled(uid types.UID) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.cancelled[uid]
 }
 
 // checkWorkload refuses a request the offload controller did not make for the
 // Workload it names, as read from the API server: its controller owner is that
 // Workload by name and UID, and the Workload's PodSets and admission are the
-// request's. A Workload that no longer holds its quota with the request's check
-// Pending makes the request wait: the offload controller deletes it.
+// request's. A Workload that no longer holds its quota, or whose check is
+// neither Pending nor Ready (an attempt made in place keeps it Ready), makes the
+// request wait: the offload controller deletes it.
 func (d *Executor) checkWorkload(ctx context.Context, q *v1alpha1.OffloadRequest) *refusal {
 	ref := q.Spec.Workload
 	owner := metav1.GetControllerOf(q)
@@ -229,30 +253,30 @@ func (d *Executor) checkWorkload(ctx context.Context, q *v1alpha1.OffloadRequest
 	if st == nil {
 		return permanentError("Workload %s has no admission check %s", ref.Name, q.Spec.AdmissionCheck)
 	}
-	if st.State != kueue.CheckStatePending {
-		return transientError("admission check %s of Workload %s is %s, not %s", st.Name, ref.Name, st.State, kueue.CheckStatePending)
+	if st.State != kueue.CheckStatePending && st.State != kueue.CheckStateReady {
+		return transientError("admission check %s of Workload %s is %s, not %s or %s", st.Name, ref.Name, st.State, kueue.CheckStatePending, kueue.CheckStateReady)
 	}
-	if why := podSetsDiffer(wl, q.Spec.PodSets); why != "" {
+	// The PodSets as the offload controller prepares them from the Workload
+	want, admitted := offload.RequestPodSets(wl)
+	if why := podSetsDiffer(want, admitted, q.Spec.PodSets); why != "" {
 		return permanentError("OffloadRequest %s does not match Workload %s: %s", q.Name, ref.Name, why)
 	}
 	return nil
 }
 
-// podSetsDiffer says how the request's PodSets differ from the Workload's
-// PodSets and their admission, or nothing when they are equal.
-func podSetsDiffer(wl *kueue.Workload, podSets []v1alpha1.PodSet) string {
-	if len(podSets) != len(wl.Spec.PodSets) {
-		return fmt.Sprintf("%d PodSets, the Workload has %d", len(podSets), len(wl.Spec.PodSets))
+// podSetsDiffer says how the request's PodSets differ from want, the Workload's
+// as the offload controller prepares them, and their admission, or nothing when
+// they are equal.
+func podSetsDiffer(want []kueue.PodSet, admitted []kueue.PodSetAssignment, podSets []v1alpha1.PodSet) string {
+	if len(podSets) != len(want) {
+		return fmt.Sprintf("%d PodSets, the Workload has %d", len(podSets), len(want))
 	}
 	assignments := map[kueue.PodSetReference]*kueue.PodSetAssignment{}
-	if wl.Status.Admission != nil {
-		for i := range wl.Status.Admission.PodSetAssignments {
-			a := &wl.Status.Admission.PodSetAssignments[i]
-			assignments[a.Name] = a
-		}
+	for i := range admitted {
+		assignments[admitted[i].Name] = &admitted[i]
 	}
 	for i, ps := range podSets {
-		w := wl.Spec.PodSets[i]
+		w := want[i]
 		count := w.Count
 		var flavors map[v1.ResourceName]kueue.ResourceFlavorReference
 		if a := assignments[w.Name]; a != nil {
@@ -276,8 +300,12 @@ func podSetsDiffer(wl *kueue.Workload, podSets []v1alpha1.PodSet) string {
 }
 
 // checkEarlierAttempts holds a request while another one of its Workload still
-// has the executor's finalizer: that attempt's job, shadow and stage Jobs carry
-// the same Workload UID, and go only once its cancel ended.
+// has the executor's finalizer: that attempt's job, shadow and stage-in Job carry
+// the same Workload UID, and go only once its cancel ended. An attempt that then
+// copies its outputs back holds the next one until the copy ended, as a deleted
+// pod's stage-out holds the pod that replaces it under the virtual kubelet: both
+// attempts stage to the same paths of the site, and the next one's stage-in or
+// job would overwrite outputs not copied back yet. StageOutTimeout bounds that.
 func (d *Executor) checkEarlierAttempts(ctx context.Context, q *v1alpha1.OffloadRequest) *refusal {
 	list := &v1alpha1.OffloadRequestList{}
 	if err := d.Client.List(ctx, list, client.InNamespace(q.Namespace)); err != nil {
@@ -287,6 +315,9 @@ func (d *Executor) checkEarlierAttempts(ctx context.Context, q *v1alpha1.Offload
 		o := &list.Items[i]
 		if o.UID != q.UID && o.Spec.Workload.UID == q.Spec.Workload.UID && !o.DeletionTimestamp.IsZero() &&
 			controllerutil.ContainsFinalizer(o, v1alpha1.ExecutorFinalizer) {
+			if d.wasCancelled(o.UID) && d.copiesBackOnDelete(o) {
+				return transientError("waiting for OffloadRequest %s to copy back the outputs of its job (Job %s)", o.Name, stageJobName(jobRequestOf(o), stageOut))
+			}
 			return transientError("waiting for the job of OffloadRequest %s to be cancelled", o.Name)
 		}
 	}

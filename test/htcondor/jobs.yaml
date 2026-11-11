@@ -1,8 +1,11 @@
-# The Jobs of the e2e cases. None of them ever runs a pod in the cluster: Kueue
-# keeps them suspended and kueue-offload runs them in the HTCondor pool.
+# The Jobs of the e2e cases. None of them runs a container in the cluster:
+# kueue-offload runs them in the HTCondor pool, Kueue admits each once its job
+# started there, and its pods are bound to the virtual node kueue-offload-hpc-a,
+# which shows the job's state and serves its logs. backoffLimit 0: an attempt is
+# one allocation, and retries go through Kueue.
 #
 # single: one pod. Its maximum execution time reaches the submit file as the wall
-# time; its output is read on the shadow.
+# time; its output is read with kubectl logs.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -53,6 +56,7 @@ metadata:
   labels:
     kueue.x-k8s.io/queue-name: hpc-a-proj42
 spec:
+  backoffLimit: 0
   parallelism: 2
   completions: 2
   completionMode: Indexed
@@ -74,6 +78,7 @@ metadata:
   labels:
     kueue.x-k8s.io/queue-name: hpc-a-proj42
 spec:
+  backoffLimit: 0
   template:
     spec:
       restartPolicy: Never

@@ -22,13 +22,14 @@ type OffloadConfigSpec struct {
 	Workers []string `json:"workers"`
 
 	// executorService is the name of the executor Service in every tenant
-	// namespace, which the shadows read job logs from. The membership controller
-	// passes it to the executor template.
+	// namespace, which the offload controller's virtual node reads job logs
+	// from. The membership controller passes it to the executor template.
 	// +kubebuilder:default=kueue-offload-executor
 	// +optional
 	ExecutorService string `json:"executorService,omitempty"`
 
-	// executorPort is the port of the executor Service.
+	// executorPort is the port of the executor Service, on which the offload
+	// controller's virtual node reads job logs.
 	// +kubebuilder:default=8000
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
@@ -58,13 +59,44 @@ type OffloadConfigSpec struct {
 	// +optional
 	MaxQueueTime *metav1.Duration `json:"maxQueueTime,omitempty"`
 
+	// maxStartDelay is how far ahead the site may expect to start a job when
+	// asked. Before it submits an attempt, the executor of a site that answers
+	// estimates records in the OffloadRequest's status.estimate when the job
+	// would start. A start further away than this from when it asked, or no start
+	// time at all (the site takes no further job of the user now), deactivates
+	// the Workload (spec.active false) before the job is submitted, for
+	// deferInterval: Kueue evicts it at once and releases the quota, so that a
+	// job the site would keep waiting does not hold the project's quota
+	// meanwhile, and the controller reactivates it when deferInterval is over,
+	// which queues it again and asks the site again. The check stays Pending with the estimate and the time
+	// (event Deferred). These deferrals never reject the Workload: the
+	// OffloadRequest's deferrals counts them apart from the retryStrategy's
+	// retries. Unset: no limit, and the estimate only shows in the check message.
+	// +optional
+	MaxStartDelay *metav1.Duration `json:"maxStartDelay,omitempty"`
+
+	// nodeLabels are more labels of the site's virtual node, for the cluster's
+	// own conventions, such as the label its DaemonSets keep off virtual nodes by.
+	// They never replace a label the controller sets on the node.
+	// +optional
+	NodeLabels map[string]string `json:"nodeLabels,omitempty"`
+
+	// deferInterval is how long a Workload that maxStartDelay deferred stays
+	// deactivated before the site is asked again, the same after every deferral:
+	// a deferral waits for the site and is not a failure, so it does not back off
+	// as retryStrategy does, and a job queued behind another starts soon after
+	// the site frees a slot. Default 30s.
+	// +optional
+	DeferInterval *metav1.Duration `json:"deferInterval,omitempty"`
+
 	// retryStrategy bounds the new attempts after a job is lost: cancelled on
 	// the site, behind an executor without a heartbeat for executorLostTimeout,
 	// or queued for longer than maxQueueTime. Each loss sets the check to Retry
 	// with requeueAfterSeconds from Kueue's backoff, backoffBaseSeconds doubled
 	// per retry up to backoffMaxSeconds, and Kueue requeues the Workload after
-	// that delay. The retries are counted by the OffloadRequest's attempt; once
-	// backoffLimitCount retries were spent the check is Rejected, and 0 rejects
+	// that delay. The retries are counted by the OffloadRequest's attempt less
+	// its deferrals; once backoffLimitCount retries were spent the check is
+	// Rejected, and 0 rejects
 	// at the first loss. A job that ran and failed is not retried, and a submit
 	// the executor refuses for now (a submit limit, an unreachable site) keeps
 	// the check Pending with the quota. The type and its defaults are
@@ -76,10 +108,11 @@ type OffloadConfigSpec struct {
 	// flavors maps a ResourceFlavor name to the batch queue its quota stands for,
 	// as annotations the backend's plugin reads (for Slurm, the sbatch flags in
 	// slurm-job.vk.io/flags). A project with several queues on one machine (say a
-	// debug, a production and an interactive QOS) is one ClusterQueue with one
-	// flavor each, and the flavor Kueue assigns decides where the job is submitted.
-	// A PodSet none of whose admitted flavors is listed is rejected: its job would
-	// carry no account.
+	// debug, a production and an interactive QOS) has one flavor each, and the
+	// flavor Kueue assigns decides where the job is submitted: on the project's
+	// ClusterQueue of every flavor, the first with room; on the ClusterQueue of
+	// one of membership.queues, only that queue's flavors. A PodSet none of whose
+	// admitted flavors is listed is rejected: its job would carry no account.
 	// +optional
 	Flavors map[string]FlavorTarget `json:"flavors,omitempty"`
 
@@ -92,13 +125,26 @@ type OffloadConfigSpec struct {
 type FlavorTarget struct {
 	// annotations are added to every member pod of a PodSet admitted on this
 	// flavor. Each value is a Go text/template executed with .Account (the
-	// ClusterQueue's account label), .MaxExecSeconds (the Workload's
-	// maximumExecutionTimeSeconds, 0 when unset) and .MaxExecMinutes (the same in
-	// minutes, rounded up). The executor appends each value to the template's own
-	// value for that key, after a space, and never parses it, for example
+	// ClusterQueue's account label), .MaxExecSeconds (the job's wall time: the
+	// Workload's maximumExecutionTimeSeconds, else the annotation
+	// interlink.eu/time-limit, 0 when neither is set) and .MaxExecMinutes (the
+	// same in minutes, rounded up, and one more when it is Kueue's and the
+	// flavor's maxExecutionTimeSeconds leaves room, so that Kueue's own
+	// deactivation ends the job first). The executor appends each value to the
+	// template's own value for that key, after a space, and never parses it, for
+	// example
 	// slurm-job.vk.io/flags: "--account={{.Account}} --qos=prod{{with .MaxExecMinutes}} --time={{.}}{{end}}".
 	// +optional
 	Annotations map[string]string `json:"annotations,omitempty"`
+
+	// maxExecutionTimeSeconds is the longest wall time a job may ask for on this
+	// flavor, the limit of the batch queue it stands for. A Workload asking for
+	// more, through its maximumExecutionTimeSeconds or interlink.eu/time-limit,
+	// is rejected: Kueue cannot choose a flavor by time, and the queue would hold
+	// or refuse the job. Unset: no limit.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	MaxExecutionTimeSeconds *int32 `json:"maxExecutionTimeSeconds,omitempty"`
 }
 
 // Membership holds the settings of the membership sync controller.
@@ -110,12 +156,19 @@ type Membership struct {
 
 	// associations holds the output of
 	// sacctmgr --parsable2 --noheader show assoc format=cluster,account,user.
-	// Rows with an empty user are account rows and are skipped.
+	// Rows with an empty user are account rows and are skipped. Every ConfigMap
+	// of the controller's namespace labelled hpc.interlink.eu/associations=<site>
+	// adds the rows of its key associations, in the same format; a row in
+	// several of them counts once.
 	Associations ConfigMapKeyRef `json:"associations"`
 
 	// executorTemplate holds a Go text/template that renders the executor objects
 	// of one tenant namespace as multi-document YAML. It may produce only
 	// namespaced objects. Unset means no executor objects are rendered.
+	// The key is the template. The other keys of that ConfigMap whose names end
+	// in .tpl.yaml are templates of their own name, for
+	// {{ template "<key>" . }}, and file "<key>" returns a key's content as it
+	// is, for example {{ file "known_hosts" | toJson }}.
 	// +optional
 	ExecutorTemplate *ConfigMapKeyRef `json:"executorTemplate,omitempty"`
 
@@ -123,8 +176,28 @@ type Membership struct {
 	// +optional
 	ExecutorImage string `json:"executorImage,omitempty"`
 
-	// cohort is the Kueue Cohort of the site's ClusterQueues. Unset means the
-	// site name.
+	// offboardTemplate holds a Go text/template, executed with the data of
+	// executorTemplate, that renders as multi-document YAML the Jobs to run in a
+	// namespace that left the site, once it has no OffloadRequest of the site
+	// left: for example one that removes the tenant's directories on the site.
+	// When they succeed, the controller deletes the objects it made for the
+	// namespace and the site; the Secrets the tenant made stay, so that adding
+	// the namespace back restores it. Unset: the objects are deleted without
+	// running anything. As in executorTemplate, the key is the template, the
+	// other *.tpl.yaml keys of that ConfigMap are templates of their own name,
+	// and file "<key>" returns a key's content.
+	// +optional
+	OffboardTemplate *ConfigMapKeyRef `json:"offboardTemplate,omitempty"`
+
+	// namespaceLabels are added to every member namespace of the site, for
+	// example the label that Kueue's managedJobsNamespaceSelector selects, so
+	// that Kueue manages the jobs of every tenant. A namespace that stops being
+	// a member loses only those the controller added, not one it already had.
+	// +optional
+	NamespaceLabels map[string]string `json:"namespaceLabels,omitempty"`
+
+	// cohort is the site's Kueue Cohort, the parent of the Cohort of each of its
+	// projects, <site>-<account>-project. Unset means the site name.
 	// +optional
 	Cohort string `json:"cohort,omitempty"`
 
@@ -133,17 +206,59 @@ type Membership struct {
 	// +optional
 	AdmissionCheck string `json:"admissionCheck,omitempty"`
 
-	// defaultProjectQuota is the quota of a project that has no ProjectQuota.
+	// defaultProjectQuota is the quota of a project that has no ProjectQuota:
+	// the resourceGroups of its project Cohort.
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=16
 	// +optional
 	DefaultProjectQuota []kueue.ResourceGroup `json:"defaultProjectQuota,omitempty"`
+
+	// queues are the batch queues a member picks by name. Each project gets,
+	// next to its ClusterQueue <site>-<account> of every flavor of its quota,
+	// one ClusterQueue <site>-<account>-<name> per queue with only the queue's
+	// flavors, and each member namespace a LocalQueue of each. All of them
+	// borrow the project's quota from its Cohort, so the queues of a project
+	// share one quota. Each flavor must be listed in flavors. A queue none of
+	// whose flavors has quota on the site (defaultProjectQuota or a
+	// ProjectQuota of the site) is skipped with a Warning event.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	Queues []MembershipQueue `json:"queues,omitempty"`
+
+	// admissionFairSharing sets admissionScope.admissionMode
+	// UsageBasedAdmissionFairSharing on every ClusterQueue of the site, so that
+	// Kueue admits first, within one ClusterQueue, the Workloads of the
+	// LocalQueue with the least recent usage: the members of a project take
+	// turns on its queues. It takes effect only with admissionFairSharing in
+	// Kueue's configuration.
+	// +optional
+	AdmissionFairSharing bool `json:"admissionFairSharing,omitempty"`
 
 	// syncInterval is how often the memberships are synchronised when
 	// nothing changed.
 	// +kubebuilder:default="15m"
 	// +optional
 	SyncInterval *metav1.Duration `json:"syncInterval,omitempty"`
+}
+
+// MembershipQueue is one batch queue of a site, named after the flavors it
+// admits on.
+type MembershipQueue struct {
+	// name ends the names of the queue's ClusterQueues and LocalQueues,
+	// <site>-<account>-<name>. "all" and "project" are reserved.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:XValidation:rule="self != 'all' && self != 'project'",message="all and project are reserved"
+	Name string `json:"name"`
+
+	// flavors are the ResourceFlavors the queue admits on.
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	Flavors []kueue.ResourceFlavorReference `json:"flavors"`
 }
 
 // ConfigMapKeyRef selects one key of a ConfigMap. The membership controller
@@ -157,10 +272,29 @@ type ConfigMapKeyRef struct {
 	Key string `json:"key"`
 }
 
+// OffloadConfigStatus counts the memberships of the site, as its membership
+// controller found them at the end of its last pass.
+type OffloadConfigStatus struct {
+	// members is the number of namespaces that hold a membership of the site.
+	// +optional
+	Members *int32 `json:"members,omitempty"`
+
+	// leaving is the number of namespaces that left the site and are not
+	// offboarded yet: a job of theirs at the site has not ended, or their
+	// offboard Jobs or the controller's objects in them are still there. With
+	// members and leaving at 0 the site has no tenant left, and the controller
+	// has deleted its ClusterQueues and Cohorts.
+	// +optional
+	Leaving *int32 `json:"leaving,omitempty"`
+}
+
 // +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:printcolumn:name="Workers",type=string,JSONPath=`.spec.workers`
 // +kubebuilder:printcolumn:name="Poll",type=string,JSONPath=`.spec.pollInterval`
+// +kubebuilder:printcolumn:name="Members",type=integer,JSONPath=`.status.members`
+// +kubebuilder:printcolumn:name="Leaving",type=integer,JSONPath=`.status.leaving`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // OffloadConfig holds the parameters of an offload AdmissionCheck and, for the
@@ -169,7 +303,8 @@ type OffloadConfig struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec OffloadConfigSpec `json:"spec,omitempty"`
+	Spec   OffloadConfigSpec   `json:"spec,omitempty"`
+	Status OffloadConfigStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true

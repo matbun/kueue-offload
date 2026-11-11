@@ -297,8 +297,8 @@ func TestCapabilitiesAskedAtSubmit(t *testing.T) {
 }
 
 // A site whose Shadow block names no login node, such as a backend that reports no
-// node: the shadow only streams logs and starts as soon as the job runs, and
-// exposed ports and reverse forwards are refused at submit.
+// node: exposed ports and reverse forwards are refused at submit, and other jobs
+// get no shadow.
 func TestShadowWithoutLoginHost(t *testing.T) {
 	e := newExecutorEnv(t)
 	e.d.Config.Shadow = shadowBlock()
@@ -321,22 +321,12 @@ func TestShadowWithoutLoginHost(t *testing.T) {
 	}
 
 	e.submit(attempt(testRequest(1), 4))
-	e.setStatus(0, "", waitingContainer(executorCtn, "Idle", ""))
-	if q := e.poll(); q.Status.Shadow != nil {
-		t.Fatalf("queued job has a shadow: %+v", q.Status.Shadow)
-	}
 	e.setStatus(0, "", runningContainer(executorCtn, time.Now()))
-	q := e.poll()
-	st := q.Status
-	if state(q) != "running" || st.NodeName != "" || st.Shadow == nil || st.Shadow.Service != "" {
-		t.Fatalf("running without a node: state %s, node %q, shadow %+v", state(q), st.NodeName, st.Shadow)
+	if q := e.poll(); state(q) != "running" || q.Status.Shadow != nil {
+		t.Fatalf("running without a node: state %s, shadow %+v", state(q), q.Status.Shadow)
 	}
-	dep, err := e.kube.AppsV1().Deployments(executorNS).Get(context.Background(), st.Shadow.Deployment, metav1.GetOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if names := containerNames(dep); names != "job-logs" || len(dep.Spec.Template.Spec.InitContainers) != 0 {
-		t.Fatalf("shadow without a login node runs %s, init %d", names, len(dep.Spec.Template.Spec.InitContainers))
+	if list, _ := e.kube.AppsV1().Deployments(executorNS).List(context.Background(), metav1.ListOptions{}); len(list.Items) != 0 {
+		t.Fatalf("%d shadow Deployments", len(list.Items))
 	}
 }
 

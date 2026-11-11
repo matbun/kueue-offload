@@ -17,19 +17,26 @@ import (
 // annotation, rank from the completion index (backends.md 3.2).
 const CapabilityPodGroup = "pod-group"
 
-// CapabilityPodSetCreate is listed in a plugin's ping answer when it takes the
-// pods of one pod group in a single /createPodSets call, by PodSet in rank order,
-// and submits them as one job without buffering them (backends.md 3.3).
-const CapabilityPodSetCreate = "podset-create"
+// CapabilityPodGroupCreate is listed in a plugin's ping answer when it takes the
+// pods of one pod group in a single /createPodGroup call, in rank order, and
+// submits them as one job without buffering them (backends.md 3.3).
+const CapabilityPodGroupCreate = "pod-group-create"
+
+// CapabilityEstimate is listed in a plugin's ping answer when it answers
+// /estimate: when the site would start a job of a given shape if it were
+// submitted now.
+const CapabilityEstimate = "estimate"
 
 // capabilitiesInterval is how often the executor reads the plugin's capabilities
 // again.
 var capabilitiesInterval = 5 * time.Minute
 
 // podGroup reports whether the request's members run as one Kueue pod group:
-// more than one, and not marked independent.
+// more than one, or one whose head names a site launcher, which the plugin
+// starts only for a pod group; and not marked independent.
 func podGroup(req jobRequest) bool {
-	return workloadMembers(req) > 1 && !independentPods(req)
+	n := workloadMembers(req)
+	return (n > 1 || (n == 1 && headLauncher(req) != "")) && !independentPods(req)
 }
 
 // independentPods reports whether every PodSet's template carries
@@ -99,7 +106,7 @@ func (d *Executor) pluginCapabilities(ctx context.Context) ([]string, *refusal) 
 // checkShape refuses a pod group the plugin cannot run as one allocation
 // (backends.md 3.6): its ranks would start as separate jobs, possibly hours
 // apart, each holding its allocation while it waits for the others. A single pod
-// and independent pods run on any plugin.
+// that names no site launcher and independent pods run on any plugin.
 func (d *Executor) checkShape(ctx context.Context, req jobRequest) *refusal {
 	if !podGroup(req) {
 		return nil
@@ -111,14 +118,18 @@ func (d *Executor) checkShape(ctx context.Context, req jobRequest) *refusal {
 	if slices.Contains(caps, CapabilityPodGroup) {
 		return nil
 	}
+	if workloadMembers(req) == 1 {
+		return permanentError("the workload names site launcher %q, which runs only a pod group, but the site's plugin does not list capability %q",
+			headLauncher(req), CapabilityPodGroup)
+	}
 	return permanentError("the workload's %d pods run as one allocation, but the site's plugin does not list capability %q; "+
 		"annotate the owner with %s: \"true\" to run one job per pod", workloadMembers(req), CapabilityPodGroup, executorapi.IndependentPodsAnnotation)
 }
 
-// createsPodSets reports whether submit sends the members of req in one
-// /createPodSets call: a pod group, on a plugin that lists podset-create. Any
+// createsPodGroup reports whether submit sends the members of req in one
+// /createPodGroup call: a pod group, on a plugin that lists pod-group-create. Any
 // other workload goes member by member to /create.
-func (d *Executor) createsPodSets(ctx context.Context, req jobRequest) (bool, *refusal) {
+func (d *Executor) createsPodGroup(ctx context.Context, req jobRequest) (bool, *refusal) {
 	if !podGroup(req) {
 		return false, nil
 	}
@@ -126,5 +137,13 @@ func (d *Executor) createsPodSets(ctx context.Context, req jobRequest) (bool, *r
 	if aerr != nil {
 		return false, aerr
 	}
-	return slices.Contains(caps, CapabilityPodSetCreate), nil
+	return slices.Contains(caps, CapabilityPodGroupCreate), nil
+}
+
+// estimates reports whether the plugin answers /estimate: not when its
+// capabilities cannot be read, an API server that cannot be reached, which the
+// create that follows reports.
+func (d *Executor) estimates(ctx context.Context) bool {
+	caps, aerr := d.pluginCapabilities(ctx)
+	return aerr == nil && slices.Contains(caps, CapabilityEstimate)
 }

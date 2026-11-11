@@ -47,7 +47,61 @@ const (
 	GangRankAnnotation = "interlink.eu/gang-rank"
 	GangRoleHead       = "head"
 	GangRoleWorker     = "worker"
+
+	// GangEndAnnotation tells the plugin when a gang without a launcher ends:
+	// GangEndAll, when every rank has run its own command to its end. The
+	// plugin's default ends it with rank 0 and stops the others, the shape of a
+	// driver and its workers, which kueue-offload starts through a launcher.
+	GangEndAnnotation = "interlink.eu/gang-end"
+	GangEndAll        = "all"
 )
+
+// DisableOffloadInitContainersAnnotation names, comma separated, init containers
+// of the template that the job does not run, as the virtual kubelet reads it. The
+// virtual kubelet runs them on the cluster, in the pod's shadow; here they run
+// nowhere, since the pod never leaves its gate.
+const DisableOffloadInitContainersAnnotation = "interlink.eu/disable-offload-init-containers"
+
+// dropDisabledInitContainers removes from tmpl the init containers that its
+// DisableOffloadInitContainersAnnotation names, and the volumes that only they
+// mount, as the virtual kubelet leaves them out of the pod it sends.
+func dropDisabledInitContainers(tmpl *v1.PodTemplateSpec) {
+	names := map[string]bool{}
+	for _, name := range strings.Split(tmpl.Annotations[DisableOffloadInitContainersAnnotation], ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			names[name] = true
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+	spec := &tmpl.Spec
+	var kept, dropped []v1.Container
+	for _, c := range spec.InitContainers {
+		if names[c.Name] {
+			dropped = append(dropped, c)
+		} else {
+			kept = append(kept, c)
+		}
+	}
+	if len(dropped) == 0 {
+		return
+	}
+	spec.InitContainers = kept
+	mountedBy := func(lists ...[]v1.Container) map[string]bool {
+		mounted := map[string]bool{}
+		for _, list := range lists {
+			for _, c := range list {
+				for _, m := range c.VolumeMounts {
+					mounted[m.Name] = true
+				}
+			}
+		}
+		return mounted
+	}
+	onlyDropped, used := mountedBy(dropped), mountedBy(spec.InitContainers, spec.Containers)
+	spec.Volumes = slices.DeleteFunc(spec.Volumes, func(v v1.Volume) bool { return onlyDropped[v.Name] && !used[v.Name] })
+}
 
 // defaultVolumeMode is the file mode the API server defaults volumes to.
 const defaultVolumeMode int32 = 0o644
@@ -94,12 +148,23 @@ func memberPodSet(req jobRequest, i int) int {
 	return -1
 }
 
+// headLauncher is the site launcher the head member names, from its template or
+// its flavor's annotations, which the plugin reads to start the whole gang.
+func headLauncher(req jobRequest) string {
+	ps := req.PodSets[memberPodSet(req, 0)]
+	if l := launcherName(ps.Template); l != "" {
+		return l
+	}
+	return strings.TrimSpace(ps.Annotations[LauncherAnnotation])
+}
+
 // buildMember returns member i of the request as the pod the plugin's create path
 // takes: its own PodSet's template, named after the owner, labelled with its
 // completion index within the whole workload, with its flavor's annotations
-// appended to the template's. A workload of more than one member is a Kueue pod
-// group of that size, member 0 (of the first PodSet) its head, unless its pods are
-// independent (podGroup). References are not resolved here.
+// appended to the template's. A workload of more than one member, or of one that
+// names a site launcher, is a Kueue pod group of that size, member 0 (of the first
+// PodSet) its head, unless its pods are independent (podGroup). References are not
+// resolved here.
 func buildMember(req jobRequest, i int) *v1.Pod {
 	ps := req.PodSets[memberPodSet(req, i)]
 	count := workloadMembers(req)
@@ -144,6 +209,10 @@ func buildMember(req jobRequest, i int) *v1.Pod {
 		default:
 			annotations[k] += " " + v
 		}
+	}
+
+	if podGroup(req) && headLauncher(req) == "" && annotations[GangEndAnnotation] == "" {
+		annotations[GangEndAnnotation] = GangEndAll
 	}
 
 	pod := &v1.Pod{
@@ -211,6 +280,79 @@ func requestsAsLimits(r *v1.ResourceRequirements) {
 			r.Limits = v1.ResourceList{}
 		}
 		r.Limits[name] = q.DeepCopy()
+	}
+}
+
+// resourceAsked is what r asks of a resource: its limit, else its request.
+func resourceAsked(r v1.ResourceRequirements, name v1.ResourceName) (resource.Quantity, bool) {
+	if q, ok := r.Limits[name]; ok {
+		return q, true
+	}
+	q, ok := r.Requests[name]
+	return q, ok
+}
+
+// templateGPUs is the GPUs a template's containers ask for, under the site's
+// GPUResource or one of its aliases: the plugin adds them up into the job's.
+func templateGPUs(spec v1.PodSpec, res *SiteResources) int64 {
+	names := append([]string{res.GPUResource}, res.GPUAliases...)
+	var n int64
+	for _, c := range spec.Containers {
+		for _, name := range names {
+			if q, ok := resourceAsked(c.Resources, v1.ResourceName(name)); ok {
+				n += q.Value()
+			}
+		}
+	}
+	return n
+}
+
+// templateCPU is the most CPU a container of the template asks for, which the
+// plugin makes the job's CPUs; set is false when no container asks for any.
+func templateCPU(spec v1.PodSpec) (cpu resource.Quantity, set bool) {
+	for _, c := range spec.Containers {
+		if q, ok := resourceAsked(c.Resources, v1.ResourceCPU); ok && (!set || q.Cmp(cpu) > 0) {
+			cpu, set = q, true
+		}
+	}
+	return cpu, set
+}
+
+// withSiteResources sizes a PodSet's template for a site with Resources, whose
+// shape validateResources checked: its GPU aliases become GPUResource again, so the
+// plugin asks the site for them, and a template that sets no CPU gets CPUsPerGPU
+// per GPU as its first container's CPU limit, which the plugin makes the job's CPUs.
+// Kueue charged the Workload by the template as it is.
+func withSiteResources(ps *v1alpha1.PodSet, res *SiteResources) {
+	if res == nil {
+		return
+	}
+	spec := &ps.Template.Spec
+	gpus := templateGPUs(*spec, res)
+	gpu := v1.ResourceName(res.GPUResource)
+	for _, list := range [][]v1.Container{spec.InitContainers, spec.Containers} {
+		for c := range list {
+			for _, rl := range []v1.ResourceList{list[c].Resources.Requests, list[c].Resources.Limits} {
+				for _, alias := range res.GPUAliases {
+					q, ok := rl[v1.ResourceName(alias)]
+					if !ok {
+						continue
+					}
+					if have, ok := rl[gpu]; ok {
+						q.Add(have)
+					}
+					rl[gpu] = q
+					delete(rl, v1.ResourceName(alias))
+				}
+			}
+		}
+	}
+	if _, set := templateCPU(*spec); !set && len(spec.Containers) > 0 {
+		r := &spec.Containers[0].Resources
+		if r.Limits == nil {
+			r.Limits = v1.ResourceList{}
+		}
+		r.Limits[v1.ResourceCPU] = *resource.NewQuantity(res.CPUsPerGPU*gpus, resource.DecimalSI)
 	}
 }
 

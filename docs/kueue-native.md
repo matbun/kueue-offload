@@ -1,8 +1,10 @@
 # kueue-offload, the Kueue-native shape
 
 kueue-offload runs Kueue Workloads on a batch system that has no Kubernetes API (Slurm today)
-with no virtual node: an admission check controller hands a Workload whose quota is reserved to a
-per-tenant executor, which runs all its PodSets as one batch job under the tenant's own identity.
+through an admission check: its controller hands a Workload whose quota is reserved to a
+per-tenant executor, which runs all its PodSets as one batch job under the tenant's own identity,
+and shows the job on the Workload's pods, bound to one virtual node per site that the controller
+runs.
 The reference deployment runs batch Jobs, pod groups, JobSet and TrainJob gangs, a Katib
 experiment, a pipeline step and notebooks this way on a production HPC system. `design.md`
 records how the current code works. This file describes the shape it should take to follow Kueue
@@ -53,8 +55,10 @@ system breaks:
 
 An HPC offload today therefore either rebuilds Kubernetes in front of the site (a virtual
 kubelet, or an API server facade that MultiKueue could talk to) or runs as a separate admission
-check controller that can never report `Ready`, which is what kueue-offload does (`design.md`,
-[The check stays Pending](design.md#the-check-stays-pending)). This document proposes the shape in between.
+check controller that reports `Ready` only once the job started elsewhere and keeps the pods the
+owner then makes off the cluster's nodes, which is what kueue-offload does (`design.md`, [The check
+goes Ready when the job starts](design.md#the-check-goes-ready-when-the-job-starts)). This document
+proposes the shape in between.
 
 ## 2. How kueue-offload maps onto Kueue and MultiKueue
 
@@ -63,9 +67,9 @@ check controller that can never report `Ready`, which is what kueue-offload does
 | AdmissionCheck `controllerName: interlink.eu/offload`, parameters `OffloadConfig` | admission check with a parameters object, like ProvisioningRequestConfig and MultiKueueConfig | `0.16.9 v1beta2/admissioncheck_types.go:55-82` | none |
 | a ResourceFlavor per Slurm queue, `OffloadConfig.flavors` maps it to partition and QOS | ResourceFlavor; a check per flavor with `onFlavors` (KEP 1432) | `0.16.9 v1beta2/clusterqueue_types.go:159-169`, `keps/1432:31-33` | `onFlavors` unused; the target sits in the check's config, not on the flavor |
 | a ClusterQueue per project, a LocalQueue per membership, a Cohort | ClusterQueue `namespaceSelector`, LocalQueue, Cohort | `0.16.9 v1beta2/clusterqueue_types.go:81, 105`, `v1beta2/localqueue_types.go:33-37`, `v1beta2/cohort_types.go:24` | none |
-| check `Pending` while the job is queued and while it runs ([The check stays Pending](design.md#the-check-stays-pending)) | `Pending` is "the check still hasn't been performed"; `Ready` means the Workload "can begin execution" | `0.16.9 v1beta2/admissioncheck_types.go:37-44` | everything keyed on `Admitted` is inert (section 3.4) |
-| Job kept suspended, pods kept gated, terminal status patched | MultiKueue's batch Job path with `MultiKueueBatchJobWithManagedBy` off: skip the local start, copy the finished status | `0.16.9 jf/reconciler.go:1231-1246`, `pkg/controller/jobs/job/job_multikueue_adapter.go:89-94`, `pkg/features/kube_features.go:364-367`, `pkg/controller/jobs/pod/pod_multikueue_adapter.go:140-170` | the skip is keyed on MultiKueue's name; for Jobs the gate is on since 0.15 and GA in 0.17 (3.4) |
-| per-kind finishing in `pkg/offload/owner.go` | `MultiKueueAdapter` (SyncJob, DeleteRemoteObject, IsJobManagedByKueue, GVK) | `0.16.9 jf/interface.go:259-273`; `0.20.4 jf/multikueue.go:31-102` | terminal state only, written by hand |
+| check `Pending` while the job is queued, `Ready` once it started ([The check goes Ready when the job starts](design.md#the-check-goes-ready-when-the-job-starts)) | `Pending` is "the check still hasn't been performed"; `Ready` means the Workload "can begin execution" | `0.16.9 v1beta2/admissioncheck_types.go:37-44` | `Admitted` comes with the job's start, not with the decision to run it (section 3.4) |
+| Job suspended and pods gated until the job started; then the owner's pods bound to the site's virtual node, which shows their state ([Virtual node](design.md#virtual-node)) | MultiKueue's batch Job path with `MultiKueueBatchJobWithManagedBy` off: skip the local start, copy the finished status | `0.16.9 jf/reconciler.go:1231-1246`, `pkg/controller/jobs/job/job_multikueue_adapter.go:89-94`, `pkg/features/kube_features.go:364-367`, `pkg/controller/jobs/pod/pod_multikueue_adapter.go:140-170` | the skip is keyed on MultiKueue's name; for Jobs the gate is on since 0.15 and GA in 0.17 (3.4) |
+| owners end from their pods, whose status the virtual node writes from the member's (`pkg/node`) | `MultiKueueAdapter` (SyncJob, DeleteRemoteObject, IsJobManagedByKueue, GVK) | `0.16.9 jf/interface.go:259-273`; `0.20.4 jf/multikueue.go:31-102` | pod status, as a kubelet writes it, instead of owner status |
 | unknown owner kind: `Rejected` | no adapter, or job not managed: `Rejected` | `0.16.9 mk/workload.go:156-239` | same shape |
 | an `OffloadRequest` per attempt ([The OffloadRequest](design.md#the-offloadrequest)) | create a remote Workload (`cloneForCreate`), then the job through `SyncJob` | `0.16.9 mk/workload.go:812-824` | MultiKueue sends only the Spec, not `status.admission` |
 | the executor's status on the request, watched | remote watches feeding the workload controller | `0.16.9 mk/multikueuecluster.go:192-249` | none; the executor polls the site |
@@ -160,7 +164,8 @@ a mixed ClusterQueue would therefore stop a Job from ever running locally on the
 believe this is why MultiKueue checks cannot be per flavor, though the code gives no reason
 (`0.16.9 pkg/cache/scheduler/clusterqueue.go:401-404`). Consequences:
 - ClusterQueues with only HPC flavors can use `managedBy` and `Ready` (3.4).
-- Mixed ClusterQueues keep the owner suspended until it ends (the Pending model).
+- Mixed ClusterQueues keep the owner suspended until its job started at the site, then run its
+  pods on the site's virtual node (the node model).
 - Pods are not affected, because gating is decided at start, when the flavor is known
   (`0.16.9 jf/reconciler.go:1231-1246`).
 
@@ -279,7 +284,7 @@ External dispatcher lets any controller nominate workers through `status.nominat
 (`0.16.9 keps/693-multikueue:417-420`). Such a dispatcher could rank sites by the site
 scheduler's start estimate.
 
-### 3.4 managedBy and Ready, the Pending model before that
+### 3.4 managedBy and Ready, the node model before that
 
 On Kubernetes 1.32 or later, and for ClusterQueues with only HPC flavors, the owner carries
 `managedBy: interlink.eu/offload`. The check goes `Ready` at `running`. Kueue admits and
@@ -301,17 +306,18 @@ KEP lands a webhook of this project sets it, with the same rule. Per kind:
 - Plain pods have no `managedBy`, and only a MultiKueue check skips their ungating
   (`0.16.9 pkg/util/admissioncheck/admissioncheck.go:224-235`). They need the Kueue change.
 
-Everywhere else (Kubernetes 1.30, mixed ClusterQueues, pods and TrainJob today), the Pending
-model ([The check stays Pending](design.md#the-check-stays-pending)) stays. The check is `Pending` for the job's whole life, and the owner stays suspended
-or gated. The adapter patches the terminal status, and Kueue finishes the Workload, because it
-handles a finished job before a suspended one (`0.16.9 jf/reconciler.go:416-459, 563`). MultiKueue
-skipped the local start of batch Jobs without `managedBy` only with
-`MultiKueueBatchJobWithManagedBy` disabled (`0.16.9 jf/reconciler.go:1231-1246`); that gate is
-beta and on since 0.15 (`0.16.9 pkg/features/kube_features.go:364-367`), and with it on the
-0.16.9 Job adapter already requires `managedBy`
-(`0.16.9 pkg/controller/jobs/job/job_multikueue_adapter.go:212-227`). The gate went GA in 0.17
-(`0.20.4 CHANGELOG/CHANGELOG-0.17.md:408`), removing that path: only composable jobs skip the
-local start (`0.20.4 jf/reconciler.go:1813-1826`).
+Everywhere else (Kubernetes 1.30, mixed ClusterQueues, pods and TrainJob today), the model of
+`design.md` stays ([The check goes Ready when the job
+starts](design.md#the-check-goes-ready-when-the-job-starts)): the check is `Pending` while the job
+waits and `Ready` once it started, and the pods the owner then makes are bound to the site's
+virtual node, which shows them the job's state, so the owner ends from its pods and Kueue finishes
+the Workload. MultiKueue skipped the local start of batch Jobs without
+`managedBy` only with `MultiKueueBatchJobWithManagedBy` disabled (`0.16.9
+jf/reconciler.go:1231-1246`); that gate is beta and on since 0.15 (`0.16.9
+pkg/features/kube_features.go:364-367`), and with it on the 0.16.9 Job adapter already requires
+`managedBy` (`0.16.9 pkg/controller/jobs/job/job_multikueue_adapter.go:212-227`). The gate went GA
+in 0.17 (`0.20.4 CHANGELOG/CHANGELOG-0.17.md:408`), removing that path: only composable jobs skip
+the local start (`0.20.4 jf/reconciler.go:1813-1826`).
 
 In the managedBy model, `SyncStatus` also writes the running rank count to `status.ready` (Job)
 and `replicatedJobsStatus[].ready` (JobSet) once the job runs. With `waitForPodsReady` set, Kueue
@@ -322,10 +328,13 @@ job, and `blockAdmission` would stall the ClusterQueue
 `pkg/controller/jobs/jobset/jobset_controller.go:178-188`,
 `apis/config/v1beta2/configuration_types.go:227-233`).
 
-The Pending model's cost is that everything keyed on `Admitted` does nothing:
-- the maximum execution time (`0.16.9 pkg/controller/core/workload_controller.go:622-626`);
-- `waitForPodsReady` (`:1114-1122`);
-- `admitted_workloads_total` and the wait time metric (`0.16.9 pkg/metrics/metrics.go:254-262, 318-323`);
+In the node model a Workload is `Admitted` only once its job started, so everything keyed on
+`Admitted` counts from the start, not from the reservation:
+- the maximum execution time (`0.16.9 pkg/controller/core/workload_controller.go:622-626`), which
+  then races the site's own wall time;
+- `waitForPodsReady` (`:1114-1122`), which sees the pods only after the start;
+- `admitted_workloads_total` and the wait time metric (`0.16.9 pkg/metrics/metrics.go:254-262, 318-323`),
+  whose wait includes the site's queue;
 - Concurrent Admission (alpha, off; `0.20.4 pkg/features/kube_features.go:1183-1185`), whose
   parent is admitted only when a variant is (`0.20.4 keps/8691:496-498, 520`).
 
@@ -333,8 +342,9 @@ On 0.16.9, admission fair sharing treats these Workloads unevenly. The sampled u
 counts admitted Workloads only (`0.16.9 pkg/controller/core/localqueue_controller.go:316-321, 348`),
 while the entry penalty is added at reservation and settled only at admission
 (`0.16.9 pkg/scheduler/scheduler.go:733-737`, `pkg/controller/core/workload_controller.go:983-989, 1071`).
-A Workload that never becomes `Admitted` thus leaves an unsettled penalty in its LocalQueue's
-usage (`0.16.9 pkg/workload/workload.go:410-424`). 0.20 moves both to the reservation through
+A Workload becomes `Admitted` only when its job started, so its penalty stays unsettled in its
+LocalQueue's usage while the job waits at the site, and for good when it never starts
+(`0.16.9 pkg/workload/workload.go:410-424`). 0.20 moves both to the reservation through
 `AdmissionFairSharingAnchorAtQuotaReservation` (beta, on;
 `0.20.4 pkg/features/kube_features.go:155-161, 1020-1022`).
 
@@ -363,8 +373,9 @@ For a failed pod group, the adapter also sets the annotation
 `kueue.x-k8s.io/retriable-in-group: "false"` on the pods of the group. Without it, Kueue
 keeps waiting for replacement pods and the group never finishes
 (`0.16.9 pkg/controller/jobs/pod/pod_controller.go:226-238, 351-394`,
-`pkg/controller/jobs/pod/constants/constants.go:34-35`). `finishPods`
-(`pkg/offload/owner.go`) sets it on every pod of a failed group before marking the pod Failed.
+`pkg/controller/jobs/pod/constants/constants.go:34-35`). The virtual node (`pkg/node/pods.go`)
+sets it on a member of a group before it marks the pod Failed, and before it removes a member
+whose job has not finished.
 
 ### 3.6 The executor turns a Workload into one job, with no pods
 
@@ -395,7 +406,9 @@ job per pod.
 
 ### 3.7 Identity stays in the tenant namespace
 
-Neither controller has Secret access. The tenant's executor runs in the tenant's namespace with a
+Neither controller reads a Secret's data: the offload controller has no Secret access, and the
+membership controller reads Secrets as metadata only, to roll an executor whose Secret was replaced
+(`design.md`, "Executor health"). The tenant's executor runs in the tenant's namespace with a
 RoleBinding there only and the tenant's own key, and it acts only on OffloadRequests there. The worker
 object (OffloadWorker, later the external MultiKueueCluster) is a router: it names the controller
 that serves the site. The namespace decides whose identity runs the request, from the site's own
@@ -422,7 +435,7 @@ implemented yet).
 | --- | --- |
 | Executor: SSH, job scripts, site launchers (torchrun, MPI, Ray), image staging, kubelet emulation | specific to each backend. MultiKueue leaves authentication between clusters out of scope (`0.16.9 keps/693-multikueue:68`) |
 | Site identity mapping and membership: associations become namespace labels, LocalQueues, ClusterQueues and executors | MultiKueue leaves discovering clusters and syncing configuration to other tooling (`0.16.9 keps/693-multikueue:64-67`). The output is plain Kueue objects. In 0.20 the quota half could be published as a `CapacityProvider` (gate `DynamicQuotaOrchestration`, alpha, off; `0.20.4 keps/12382:62-80`, `pkg/features/kube_features.go:1347-1349`) |
-| Tunnels and logs (the shadow) | Kueue has nothing for logs or ingress of remote work. The shadow is a real pod outside every ClusterQueue, rendered by the executor for every job by default (`AlwaysShadow`, plugin `pkg/slurm/executor_config.go:66-68`, with a site opt-out), and it outlives the job so `kubectl logs` still works ([Shadow](design.md#shadow)) |
+| Tunnels and logs (the shadow, the virtual node) | Kueue has nothing for logs or ingress of remote work. The shadow is a real pod outside every ClusterQueue, rendered by the executor for a job that exposes ports or tunnels back ([Shadow](design.md#shadow)); the logs come from the executor through the site's virtual node, on which the Workload's pods are bound, so `kubectl logs <pod>` works as on any cluster ([Virtual node](design.md#virtual-node)) |
 | Staging data between cluster volumes and the site's filesystem | storage is a MultiKueue non-goal (`0.16.9 keps/693-multikueue:61-63`). It runs as executor-side Jobs |
 
 ## 5. KEP sketch: MultiKueue external workers
@@ -518,7 +531,7 @@ Behaviour:
 | --- | --- |
 | A Kubernetes API facade behind `kubeConfig` (no Kueue change) | it must serve Workloads, every job kind, label-selector watches with bookmarks and List for GC (`0.16.9 mk/multikueuecluster.go:268-298, 383-431`): the virtual kubelet problem one layer up |
 | A virtual kubelet per tenant | fake nodes and capacity; pods exist before the gang is decided |
-| A standalone check controller (kueue-offload today) | cannot report `Ready`; repeats MultiKueue's code, which KEP 2349 already held against custom MultiKueue check controllers (`0.16.9 keps/2349:200-205`) |
+| A standalone check controller (kueue-offload today) | reports `Ready` only once the job started, and needs a virtual node per site for the pods Kueue then lets the owner make; repeats MultiKueue's code, which KEP 2349 already held against custom MultiKueue check controllers (`0.16.9 keps/2349:200-205`) |
 | A "runs remotely" property on AdmissionCheck that generalizes `ShouldSkipLocalExecution` and `ApplyDefaultForManagedBy` | small, and works per flavor for pods, but every external controller then runs MultiKueue's state machine itself, the burden KEP 2349 cites against external controllers taking the check's role (`0.16.9 keps/2349:195-198`). A good first step on its own |
 | A dedicated protocol to workers, such as gRPC | KEP 2349 deferred a dedicated API for complexity, debugging across layers and compatibility of separately built binaries (`0.16.9 keps/2349:188-193`). ExternalWorkload is also a dedicated API: a CRD answers the protocol and compatibility points, not the layering one |
 | ClusterProfile with a credential plugin | per cluster, not per user, and still a Kubernetes API (`0.16.9 keps/693-multikueue:256-290`) |
@@ -550,8 +563,9 @@ Steps 1 to 7 need no Kueue change and run on Kueue 0.16.9 and Kubernetes 1.30.
    ProvisioningRequestConfig's type and defaults, replaces `maxRetries` and the retry count the
    controller kept per Workload. The controller counts the retries (since step 6 from the
    request's `attempt`), sets `requeueAfterSeconds` with Kueue's
-   `UpdateAdmissionCheckRequeueState`, and writes `Rejected` once `backoffLimitCount` retries are
-   spent. The in-memory submit backoff goes: a submit refused for now (a submit limit, an
+   `UpdateAdmissionCheckRequeueState`, and gives the Workload up once `backoffLimitCount` retries
+   are spent (its pods fail on the virtual node; a Ray owner's check is `Rejected`; design.md
+   [Owners](design.md#owners)). The in-memory submit backoff goes: a submit refused for now (a submit limit, an
    unreachable site) stays `Pending` holding the quota and is tried again on the executor's next
    poll ([Transient submit failures](design.md#transient-submit-failures), 3.2).
 3. Executor: wall time from `maximumExecutionTimeSeconds`. The `--time` written in
@@ -574,7 +588,7 @@ Steps 1 to 7 need no Kueue change and run on Kueue 0.16.9 and Kubernetes 1.30.
 8. Adapters by GVK (3.5). Then `managedBy` and `Ready`, opt-in per ClusterQueue with only HPC
    flavors: JobSet first, batch Job on Kubernetes 1.32 or later, tested with `waitForPodsReady`
    on. `managedBy` is immutable, so Jobs created with it must finish before a ClusterQueue opts
-   out. Pods, TrainJob and mixed ClusterQueues stay on the Pending model.
+   out. Pods, TrainJob and mixed ClusterQueues stay on the node model.
 9. Move the target Kueue to 0.20 or later: port to the new adapter interfaces, use reserved-usage
    fair sharing. The Job path there requires `managedBy`.
 10. Upstream issue, then the KEP of section 5. Once it lands, OffloadRequest becomes

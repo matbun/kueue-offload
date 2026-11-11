@@ -15,12 +15,13 @@ import (
 )
 
 // fakePlugin is an interLink plugin behind the API server: /create, /status (with
-// an empty list, the ping), /getLogs, /delete and /createPodSets. Every answer is
-// scripted by the test. With capability pod-group, which it lists by default,
-// members of a pod group are buffered until the last one, as the Slurm plugin's
-// gang path does; without it every pod is its own job, numbered from fakeJobID by
-// completion index. /createPodSets gives every pod of the group fakeJobID, as the
-// Slurm plugin does; the executor calls it only when a test lists podset-create.
+// an empty list, the ping), /getLogs, /delete, /createPodGroup and /estimate.
+// Every answer is scripted by the test. With capability pod-group, which it
+// lists by default, members of a pod group are buffered until the last one, as
+// the Slurm plugin's gang path does; without it every pod is its own job,
+// numbered from fakeJobID by completion index. /createPodGroup gives every pod of
+// the group fakeJobID, as the Slurm plugin does; the executor calls it only when
+// a test lists pod-group-create, and /estimate only when a test lists estimate.
 type fakePlugin struct {
 	t   *testing.T
 	srv *httptest.Server
@@ -31,21 +32,22 @@ type fakePlugin struct {
 	// createCodes answer the next /create calls, one each; 200 once used up.
 	createCodes []int
 	createText  string
-	// podSets holds every /createPodSets body, in arrival order. podSetsCodes and
-	// podSetsText answer the next calls as createCodes and createText do;
-	// podSetsAnswer, when set, rewrites an answer of 200.
-	podSets       []fakePodSets
-	podSetsCodes  []int
-	podSetsText   string
-	podSetsAnswer func([]commonIL.CreateStruct) []commonIL.CreateStruct
+	// groupCalls holds every /createPodGroup body, in arrival order. groupCodes
+	// and groupText answer the next calls as createCodes and createText do;
+	// groupAnswer, when set, rewrites an answer of 200.
+	groupCalls  []fakePodGroup
+	groupCodes  []int
+	groupText   string
+	groupAnswer func([]commonIL.CreateStruct) []commonIL.CreateStruct
 	// status is what /status reports per pod UID; a pod not in it is left out.
 	status map[string]commonIL.PodStatus
 	// phases holds the phases of the last /status request, by pod UID.
 	phases   map[string]v1.PodPhase
 	statuses int
 	// logs is each container's log, by "<pod UID>/<container>". A followed log
-	// ends once its pod is in ended.
+	// ends once its pod is in ended. logOpts holds the options of every /getLogs.
 	logs    map[string]string
+	logOpts []commonIL.ContainerLogOpts
 	ended   map[string]bool
 	deleted []string
 	pings   int
@@ -57,20 +59,24 @@ type fakePlugin struct {
 	// that answer.
 	capabilities []string
 	pingBody     string
+	// estimates holds every /estimate body, in arrival order. estimateCode and
+	// estimateText answer them when the code is set; otherwise the answer is
+	// estimateStart.
+	estimates     []EstimateRequest
+	estimateCode  int
+	estimateText  string
+	estimateStart time.Time
 }
 
 const fakeJobID = executorJobID
 
-// fakePodSets is a /createPodSets body as the fake reads it: only the pods, which
-// the API server's body and the plugin's both carry under "pod".
-type fakePodSets struct {
+// fakePodGroup is a /createPodGroup body as the fake reads it: only the pods,
+// which the API server's body and the plugin's both carry under "pod".
+type fakePodGroup struct {
 	GroupUID string `json:"groupUID"`
-	PodSets  []struct {
-		Name string `json:"name"`
-		Pods []struct {
-			Pod v1.Pod `json:"pod"`
-		} `json:"pods"`
-	} `json:"podSets"`
+	Pods     []struct {
+		Pod v1.Pod `json:"pod"`
+	} `json:"pods"`
 }
 
 func newFakePlugin(t *testing.T) *fakePlugin {
@@ -81,7 +87,8 @@ func newFakePlugin(t *testing.T) *fakePlugin {
 	mux.HandleFunc("/status", p.statusHandler)
 	mux.HandleFunc("/getLogs", p.getLogs)
 	mux.HandleFunc("/delete", p.delete)
-	mux.HandleFunc("/createPodSets", p.createPodSets)
+	mux.HandleFunc("/createPodGroup", p.createPodGroup)
+	mux.HandleFunc("/estimate", p.estimate)
 	p.srv = httptest.NewServer(mux)
 	t.Cleanup(p.srv.Close)
 	return p
@@ -129,34 +136,47 @@ func (p *fakePlugin) create(w http.ResponseWriter, r *http.Request) {
 	writeTestJSON(w, commonIL.CreateStruct{PodUID: string(pod.UID), PodJID: jid})
 }
 
-func (p *fakePlugin) createPodSets(w http.ResponseWriter, r *http.Request) {
-	var body fakePodSets
+func (p *fakePlugin) createPodGroup(w http.ResponseWriter, r *http.Request) {
+	var body fakePodGroup
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		p.t.Errorf("fake plugin: decoding /createPodSets: %v", err)
+		p.t.Errorf("fake plugin: decoding /createPodGroup: %v", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.podSets = append(p.podSets, body)
-	if len(p.podSetsCodes) > 0 {
-		code := p.podSetsCodes[0]
-		p.podSetsCodes = p.podSetsCodes[1:]
+	p.groupCalls = append(p.groupCalls, body)
+	if len(p.groupCodes) > 0 {
+		code := p.groupCodes[0]
+		p.groupCodes = p.groupCodes[1:]
 		if code != http.StatusOK {
-			http.Error(w, p.podSetsText, code)
+			http.Error(w, p.groupText, code)
 			return
 		}
 	}
 	out := []commonIL.CreateStruct{}
-	for _, ps := range body.PodSets {
-		for _, data := range ps.Pods {
-			out = append(out, commonIL.CreateStruct{PodUID: string(data.Pod.UID), PodJID: fakeJobID})
-		}
+	for _, data := range body.Pods {
+		out = append(out, commonIL.CreateStruct{PodUID: string(data.Pod.UID), PodJID: fakeJobID})
 	}
-	if p.podSetsAnswer != nil {
-		out = p.podSetsAnswer(out)
+	if p.groupAnswer != nil {
+		out = p.groupAnswer(out)
 	}
 	writeTestJSON(w, out)
+}
+
+func (p *fakePlugin) estimate(w http.ResponseWriter, r *http.Request) {
+	var req EstimateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		p.t.Errorf("fake plugin: decoding /estimate: %v", err)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.estimates = append(p.estimates, req)
+	if p.estimateCode != 0 {
+		http.Error(w, p.estimateText, p.estimateCode)
+		return
+	}
+	writeTestJSON(w, EstimateResponse{Start: p.estimateStart, Raw: "sbatch: Job 77 to start at " + p.estimateStart.Format("2006-01-02T15:04:05")})
 }
 
 func (p *fakePlugin) statusHandler(w http.ResponseWriter, r *http.Request) {
@@ -194,6 +214,7 @@ func (p *fakePlugin) getLogs(w http.ResponseWriter, r *http.Request) {
 		p.t.Errorf("fake plugin: decoding /getLogs: %v", err)
 	}
 	key := req.PodUID + "/" + req.ContainerName
+	p.with(func(p *fakePlugin) { p.logOpts = append(p.logOpts, req.Opts) })
 	sent := 0
 	next := func() (string, bool) {
 		p.mu.Lock()
@@ -256,11 +277,18 @@ func (p *fakePlugin) createdPods() []v1.Pod {
 	return pods
 }
 
-// podSetCalls returns the /createPodSets bodies, in arrival order.
-func (p *fakePlugin) podSetCalls() []fakePodSets {
+// estimateCalls returns the /estimate bodies, in arrival order.
+func (p *fakePlugin) estimateCalls() []EstimateRequest {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return append([]fakePodSets(nil), p.podSets...)
+	return append([]EstimateRequest(nil), p.estimates...)
+}
+
+// podGroupCalls returns the /createPodGroup bodies, in arrival order.
+func (p *fakePlugin) podGroupCalls() []fakePodGroup {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]fakePodGroup(nil), p.groupCalls...)
 }
 
 // container returns the data /create received for a container of member i, the

@@ -41,27 +41,33 @@ type checkApplyStatus struct {
 }
 
 type checkApplyEntry struct {
-	Name                string `json:"name"`
-	State               string `json:"state"`
-	Message             string `json:"message"`
-	LastTransitionTime  string `json:"lastTransitionTime"`
-	RequeueAfterSeconds *int32 `json:"requeueAfterSeconds,omitempty"`
+	Name                string               `json:"name"`
+	State               string               `json:"state"`
+	Message             string               `json:"message"`
+	LastTransitionTime  string               `json:"lastTransitionTime"`
+	RequeueAfterSeconds *int32               `json:"requeueAfterSeconds,omitempty"`
+	PodSetUpdates       []kueue.PodSetUpdate `json:"podSetUpdates,omitempty"`
 }
 
 // checkApplyBody is the apply configuration for one check entry. It leaves out
-// retryCount, which Kueue owns.
+// retryCount, which Kueue owns, and carries podSetUpdates only in state Ready:
+// Kueue applies them when it admits the Workload.
 func checkApplyBody(wl *kueue.Workload, st kueue.AdmissionCheckState) ([]byte, error) {
+	entry := checkApplyEntry{
+		Name:                string(st.Name),
+		State:               string(st.State),
+		Message:             st.Message,
+		LastTransitionTime:  st.LastTransitionTime.UTC().Format("2006-01-02T15:04:05Z"),
+		RequeueAfterSeconds: st.RequeueAfterSeconds,
+	}
+	if st.State == kueue.CheckStateReady {
+		entry.PodSetUpdates = st.PodSetUpdates
+	}
 	return json.Marshal(checkApply{
 		APIVersion: kueue.GroupVersion.String(),
 		Kind:       "Workload",
 		Metadata:   checkApplyMeta{Name: wl.Name, Namespace: wl.Namespace},
-		Status: checkApplyStatus{AdmissionChecks: []checkApplyEntry{{
-			Name:                string(st.Name),
-			State:               string(st.State),
-			Message:             st.Message,
-			LastTransitionTime:  st.LastTransitionTime.UTC().Format("2006-01-02T15:04:05Z"),
-			RequeueAfterSeconds: st.RequeueAfterSeconds,
-		}}},
+		Status:     checkApplyStatus{AdmissionChecks: []checkApplyEntry{entry}},
 	})
 }
 

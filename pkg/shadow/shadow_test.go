@@ -32,8 +32,6 @@ const (
 
 func testConfig() Config {
 	return Config{
-		ExecutorImage:       "registry.example.org/kueue-offload-executor:1.0",
-		ExecutorURL:         "http://kueue-offload-executor:8000",
 		LoginHost:           "login.hpc-a.example.org",
 		User:                "alice",
 		KeySecret:           "hpc-a-tunnel-key",
@@ -150,8 +148,12 @@ func TestEnsureNotebook(t *testing.T) {
 	if got := containerNames(d.Spec.Template.Spec.InitContainers); !slices.Equal(got, []string{"wait-for-node"}) {
 		t.Errorf("init containers %v", got)
 	}
-	if got := containerNames(d.Spec.Template.Spec.Containers); !slices.Equal(got, []string{"ssh-forward", "job-logs"}) {
+	if got := containerNames(d.Spec.Template.Spec.Containers); !slices.Equal(got, []string{"ssh-forward"}) {
 		t.Errorf("containers %v", got)
+	}
+	// One pod at a time: a rolling update would hold every tunnel twice.
+	if d.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Errorf("strategy %+v, want Recreate", d.Spec.Strategy)
 	}
 
 	forward := container(t, d, "ssh-forward")
@@ -163,20 +165,6 @@ func TestEnsureNotebook(t *testing.T) {
 	}
 	if forward.ReadinessProbe == nil || forward.ReadinessProbe.TCPSocket.Port.IntVal != 8888 {
 		t.Errorf("readiness probe %+v, want tcp 8888", forward.ReadinessProbe)
-	}
-
-	logs := container(t, d, "job-logs")
-	wantCmd := []string{"/executor", "logs", "--executor", "http://kueue-offload-executor:8000", "--workload", testUID, "--follow"}
-	if !slices.Equal(logs.Command, wantCmd) {
-		t.Errorf("job-logs command %v, want %v", logs.Command, wantCmd)
-	}
-	if logs.Image != "registry.example.org/kueue-offload-executor:1.0" {
-		t.Errorf("job-logs image %s", logs.Image)
-	}
-	r := logs.Resources
-	if r.Requests.Cpu().String() != "10m" || r.Requests.Memory().String() != "32Mi" ||
-		r.Limits.Cpu().String() != "100m" || r.Limits.Memory().String() != "64Mi" {
-		t.Errorf("job-logs resources %+v", r)
 	}
 
 	var volumes []string
@@ -212,152 +200,26 @@ func TestEnsureNotebook(t *testing.T) {
 	}
 }
 
-func assertLogsOnly(t *testing.T, client *fake.Clientset, ref Ref) {
-	t.Helper()
-	if ref.Service != "" {
-		t.Errorf("logs-only ref names service %q", ref.Service)
+// A job that forwards no TCP port and has no reverse tunnel gets no shadow:
+// nothing is written.
+func TestEnsureWithoutTunnelsIsNone(t *testing.T) {
+	cases := map[string]func(*Spec){
+		"no port":  func(s *Spec) { s.Template = podTemplate() },
+		"UDP only": func(s *Spec) { s.Template = podTemplate(); s.Template.Annotations[annExtraPorts] = "5353:dns:UDP" },
 	}
-	d := getDeployment(t, client, testShadow)
-	if got := containerNames(d.Spec.Template.Spec.Containers); !slices.Equal(got, []string{"job-logs"}) {
-		t.Errorf("logs-only containers %v", got)
-	}
-	if len(d.Spec.Template.Spec.InitContainers) != 0 {
-		t.Errorf("logs-only init containers %v", containerNames(d.Spec.Template.Spec.InitContainers))
-	}
-	// Nothing mounts the tunnel key, so a missing Secret cannot hold the pod.
-	if len(d.Spec.Template.Spec.Volumes) != 0 {
-		t.Errorf("logs-only volumes %+v", d.Spec.Template.Spec.Volumes)
-	}
-	assertOwnerLabels(t, "pod template", d.Spec.Template.Labels, testUID)
-	_, err := client.CoreV1().Services(testNamespace).Get(t.Context(), testShadow, metav1.GetOptions{})
-	if !apierrors.IsNotFound(err) {
-		t.Errorf("logs-only shadow has a service (err %v)", err)
-	}
-}
-
-func TestEnsureWithoutPortsIsLogsOnly(t *testing.T) {
-	client, m := newTestManager(t, testConfig())
-	spec := notebookSpec()
-	spec.Template = podTemplate()
-	ref, err := m.Ensure(t.Context(), spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertLogsOnly(t, client, ref)
-	if ref.NodeConfigMap != testShadow+"-node" {
-		t.Errorf("ref %+v", ref)
-	}
-}
-
-func TestEnsureUDPOnlyIsLogsOnly(t *testing.T) {
-	client, m := newTestManager(t, testConfig())
-	spec := notebookSpec()
-	spec.Template = podTemplate()
-	spec.Template.Annotations[annExtraPorts] = "5353:dns:UDP"
-	ref, err := m.Ensure(t.Context(), spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertLogsOnly(t, client, ref)
-}
-
-func TestAlwaysShadowFalse(t *testing.T) {
-	cfg := testConfig()
-	never := false
-	cfg.AlwaysShadow = &never
-	client, m := newTestManager(t, cfg)
-
-	spec := notebookSpec()
-	spec.Template = podTemplate()
-	ref, err := m.Ensure(t.Context(), spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ref != (Ref{}) || len(writes(client)) != 0 {
-		t.Fatalf("a job without ports got a shadow: ref %+v, writes %v", ref, writes(client))
-	}
-
-	if _, err := m.Ensure(t.Context(), notebookSpec()); err != nil {
-		t.Fatal(err)
-	}
-	getDeployment(t, client, testShadow)
-}
-
-func TestTerminalFlipsToLogsOnly(t *testing.T) {
-	client, m := newTestManager(t, testConfig())
-	spec := notebookSpec()
-	if _, err := m.Ensure(t.Context(), spec); err != nil {
-		t.Fatal(err)
-	}
-	spec.Terminal = true
-	ref, err := m.Ensure(t.Context(), spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertLogsOnly(t, client, ref)
-	if ref.Deployment != testShadow {
-		t.Errorf("ref %+v", ref)
-	}
-}
-
-// notebookPodLabels are a Kubeflow Notebook's pod as Kueue holds it gated: its
-// StatefulSet's, the spawner's PodDefault selector, Kueue's, and its
-// controller's.
-func notebookPodLabels() map[string]string {
-	return map[string]string{
-		"statefulset": testName, "notebook-name": testName, "hpc-a-proj42": "true",
-		"kueue.x-k8s.io/queue-name": "hpc-a-proj42", "kueue.x-k8s.io/managed": "true",
-		"controller-revision-hash": testName + "-5d565", "statefulset.kubernetes.io/pod-name": testName + "-0",
-		"app.kubernetes.io/component": "jupyter",
-	}
-}
-
-func service(name string, selector map[string]string) *corev1.Service {
-	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
-		Spec:       corev1.ServiceSpec{Selector: selector},
-	}
-}
-
-// The shadow carries the labels the namespace's Services select the pod by, so
-// they select the shadow too, and no other: a PodDefault selecting hpc-a-proj42
-// would give the shadow Kueue's queue label, and Kueue would gate it.
-func TestShadowCarriesServiceLabels(t *testing.T) {
-	client, m := newTestManager(t, testConfig(),
-		service(testName, map[string]string{"statefulset": testName}),
-		service("per-pod", map[string]string{"statefulset.kubernetes.io/pod-name": testName + "-0", "kueue.x-k8s.io/managed": "true"}),
-		service("component", map[string]string{"app.kubernetes.io/component": "jupyter"}),
-		service("other", map[string]string{"statefulset": "other", "notebook-name": testName}),
-		service("headless", nil),
-	)
-	spec := notebookSpec()
-	spec.Labels = notebookPodLabels()
-	if _, err := m.Ensure(t.Context(), spec); err != nil {
-		t.Fatal(err)
-	}
-	d := getDeployment(t, client, testShadow)
-	want := map[string]string{
-		"statefulset": testName, "statefulset.kubernetes.io/pod-name": testName + "-0",
-		"app.kubernetes.io/component": testShadow, LabelShadow: "true", LabelShadowOf: testUID,
-	}
-	if !reflect.DeepEqual(d.Spec.Template.Labels, want) {
-		t.Errorf("pod template labels %v, want %v", d.Spec.Template.Labels, want)
-	}
-	if !reflect.DeepEqual(d.Spec.Selector.MatchLabels, map[string]string{"app.kubernetes.io/component": testShadow}) {
-		t.Errorf("selector %v", d.Spec.Selector.MatchLabels)
-	}
-	if _, ok := d.Labels["statefulset"]; ok {
-		t.Errorf("the Deployment itself carries the pod's labels: %v", d.Labels)
-	}
-
-	// Ended, the shadow forwards nothing: no Service may select it any more.
-	spec.Terminal = true
-	if _, err := m.Ensure(t.Context(), spec); err != nil {
-		t.Fatal(err)
-	}
-	d = getDeployment(t, client, testShadow)
-	if _, ok := d.Spec.Template.Labels["statefulset"]; ok {
-		t.Errorf("the logs-only shadow carries the pod's labels: %v", d.Spec.Template.Labels)
+	for name, change := range cases {
+		t.Run(name, func(t *testing.T) {
+			client, m := newTestManager(t, testConfig())
+			spec := notebookSpec()
+			change(&spec)
+			ref, err := m.Ensure(t.Context(), spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ref != (Ref{}) || len(client.Actions()) != 0 {
+				t.Fatalf("a job without tunnels got a shadow: ref %+v, actions %v", ref, client.Actions())
+			}
+		})
 	}
 }
 
@@ -623,7 +485,7 @@ func TestTemplateRendersEveryMode(t *testing.T) {
 							t.Fatal(err)
 						}
 					}
-					d, svc, err := render(cfg, spec, testShadow, ports, false)
+					d, svc, err := render(cfg, spec, testShadow, ports)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -693,16 +555,13 @@ func TestResourceName(t *testing.T) {
 }
 
 func TestNormalizeConfig(t *testing.T) {
-	t.Setenv(ExecutorImageEnv, "registry.example.org/kueue-offload-executor:from-env")
 	cfg := testConfig()
-	cfg.ExecutorImage = ""
 	cfg.ForwardTarget = ""
 	if err := NormalizeConfig(&cfg); err != nil {
 		t.Fatal(err)
 	}
 	want := Config{
-		Image: DefaultImage, ExecutorImage: "registry.example.org/kueue-offload-executor:from-env",
-		ExecutorURL: cfg.ExecutorURL, LoginHost: cfg.LoginHost, User: cfg.User, Port: 22,
+		Image: DefaultImage, LoginHost: cfg.LoginHost, User: cfg.User, Port: 22,
 		KeySecret: cfg.KeySecret, KeySecretKey: "ssh-privatekey", KnownHostsConfigMap: cfg.KnownHostsConfigMap,
 		NodeHostKeys: NodeHostKeysVerify, ForwardTarget: ForwardTargetLogin, ForwardMode: ForwardModePortForward,
 		NodeWaitTimeout: "2h",
@@ -711,8 +570,8 @@ func TestNormalizeConfig(t *testing.T) {
 	if !reflect.DeepEqual(cfg, want) {
 		t.Errorf("normalized\n%+v\nwant\n%+v", cfg, want)
 	}
-	if !cfg.alwaysShadow() || cfg.nodeWaitSeconds() != 7200 {
-		t.Errorf("alwaysShadow %v, nodeWaitSeconds %d", cfg.alwaysShadow(), cfg.nodeWaitSeconds())
+	if cfg.nodeWaitSeconds() != 7200 {
+		t.Errorf("nodeWaitSeconds %d", cfg.nodeWaitSeconds())
 	}
 
 	execMode := testConfig()
@@ -721,11 +580,7 @@ func TestNormalizeConfig(t *testing.T) {
 		t.Errorf("exec mode: %v, %+v", err, execMode)
 	}
 
-	t.Setenv(ExecutorImageEnv, "")
 	for name, broken := range map[string]func(*Config){
-		"no executor image":     func(c *Config) { c.ExecutorImage = "" },
-		"no executor url":       func(c *Config) { c.ExecutorURL = "" },
-		"executor url not http": func(c *Config) { c.ExecutorURL = "kueue-offload-executor:8000" },
 		"reverse without login": func(c *Config) { c.LoginHost, c.Reverse.Enabled = "", true },
 		"login host injection":  func(c *Config) { c.LoginHost = "login;id" },
 		"user with space":       func(c *Config) { c.User = "alice -oProxyCommand=id" },
@@ -755,9 +610,9 @@ func TestNormalizeConfig(t *testing.T) {
 	}
 }
 
-// Without a login node the shadow only streams logs: no user or key is needed, and
-// a tunnel is refused rather than rendered.
-func TestNoLoginHostIsLogsOnly(t *testing.T) {
+// Without a login node no user or key is needed, and a tunnel is refused rather
+// than rendered.
+func TestNoLoginHostRefusesTunnels(t *testing.T) {
 	cfg := testConfig()
 	cfg.LoginHost, cfg.User, cfg.KeySecret, cfg.KnownHostsConfigMap = "", "", "", ""
 	client, m := newTestManager(t, cfg)
@@ -770,11 +625,9 @@ func TestNoLoginHostIsLogsOnly(t *testing.T) {
 		t.Fatalf("writes %v", writes(client))
 	}
 	spec.Template = podTemplate()
-	ref, err := m.Ensure(t.Context(), spec)
-	if err != nil {
-		t.Fatal(err)
+	if ref, err := m.Ensure(t.Context(), spec); err != nil || ref != (Ref{}) {
+		t.Fatalf("a job without tunnels: ref %+v, %v", ref, err)
 	}
-	assertLogsOnly(t, client, ref)
 	if !ForwardsPorts(podTemplate(8888)) || ForwardsPorts(podTemplate()) {
 		t.Errorf("ForwardsPorts")
 	}

@@ -33,6 +33,7 @@ type site struct {
 	executorLostTimeout time.Duration
 	// maxQueueTime is 0 without a limit.
 	maxQueueTime       time.Duration
+	deferInterval      time.Duration
 	backoffLimitCount  int32
 	backoffBaseSeconds int32
 	backoffMaxSeconds  int32
@@ -44,6 +45,7 @@ func resolveSite(sc *v1alpha1.OffloadConfig) site {
 		config:              sc.Name,
 		pollInterval:        15 * time.Second,
 		executorLostTimeout: 10 * time.Minute,
+		deferInterval:       30 * time.Second,
 		flavors:             sc.Spec.Flavors,
 	}
 	if len(sc.Spec.Workers) > 0 {
@@ -57,6 +59,9 @@ func resolveSite(sc *v1alpha1.OffloadConfig) site {
 	}
 	if d := sc.Spec.MaxQueueTime; d != nil && d.Duration > 0 {
 		s.maxQueueTime = d.Duration
+	}
+	if d := sc.Spec.DeferInterval; d != nil && d.Duration > 0 {
+		s.deferInterval = d.Duration
 	}
 	rs := ptr.Deref(sc.Spec.RetryStrategy, kueue.ProvisioningRequestRetryStrategy{})
 	s.backoffLimitCount = max(ptr.Deref(rs.BackoffLimitCount, 3), 0)

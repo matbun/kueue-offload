@@ -89,7 +89,7 @@ func TestReverseTunnel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if names := containerNames(dep); names != "ssh-reverse,job-logs" {
+	if names := containerNames(dep); names != "ssh-reverse" {
 		t.Fatalf("shadow containers %s", names)
 	}
 	env := envOf(dep.Spec.Template.Spec.Containers[0])
@@ -138,6 +138,11 @@ func TestReverseRefusals(t *testing.T) {
 			r.Spec.PodSets[0].Template.Annotations[LauncherAnnotation] = "torchrun"
 			return r
 		}(), LauncherAnnotation},
+		{"site launcher from the flavor", enabled, func() *v1alpha1.OffloadRequest {
+			r := reverseRequest(2, reverseTarget+":5000")
+			r.Spec.PodSets[0].Annotations[LauncherAnnotation] = "torchrun"
+			return r
+		}(), LauncherAnnotation},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -151,7 +156,6 @@ func TestReverseRefusals(t *testing.T) {
 }
 
 func TestValidateConfigChecksReverse(t *testing.T) {
-	t.Setenv(shadow.ExecutorImageEnv, "")
 	base := func() Config {
 		c := testConfig("http://localhost:3000")
 		c.Shadow = shadowBlock()

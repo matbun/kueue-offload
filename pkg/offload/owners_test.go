@@ -13,29 +13,6 @@ import (
 
 var customKinds = []ownerKind{jobSetKind, trainJobKind}
 
-// terminalTypes are the condition types Kueue's integrations read, completed
-// then failed.
-var terminalTypes = map[string][2]string{"JobSet": {"Completed", "Failed"}, "TrainJob": {"Complete", "Failed"}}
-
-// condition returns the condition of type ty on an unstructured owner.
-func condition(t *testing.T, u *unstructured.Unstructured, ty string) map[string]any {
-	t.Helper()
-	conds, _, err := unstructured.NestedSlice(u.Object, "status", "conditions")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var found map[string]any
-	for _, raw := range conds {
-		if c, _ := raw.(map[string]any); c["type"] == ty {
-			if found != nil {
-				t.Errorf("condition %s set twice", ty)
-			}
-			found = c
-		}
-	}
-	return found
-}
-
 func TestCustomOwnerSubmit(t *testing.T) {
 	for _, k := range customKinds {
 		t.Run(k.gvk.Kind, func(t *testing.T) {
@@ -56,16 +33,17 @@ func TestCustomOwnerSubmit(t *testing.T) {
 	}
 }
 
+// A JobSet's or a TrainJob's job ends on the check, Ready: Kueue's integration
+// finishes the owner from its pods, which the node ends.
 func TestCustomOwnerTerminal(t *testing.T) {
 	cases := []struct {
-		name     string
-		failed   bool
-		detail   string
-		terminal string
-		message  string
+		name    string
+		failed  bool
+		detail  string
+		message string
 	}{
-		{"completed", false, "", "Completed", "job 123 completed"},
-		{"failed", true, "rank 1 exited 3", "Failed", "job 123 failed: rank 1 exited 3"},
+		{"completed", false, "", "job 123 completed"},
+		{"failed", true, "rank 1 exited 3", "job 123 failed: rank 1 exited 3"},
 	}
 	for _, k := range customKinds {
 		for _, tc := range cases {
@@ -74,38 +52,19 @@ func TestCustomOwnerTerminal(t *testing.T) {
 				e.submitted()
 				e.report(1, e.finished(!tc.failed, tc.detail))
 				e.reconcile()
-				u := e.custom(k)
-				types := terminalTypes[k.gvk.Kind]
-				ty, other := types[0], types[1]
-				if tc.failed {
-					ty, other = other, ty
+				if st := e.check("hpc-a"); st.State != kueue.CheckStateReady || st.Message != tc.message {
+					t.Errorf("check = %s %q, want Ready %q", st.State, st.Message, tc.message)
 				}
-				c := condition(t, u, ty)
-				if c == nil || c["status"] != "True" || c["reason"] != ReasonOffload || c["message"] != tc.message || c["lastTransitionTime"] == nil {
-					t.Errorf("condition %s = %v, want True %s %q", ty, c, ReasonOffload, tc.message)
+				if st, ok := e.custom(k).Object["status"]; ok {
+					t.Errorf("owner status written: %v", st)
 				}
-				if condition(t, u, other) != nil {
-					t.Errorf("condition %s also set", other)
-				}
-				state, _, _ := unstructured.NestedString(u.Object, "status", "terminalState")
-				if k.terminalState && state != tc.terminal {
-					t.Errorf("terminalState = %q, want %q", state, tc.terminal)
-				}
-				if !k.terminalState && state != "" {
-					t.Errorf("%s got terminalState %q", k.gvk.Kind, state)
-				}
-				if st := e.check("hpc-a"); st.State != kueue.CheckStatePending {
-					t.Errorf("check = %s, want Pending until the Workload finishes", st.State)
-				}
-				if len(e.job().Status.Conditions) != 0 {
-					t.Errorf("an unrelated Job was patched")
-				}
+				e.readyWrites()
 			})
 		}
 	}
 }
 
-func TestCustomOwnerRejected(t *testing.T) {
+func TestCustomOwnerFails(t *testing.T) {
 	const msg = "sbatch: error: Invalid account or account/partition combination specified"
 	for _, k := range customKinds {
 		t.Run(k.gvk.Kind, func(t *testing.T) {
@@ -115,12 +74,11 @@ func TestCustomOwnerRejected(t *testing.T) {
 				e.condition(st, v1alpha1.OffloadRequestAccepted, metav1.ConditionFalse, "Refused", msg)
 			})
 			e.reconcile()
-			if st := e.check("hpc-a"); st.State != kueue.CheckStateRejected || st.Message != msg {
-				t.Errorf("check = %s %q", st.State, st.Message)
+			if st := e.check("hpc-a"); st.State != kueue.CheckStateReady || st.Message != msg || e.failed() != msg {
+				t.Errorf("check = %s %q, failed %q", st.State, st.Message, e.failed())
 			}
-			c := condition(t, e.custom(k), "Failed")
-			if c == nil || c["status"] != "True" || c["reason"] != ReasonRejected || c["message"] != msg {
-				t.Errorf("condition Failed = %v, want True %s", c, ReasonRejected)
+			if st, ok := e.custom(k).Object["status"]; ok {
+				t.Errorf("owner status written: %v", st)
 			}
 		})
 	}

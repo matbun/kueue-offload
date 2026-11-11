@@ -9,12 +9,16 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/events"
 	"k8s.io/utils/ptr"
@@ -42,7 +46,9 @@ const (
 
 // recordingChecks stands in for the server-side apply writer, which the fake
 // client cannot merge as a list keyed by name. It records each write and
-// applies it to the stored Workload the way the API server would.
+// applies it to the stored Workload the way the API server would: the entry's
+// podSetUpdates only in state Ready, refused when they change while the check
+// stays Ready, as Kueue's webhook refuses them.
 type recordingChecks struct {
 	c      client.Client
 	writes []kueue.AdmissionCheckState
@@ -54,15 +60,22 @@ func (w *recordingChecks) WriteCheck(ctx context.Context, wl *kueue.Workload, st
 	if err := w.c.Get(ctx, client.ObjectKeyFromObject(wl), cur); err != nil {
 		return err
 	}
+	if st.State != kueue.CheckStateReady {
+		st.PodSetUpdates = nil
+	}
 	found := false
 	for i := range cur.Status.AdmissionChecks {
-		if cur.Status.AdmissionChecks[i].Name == st.Name {
-			cur.Status.AdmissionChecks[i].State = st.State
-			cur.Status.AdmissionChecks[i].Message = st.Message
-			cur.Status.AdmissionChecks[i].LastTransitionTime = st.LastTransitionTime
-			cur.Status.AdmissionChecks[i].RequeueAfterSeconds = st.RequeueAfterSeconds
-			found = true
+		ac := &cur.Status.AdmissionChecks[i]
+		if ac.Name != st.Name {
+			continue
 		}
+		if ac.State == kueue.CheckStateReady && st.State == kueue.CheckStateReady && !equality.Semantic.DeepEqual(ac.PodSetUpdates, st.PodSetUpdates) {
+			return apierrors.NewInvalid(schema.GroupKind{Group: kueue.GroupVersion.Group, Kind: "Workload"}, wl.Name,
+				field.ErrorList{field.Invalid(field.NewPath("status", "admissionChecks").Index(i).Child("podSetUpdates"), st.PodSetUpdates, "field is immutable")})
+		}
+		ac.State, ac.Message, ac.LastTransitionTime = st.State, st.Message, st.LastTransitionTime
+		ac.RequeueAfterSeconds, ac.PodSetUpdates = st.RequeueAfterSeconds, st.PodSetUpdates
+		found = true
 	}
 	if !found {
 		cur.Status.AdmissionChecks = append(cur.Status.AdmissionChecks, st)
@@ -311,6 +324,7 @@ func testClient(t *testing.T, objs []client.Object, funcs interceptor.Funcs) cli
 		WithStatusSubresource(&kueue.Workload{}, &kueue.AdmissionCheck{}, &v1alpha1.OffloadRequest{}, &v1alpha1.OffloadWorker{},
 			&batchv1.Job{}, &corev1.Pod{}, newUnstructured(jobSetKind), newUnstructured(trainJobKind)).
 		WithIndex(&v1alpha1.OffloadRequest{}, RequestWorkloadKey, indexRequestWorkload).
+		WithIndex(&corev1.Pod{}, PodWorkloadKey, indexPodWorkload).
 		WithIndex(&kueue.AdmissionCheck{}, AdmissionCheckUsingConfigKey,
 			admissioncheck.IndexerByConfigFunction(ControllerName, v1alpha1.GroupVersion.WithKind("OffloadConfig"))).
 		WithInterceptorFuncs(funcs).Build()
@@ -393,6 +407,42 @@ func (e *env) pod(name string) *corev1.Pod {
 		e.t.Fatal(err)
 	}
 	return p
+}
+
+// failed is the Workload's v1alpha1.FailedAnnotation, empty without one.
+func (e *env) failed() string {
+	e.t.Helper()
+	return e.workload().Annotations[v1alpha1.FailedAnnotation]
+}
+
+// testNode is the virtual node of check hpc-a.
+var testNode = v1alpha1.NodeName(testSite)
+
+// readyWrites checks that every Ready write of check hpc-a carries the
+// Workload's podSetUpdates for the check's node, and returns how many there
+// were.
+func (e *env) readyWrites() int {
+	e.t.Helper()
+	want := podSetUpdates(e.workload(), testNode)
+	n := 0
+	for _, w := range e.checks.writes {
+		if w.Name != "hpc-a" || w.State != kueue.CheckStateReady {
+			continue
+		}
+		n++
+		if !equality.Semantic.DeepEqual(w.PodSetUpdates, want) {
+			e.t.Errorf("Ready %q with podSetUpdates %+v, want %+v", w.Message, w.PodSetUpdates, want)
+		}
+	}
+	return n
+}
+
+// startedAt is the executor's report of job 123 running on node07 since start.
+func (e *env) startedAt(start time.Time) func(st *v1alpha1.OffloadRequestStatus) {
+	return func(st *v1alpha1.OffloadRequestStatus) {
+		e.queued("123", "", "")(st)
+		e.running("node07", ptr.To(metav1.NewTime(start)))(st)
+	}
 }
 
 func findCheck(wl *kueue.Workload, name kueue.AdmissionCheckReference) *kueue.AdmissionCheckState {
@@ -573,13 +623,4 @@ func hasEvent(evs []string, prefix string) bool {
 		}
 	}
 	return false
-}
-
-func jobCondition(j *batchv1.Job, ty batchv1.JobConditionType) *batchv1.JobCondition {
-	for i := range j.Status.Conditions {
-		if j.Status.Conditions[i].Type == ty {
-			return &j.Status.Conditions[i]
-		}
-	}
-	return nil
 }

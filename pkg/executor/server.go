@@ -4,8 +4,8 @@
 // PodSets into member pods and sends each to an interLink API server's /create,
 // as a virtual kubelet sends a pod, so the plugin behind it runs them (one pod:
 // one job; several: one job of a pod group, or one job each for independent
-// pods). A plugin that lists podset-create gets a pod group's members in one
-// /createPodSets instead. On every poll it maps the members' /status to the
+// pods). A plugin that lists pod-group-create gets a pod group's members in one
+// /createPodGroup instead. On every poll it maps the members' /status to the
 // request's status, and once the request is deleted it deletes the members and
 // removes what it made for them. What it keeps about a request lives in the
 // request's status.
@@ -27,12 +27,14 @@ import (
 	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/matbun/kueue-offload/api/v1alpha1"
+	"github.com/matbun/kueue-offload/pkg/executorapi"
 	"github.com/matbun/kueue-offload/pkg/shadow"
 )
 
@@ -51,9 +53,9 @@ type jobRequest struct {
 	WorkloadName string
 	Namespace    string
 	Owner        v1alpha1.OwnerReference
-	OwnerLabels  map[string]string
 	Site         string
 	Account      string
+	Attempt      int32
 	PodSets      []v1alpha1.PodSet
 }
 
@@ -63,9 +65,9 @@ func jobRequestOf(q *v1alpha1.OffloadRequest) jobRequest {
 		WorkloadName: q.Spec.Workload.Name,
 		Namespace:    q.Namespace,
 		Owner:        q.Spec.Owner,
-		OwnerLabels:  q.Spec.OwnerLabels,
 		Site:         q.Spec.Site,
 		Account:      q.Spec.Account,
+		Attempt:      q.Spec.Attempt,
 	}
 	for _, ps := range q.Spec.PodSets {
 		ps := *ps.DeepCopy()
@@ -78,6 +80,7 @@ func jobRequestOf(q *v1alpha1.OffloadRequest) jobRequest {
 			}
 			ps.Template.Annotations[k] = v
 		}
+		dropDisabledInitContainers(&ps.Template)
 		req.PodSets = append(req.PodSets, ps)
 	}
 	return req
@@ -99,10 +102,13 @@ type Executor struct {
 	// Shadow renders the shadows. Nil: no shadows.
 	Shadow ShadowManager
 
-	// shadowsEnded holds the requests whose shadow was rendered for the job's
-	// end. It is not kept across restarts: rendering it once more is idempotent.
+	// shadowsEnded holds the requests whose shadow was deleted at the job's end,
+	// cancelled the deleted requests whose job, shadow and stage-in Job are
+	// gone while their copy back runs. They are not kept across restarts: doing
+	// either once more is idempotent.
 	mu           sync.Mutex
 	shadowsEnded map[types.UID]bool
+	cancelled    map[types.UID]bool
 	// healthyUntil is when the last successful ping stops answering /healthz;
 	// caps are the capabilities that ping listed, once capsKnown.
 	healthMu     sync.Mutex
@@ -116,12 +122,15 @@ var workloadUIDPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4
 
 // New returns an Executor. c and reader may be the same client.
 func New(cfg Config, il *InterLink, kube kubernetes.Interface, c client.Client, reader client.Reader, shadow ShadowManager) *Executor {
-	return &Executor{Config: cfg, InterLink: il, Kube: kube, Client: c, Reader: reader, Shadow: shadow, shadowsEnded: map[types.UID]bool{}}
+	return &Executor{Config: cfg, InterLink: il, Kube: kube, Client: c, Reader: reader, Shadow: shadow,
+		shadowsEnded: map[types.UID]bool{}, cancelled: map[types.UID]bool{}}
 }
 
-// RegisterRoutes adds the executor's HTTP API, for the shadows, to mux.
+// RegisterRoutes adds the executor's HTTP API, for the offload controller, to
+// mux.
 func (d *Executor) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /getLogs", d.GetLogsHandler)
+	mux.HandleFunc("GET "+executorapi.GetLogsPath, d.GetLogsHandler)
+	mux.HandleFunc(executorapi.ExecPath, d.ExecHandler)
 	mux.HandleFunc("GET /healthz", d.HealthzHandler)
 }
 
@@ -204,6 +213,12 @@ func (d *Executor) validateSubmit(req jobRequest) *refusal {
 	if total > maxWorkloadMembers {
 		return permanentError("the workload has %d members, more than %d", total, maxWorkloadMembers)
 	}
+	if aerr := validateResources(req, site.Resources); aerr != nil {
+		return aerr
+	}
+	if aerr := validateFlags(req, site.AllowedFlags); aerr != nil {
+		return aerr
+	}
 	if podGroup(req) {
 		if aerr := validatePodSetsShareAllocation(req.PodSets); aerr != nil {
 			return aerr
@@ -218,8 +233,82 @@ func (d *Executor) validateSubmit(req jobRequest) *refusal {
 	return d.validateStaging(req)
 }
 
+// Annotations of a template that ask Slurm for options of the workload's own.
+const (
+	SlurmFlagsAnnotation  = "slurm-job.vk.io/flags"
+	SlurmFlavorAnnotation = "slurm-job.vk.io/flavor"
+)
+
+// validateResources refuses a template whose members the site cannot size: one
+// node each, with 1 to GPUsPerMember GPUs and either no CPU or CPUsPerGPU per GPU.
+// Kueue charged the Workload by its templates, so the executor adds no GPU and
+// changes no CPU the user set.
+func validateResources(req jobRequest, res *SiteResources) *refusal {
+	if res == nil {
+		return nil
+	}
+	for _, ps := range req.PodSets {
+		gpus := templateGPUs(ps.Template.Spec, res)
+		if gpus < 1 || gpus > res.GPUsPerMember {
+			return permanentError("PodSet %s asks for %d %s: a pod gets at most one node, %d GPUs: ask for 1 to %d %s",
+				ps.Name, gpus, res.GPUResource, res.GPUsPerMember, res.GPUsPerMember, res.GPUResource)
+		}
+		want := res.CPUsPerGPU * gpus
+		if cpu, set := templateCPU(ps.Template.Spec); set && cpu.Cmp(*resource.NewQuantity(want, resource.DecimalSI)) != 0 {
+			return permanentError("PodSet %s asks for %s CPUs with %d %s: resources are allocated automatically, %d cores per GPU: leave cpu out or set it to %d",
+				ps.Name, cpu.String(), gpus, res.GPUResource, res.CPUsPerGPU, want)
+		}
+	}
+	return nil
+}
+
+// validateFlags refuses Slurm options a workload gives itself, in its owner's or
+// templates' annotations, beyond what the site allows. The options of its Kueue
+// flavor, the PodSets' own annotations, are the site's.
+func validateFlags(req jobRequest, allowed *AllowedFlags) *refusal {
+	if allowed == nil {
+		return nil
+	}
+	for _, ps := range req.PodSets {
+		ann := ps.Template.Annotations
+		if unlistedFlag(ann[SlurmFlagsAnnotation], allowed.Flags) != "" {
+			return permanentError("the Slurm options come from the site, the pod's GPUs and its time limit: %s may set %s; PodSet %s has %q",
+				SlurmFlagsAnnotation, onlyOrNone(allowed.Flags, "no option"), ps.Name, ann[SlurmFlagsAnnotation])
+		}
+		if f := ann[SlurmFlavorAnnotation]; f != "" && !slices.Contains(allowed.Flavors, f) {
+			return permanentError("the Slurm options come from the site, the pod's GPUs and its time limit: %s may name %s; PodSet %s has %q",
+				SlurmFlavorAnnotation, onlyOrNone(allowed.Flavors, "no flavor"), ps.Name, f)
+		}
+	}
+	return nil
+}
+
+// unlistedFlag returns the first option of flags whose name is not allowed, or a
+// value that follows no option.
+func unlistedFlag(flags string, allowed []string) string {
+	for i, tok := range strings.Fields(flags) {
+		name, _, _ := strings.Cut(tok, "=")
+		switch {
+		case !strings.HasPrefix(tok, "-"):
+			if i == 0 {
+				return tok
+			}
+		case !slices.Contains(allowed, name):
+			return tok
+		}
+	}
+	return ""
+}
+
+func onlyOrNone(list []string, none string) string {
+	if len(list) == 0 {
+		return none
+	}
+	return "only " + strings.Join(list, ", ")
+}
+
 // validateTunnels refuses the tunnels of a site whose Shadow block names no login
-// node: its shadows only stream logs (backends.md section 6). The shadow serves
+// node, through which they would go (backends.md section 6). The shadow serves
 // the head's template.
 func (d *Executor) validateTunnels(req jobRequest) *refusal {
 	cfg := d.Config.Shadow
@@ -262,11 +351,13 @@ func validatePodSetsShareAllocation(podSets []v1alpha1.PodSet) *refusal {
 	return nil
 }
 
-// submitRequest is the request's workload as its members are built: with the
-// ServiceAccount directory the API server would add to its pods.
+// submitRequest is the request's workload as its members are built: sized for
+// the site, with the ServiceAccount directory the API server would add to its pods.
 func (d *Executor) submitRequest(q *v1alpha1.OffloadRequest) jobRequest {
 	req := jobRequestOf(q)
+	res := d.Config.Sites[req.Site].Resources
 	for p := range req.PodSets {
+		withSiteResources(&req.PodSets[p], res)
 		withServiceAccountDir(&req.PodSets[p], d.Config.Executor.AutomountServiceAccountToken)
 	}
 	return req
@@ -274,7 +365,9 @@ func (d *Executor) submitRequest(q *v1alpha1.OffloadRequest) jobRequest {
 
 // submit runs the workload of q, staging it in first, and records the job in
 // q's status: its ID and every rank, a rank without a podUID waiting for the
-// site to take it. The caller writes the status.
+// site to take it. On a plugin that answers estimates, the first call of an
+// attempt records the site's start estimate instead and submits nothing
+// (estimate). The caller writes the status.
 func (d *Executor) submit(ctx context.Context, q *v1alpha1.OffloadRequest) *refusal {
 	// A caller that gives up does not stop a submit halfway.
 	ctx = context.WithoutCancel(ctx)
@@ -283,7 +376,7 @@ func (d *Executor) submit(ctx context.Context, q *v1alpha1.OffloadRequest) *refu
 	if aerr := d.checkShape(ctx, req); aerr != nil {
 		return aerr
 	}
-	podSets, aerr := d.createsPodSets(ctx, req)
+	groupCall, aerr := d.createsPodGroup(ctx, req)
 	if aerr != nil {
 		return aerr
 	}
@@ -296,6 +389,9 @@ func (d *Executor) submit(ctx context.Context, q *v1alpha1.OffloadRequest) *refu
 		if refs[p], aerr = d.fetchRefs(ctx, req.Namespace, ps); aerr != nil {
 			return aerr
 		}
+	}
+	if d.estimate(ctx, q, req) {
+		return nil
 	}
 	if aerr := d.stageIn(ctx, q, req); aerr != nil {
 		return aerr
@@ -320,24 +416,24 @@ func (d *Executor) submit(ctx context.Context, q *v1alpha1.OffloadRequest) *refu
 
 	// The members go in rank order. A plugin that runs a pod group as one job
 	// answers the members before the last with no job ID, or takes them all in
-	// one /createPodSets; independent members each get their own job.
+	// one /createPodGroup; independent members each get their own job.
 	group := podGroup(req)
 	ranks := make([]v1alpha1.RankStatus, count)
 	var jobIDs []string
 	pending, pendingMessage := 0, ""
-	if podSets {
-		jobID, aerr := d.createPodSets(ctx, req, members, creates)
+	if groupCall {
+		jobID, aerr := d.createPodGroup(ctx, req, members, creates)
 		if aerr != nil {
 			return aerr
 		}
-		podSets = jobID != ""
-		if podSets {
+		groupCall = jobID != ""
+		if groupCall {
 			jobIDs = append(jobIDs, jobID)
 		}
 	}
 	for i, create := range creates {
 		ranks[i] = v1alpha1.RankStatus{Rank: int32(i), State: v1alpha1.RankQueued}
-		if podSets {
+		if groupCall {
 			ranks[i].PodUID = string(members[i].UID)
 			continue
 		}
@@ -388,6 +484,97 @@ func (d *Executor) submit(ctx context.Context, q *v1alpha1.OffloadRequest) *refu
 	return nil
 }
 
+// submitLimitPattern finds, in a site's refusal to estimate a job, a limit on
+// the jobs a user or account may have submitted at once, in Slurm's names
+// (QOSMaxSubmitJobPerUserLimit, AssocMaxSubmitJobLimit): the site takes the job
+// once one of those ended.
+var submitLimitPattern = regexp.MustCompile(`(QOS|Assoc)MaxSubmitJob[A-Za-z]*|MaxSubmitJobs?Limit`)
+
+// estimate asks the site when it would start the job of req, on a plugin that
+// lists capability estimate, until it answers or something of the attempt is
+// created: its stage-in started or its job submitted. It records the answer in
+// q's status: the start time, or that the site gives none while a submit limit
+// holds. It then reports true, and the submit waits for the next poll: in
+// between, the offload controller gives the attempt up when the start is
+// further away than its OffloadConfig's maxStartDelay. Any other failure to
+// answer, an API server without /estimate included, is logged, and the job goes
+// without an estimate.
+func (d *Executor) estimate(ctx context.Context, q *v1alpha1.OffloadRequest, req jobRequest) bool {
+	staging := meta.FindStatusCondition(q.Status.Conditions, v1alpha1.OffloadRequestStagingIn) != nil
+	if q.Status.Estimate != nil || staging || !d.estimates(ctx) {
+		return false
+	}
+	shape := estimateShape(req, d.Config.Sites[req.Site].Resources, q.Spec.MaximumExecutionTimeSeconds)
+	e := &v1alpha1.StartEstimate{ProbeTime: metav1.Now().Rfc3339Copy(), Nodes: int32(shape.Nodes)}
+	answer, err := d.InterLink.Estimate(ctx, req.WorkloadUID, shape)
+	var pe *PluginError
+	switch {
+	case err == nil && !answer.Start.IsZero():
+		start := metav1.NewTime(answer.Start).Rfc3339Copy()
+		e.StartTime = &start
+		log.L.Infof("executor: request %s/%s: the site expects to start %d node(s) at %s", q.Namespace, q.Name, shape.Nodes, start.UTC().Format(time.RFC3339))
+	case errors.As(err, &pe) && submitLimitPattern.MatchString(pe.Message):
+		e.Reason, e.Message = submitLimitPattern.FindString(pe.Message), pe.Message
+		log.L.Infof("executor: request %s/%s: the site gives no start time (%s)", q.Namespace, q.Name, e.Reason)
+	default:
+		if err == nil {
+			err = errors.New("the answer has no start time")
+		}
+		log.L.Warningf("executor: request %s/%s goes without a start estimate: %v", q.Namespace, q.Name, err)
+		return false
+	}
+	q.Status.Estimate = e
+	q.Status.Reason, q.Status.Message = "", ""
+	return true
+}
+
+// timeFlag finds sbatch's own time option in scheduler flags.
+var timeFlag = regexp.MustCompile(`(^|\s)(--time[= ]|-t ?[0-9])`)
+
+// estimateShape is the job of req as /estimate takes it: one node per member of
+// a pod group, else the one node of its first job; the most GPUs and CPUs a
+// PodSet's member asks for; the head member's scheduler flags, its flavor's
+// included; and, when those flags carry no --time of their own (the one the job
+// gets), the wall time in whole minutes.
+func estimateShape(req jobRequest, res *SiteResources, wallSeconds *int32) EstimateRequest {
+	shape := EstimateRequest{Nodes: 1}
+	if podGroup(req) {
+		shape.Nodes = workloadMembers(req)
+	}
+	for _, ps := range req.PodSets {
+		shape.GPUsPerNode = max(shape.GPUsPerNode, int(siteGPUs(ps.Template.Spec, res)))
+		if cpu, set := templateCPU(ps.Template.Spec); set {
+			shape.CPUsPerNode = max(shape.CPUsPerNode, int(cpu.Value()))
+		}
+	}
+	shape.Flags = buildMember(req, 0).Annotations[SlurmFlagsAnnotation]
+	if wallSeconds != nil && *wallSeconds > 0 && !timeFlag.MatchString(shape.Flags) {
+		minutes := (*wallSeconds + 59) / 60
+		shape.Time = fmt.Sprintf("%02d:%02d:00", minutes/60, minutes%60)
+	}
+	return shape
+}
+
+// siteGPUs is the GPUs a template asks for: under the site's GPUResource or its
+// aliases with Resources, else under any <vendor>/gpu resource, as the Slurm
+// plugin counts nvidia.com/gpu and amd.com/gpu.
+func siteGPUs(spec v1.PodSpec, res *SiteResources) int64 {
+	if res != nil {
+		return templateGPUs(spec, res)
+	}
+	var n int64
+	for _, c := range spec.Containers {
+		r := c.Resources.DeepCopy()
+		requestsAsLimits(r)
+		for name, q := range r.Limits {
+			if strings.HasSuffix(string(name), "/gpu") {
+				n += q.Value()
+			}
+		}
+	}
+	return n
+}
+
 // memberCreate builds rank i of the workload and its /create request.
 func (d *Executor) memberCreate(req jobRequest, refs []podRefs, reverse *shadow.ReverseTunnel, i int) (*v1.Pod, commonIL.PodCreateRequests, *refusal) {
 	pod := buildMember(req, i)
@@ -405,43 +592,35 @@ func (d *Executor) memberCreate(req jobRequest, refs []podRefs, reverse *shadow.
 	return pod, create, aerr
 }
 
-// createPodSets sends the members of a pod group in one /createPodSets call, by
-// PodSet in rank order, and returns the group's job ID. A failed call deletes
-// the members, as a failed /create does, and so does an answer that is not one
+// createPodGroup sends the members of a pod group in one /createPodGroup call,
+// in rank order, and returns the group's job ID. A failed call deletes the
+// members, as a failed /create does, and so does an answer that is not one
 // entry per member, in rank order, all with the same job ID. It returns no job
-// ID and no refusal when the call answers 404: the plugin lists podset-create,
-// but the API server in front of it has no such route and submitted nothing, so
-// the members go to /create one by one.
-func (d *Executor) createPodSets(ctx context.Context, req jobRequest, members []*v1.Pod, creates []commonIL.PodCreateRequests) (string, *refusal) {
-	body := PodSetsCreateRequests{GroupUID: req.WorkloadUID, PodSets: make([]PodSetCreateRequests, len(req.PodSets))}
-	for p, ps := range req.PodSets {
-		body.PodSets[p].Name = string(ps.Name)
-	}
-	for i, create := range creates {
-		p := memberPodSet(req, i)
-		body.PodSets[p].Pods = append(body.PodSets[p].Pods, create)
-	}
-	res, err := d.InterLink.CreatePodSets(ctx, req.WorkloadUID, body)
+// ID and no refusal when the call answers 404: the plugin lists
+// pod-group-create, but the API server in front of it has no such route and
+// submitted nothing, so the members go to /create one by one.
+func (d *Executor) createPodGroup(ctx context.Context, req jobRequest, members []*v1.Pod, creates []commonIL.PodCreateRequests) (string, *refusal) {
+	res, err := d.InterLink.CreatePodGroup(ctx, req.WorkloadUID, PodGroupCreateRequests{GroupUID: req.WorkloadUID, Pods: creates})
 	if pluginCode(err) == http.StatusNotFound {
-		log.L.Warning("executor: workload ", req.WorkloadUID, ": the interLink API server has no /createPodSets, the members go to /create")
+		log.L.Warning("executor: workload ", req.WorkloadUID, ": the interLink API server has no /createPodGroup, the members go to /create")
 		return "", nil
 	}
 	if err != nil {
 		d.deleteMembersQuietly(ctx, req.WorkloadUID, members)
 		return "", createRefusal(err)
 	}
-	jobID, problem := podSetsJobID(res, members)
+	jobID, problem := podGroupJobID(res, members)
 	if problem != "" {
 		d.deleteMembersQuietly(ctx, req.WorkloadUID, members)
-		return "", transientError("the job of workload %s was not submitted: the answer to /createPodSets %s", req.WorkloadUID, problem)
+		return "", transientError("the job of workload %s was not submitted: the answer to /createPodGroup %s", req.WorkloadUID, problem)
 	}
 	return jobID, nil
 }
 
-// podSetsJobID returns the job ID of an answer to /createPodSets, or what is
+// podGroupJobID returns the job ID of an answer to /createPodGroup, or what is
 // wrong with the answer: it lists every member once, in rank order, all with
 // the same job ID.
-func podSetsJobID(res []commonIL.CreateStruct, members []*v1.Pod) (jobID, problem string) {
+func podGroupJobID(res []commonIL.CreateStruct, members []*v1.Pod) (jobID, problem string) {
 	if len(res) != len(members) {
 		return "", fmt.Sprintf("lists %d pods, not the %d members", len(res), len(members))
 	}
@@ -674,7 +853,8 @@ func (d *Executor) observe(ctx context.Context, q *v1alpha1.OffloadRequest, req 
 		if !found && missingRank < 0 {
 			missingRank = i
 		}
-		rank := v1alpha1.RankStatus{Rank: int32(i), PodUID: uid, JobID: ps.JobID, Containers: ps.Containers}
+		rank := v1alpha1.RankStatus{Rank: int32(i), PodUID: uid, JobID: ps.JobID, NodeName: ps.NodeName,
+			Containers: ps.Containers, InitContainers: ps.InitContainers}
 		if rank.JobID == "" && i < len(q.Status.Ranks) {
 			// The job /create named, while the plugin's status does not.
 			rank.JobID = q.Status.Ranks[i].JobID
@@ -845,37 +1025,37 @@ func jobTimes(statuses []commonIL.PodStatus) (start, end *metav1.Time) {
 	return start, end
 }
 
-// templateExposesPorts reports whether a container of the template declares a port.
-func templateExposesPorts(t v1.PodTemplateSpec) bool {
-	for _, c := range t.Spec.Containers {
-		if len(c.Ports) > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// syncShadow keeps the workload's shadow in step with the job: one Ensure per
-// poll while it runs on a known node, one more with Terminal set once it ended.
-// It records the shadow's names, and its pod's IP and readiness, in q's status.
+// syncShadow keeps the shadow of a workload that forwards ports or tunnels back
+// in step with the job: one Ensure per poll while it runs on a known node. Once
+// the job ended it deletes the shadow, once per request since the executor
+// started. It records the shadow's names, and its pod's IP and readiness, in q's
+// status.
 func (d *Executor) syncShadow(ctx context.Context, q *v1alpha1.OffloadRequest, req jobRequest, st jobState) {
-	cfg := d.Config
 	terminal := isTerminalJobState(st.State)
-	if !cfg.Shadow.Enabled || d.Shadow == nil || (terminal && d.shadowEnded(q.UID)) {
+	ps := req.PodSets[0]
+	tunnels := shadow.ForwardsPorts(ps.Template) || shadow.HasReverseAnnotations(ps.Template.Annotations)
+	if !d.Config.Shadow.Enabled || d.Shadow == nil || !tunnels || (terminal && d.shadowEnded(q.UID)) {
 		return
 	}
-	ps := req.PodSets[0]
+	if terminal {
+		if err := d.Shadow.Delete(ctx, req.WorkloadUID); err != nil {
+			log.L.Warning("executor: deleting the shadow of workload ", req.WorkloadUID, ": ", err)
+			return
+		}
+		q.Status.Shadow = nil
+		d.mu.Lock()
+		d.shadowsEnded[q.UID] = true
+		d.mu.Unlock()
+		return
+	}
+	if st.State != jobRunning || st.NodeName == "" {
+		return
+	}
 	reverse, aerr := d.reverseTunnel(req)
 	if aerr != nil {
 		log.L.Warning("executor: shadow of workload ", req.WorkloadUID, " without its reverse tunnel: ", aerr.msg)
 	}
-	if !templateExposesPorts(ps.Template) && reverse == nil && !cfg.Shadow.AlwaysShadowEnabled() {
-		return
-	}
-	// A tunnel needs the node. A shadow that only streams logs starts as soon as
-	// the job runs, also on a backend that reports no node.
-	tunnels := reverse != nil || shadow.ForwardsPorts(ps.Template)
-	if !terminal && (st.State != jobRunning || (st.NodeName == "" && tunnels)) {
+	if reverse == nil && !shadow.ForwardsPorts(ps.Template) {
 		return
 	}
 	spec := ShadowSpec{
@@ -885,9 +1065,7 @@ func (d *Executor) syncShadow(ctx context.Context, q *v1alpha1.OffloadRequest, r
 		Template:     ps.Template,
 		NodeName:     st.NodeName,
 		SocketDir:    st.SocketDir,
-		Terminal:     terminal,
 		Reverse:      reverse,
-		Labels:       req.OwnerLabels,
 	}
 	ref, err := d.Shadow.Ensure(ctx, spec)
 	if err != nil {
@@ -895,11 +1073,6 @@ func (d *Executor) syncShadow(ctx context.Context, q *v1alpha1.OffloadRequest, r
 		return
 	}
 	q.Status.Shadow = &v1alpha1.ShadowReference{Deployment: ref.Deployment, Service: ref.Service, PodIP: ref.PodIP, Ready: ref.Ready}
-	if terminal {
-		d.mu.Lock()
-		d.shadowsEnded[q.UID] = true
-		d.mu.Unlock()
-	}
 }
 
 func (d *Executor) shadowEnded(uid types.UID) bool {
@@ -909,8 +1082,9 @@ func (d *Executor) shadowEnded(uid types.UID) bool {
 }
 
 // cancel deletes the members of q, which cancels its job unless it ended, and
-// removes its shadow and its stage Jobs. On an error the caller keeps the
-// executor's finalizer, so that it is tried again.
+// removes its shadow and its stage-in Job; its stage-out Job stays, for the copy
+// back and its log. On an error the caller keeps the executor's finalizer, so
+// that it is tried again.
 func (d *Executor) cancel(ctx context.Context, q *v1alpha1.OffloadRequest) error {
 	req := jobRequestOf(q)
 	uid := req.WorkloadUID
@@ -921,10 +1095,11 @@ func (d *Executor) cancel(ctx context.Context, q *v1alpha1.OffloadRequest) error
 		return fmt.Errorf("deleting the shadow of workload %s: %w", uid, err)
 	}
 	if err := d.deleteStageJobs(ctx, uid); err != nil {
-		return fmt.Errorf("deleting the stage Jobs of workload %s: %w", uid, err)
+		return fmt.Errorf("deleting the stage-in Job of workload %s: %w", uid, err)
 	}
 	d.mu.Lock()
 	delete(d.shadowsEnded, q.UID)
+	d.cancelled[q.UID] = true
 	d.mu.Unlock()
 	log.L.Infof("executor: request %s/%s deleted (job %s)", q.Namespace, q.Name, q.Status.JobID)
 	return nil

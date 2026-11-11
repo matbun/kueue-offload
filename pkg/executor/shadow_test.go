@@ -2,6 +2,9 @@ package executor
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,17 +20,14 @@ import (
 
 func shadowBlock() ShadowConfig {
 	return ShadowConfig{
-		Enabled:       true,
-		ExecutorImage: "registry.example.org/kueue-offload:test",
-		ExecutorURL:   "http://kueue-offload-executor:8000",
-		LoginHost:     "login.hpc-a.example.org",
-		User:          "alice",
-		KeySecret:     "hpc-a-tunnel-key",
+		Enabled:   true,
+		LoginHost: "login.hpc-a.example.org",
+		User:      "alice",
+		KeySecret: "hpc-a-tunnel-key",
 	}
 }
 
 func TestValidateConfigChecksShadow(t *testing.T) {
-	t.Setenv(shadow.ExecutorImageEnv, "")
 	base := func() Config {
 		c := testConfig("http://localhost:3000")
 		c.Shadow = shadowBlock()
@@ -39,10 +39,8 @@ func TestValidateConfigChecksShadow(t *testing.T) {
 	}
 
 	bad := map[string]func(*Config){
-		"no executor URL":   func(c *Config) { c.Shadow.ExecutorURL = "" },
-		"no executor image": func(c *Config) { c.Shadow.ExecutorImage = "" },
-		"no key Secret":     func(c *Config) { c.Shadow.KeySecret = "" },
-		"no user":           func(c *Config) { c.Shadow.User = "" },
+		"no key Secret": func(c *Config) { c.Shadow.KeySecret = "" },
+		"no user":       func(c *Config) { c.Shadow.User = "" },
 		"reverse without login": func(c *Config) {
 			c.Shadow.LoginHost, c.Shadow.Reverse.Enabled = "", true
 		},
@@ -58,24 +56,29 @@ func TestValidateConfigChecksShadow(t *testing.T) {
 		}
 	}
 
-	// No login node: logs-only shadows, with neither user nor key.
+	// No login node: no tunnels, so neither user nor key.
 	c = base()
 	c.Shadow.LoginHost, c.Shadow.User, c.Shadow.KeySecret = "", "", ""
 	if err := c.Validate(); err != nil {
-		t.Fatalf("logs-only Shadow block refused: %v", err)
+		t.Fatalf("Shadow block without a login node refused: %v", err)
 	}
-
-	t.Setenv(shadow.ExecutorImageEnv, "registry.example.org/kueue-offload:env")
-	c = base()
-	c.Shadow.ExecutorImage = ""
-	if err := c.Validate(); err != nil {
-		t.Fatalf("ExecutorImage from %s refused: %v", shadow.ExecutorImageEnv, err)
+	// The logs-only shadow's keys are gone: the executor refuses unknown keys.
+	path := filepath.Join(t.TempDir(), "executor.yaml")
+	for _, key := range []string{"AlwaysShadow: true", "ExecutorURL: http://kueue-offload-executor:8000", "ExecutorImage: executor:1"} {
+		raw := "InterLink: {URL: http://localhost:3000}\nExecutor: {Namespace: " + executorNS + "}\n" +
+			"Sites: {" + executorSite + ": {AllowedAccounts: [" + executorAccount + "]}}\nShadow:\n  Enabled: true\n  " + key + "\n"
+		if err := os.WriteFile(path, []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadConfig(path); err == nil || !strings.Contains(err.Error(), strings.SplitN(key, ":", 2)[0]) {
+			t.Errorf("Shadow.%s: %v", key, err)
+		}
 	}
 }
 
 // TestWithShadowManager runs a request with the real shadow manager on a fake
-// cluster: the shadow appears once the job runs, loses its tunnel when the job
-// ends, and goes with the request.
+// cluster: the shadow appears once the job runs and is deleted when the job
+// ends, once per executor run.
 func TestWithShadowManager(t *testing.T) {
 	e := newExecutorEnv(t)
 	e.d.Config.Shadow = shadowBlock()
@@ -114,12 +117,12 @@ func TestWithShadowManager(t *testing.T) {
 	if dep.Labels[shadow.LabelShadowOf] != executorWorkload {
 		t.Errorf("Deployment labels: %v", dep.Labels)
 	}
-	forward, logs := shadowContainers(t, dep)
+	if names := containerNames(dep); names != "ssh-forward" {
+		t.Fatalf("shadow containers %s", names)
+	}
+	forward := dep.Spec.Template.Spec.Containers[0]
 	if !strings.Contains(strings.Join(forward.Args, " ")+strings.Join(forward.Command, " "), "alice@login.hpc-a.example.org") {
 		t.Errorf("ssh-forward does not reach the site's login node as its user:\n%v %v", forward.Command, forward.Args)
-	}
-	if logs.Image != "registry.example.org/kueue-offload:test" || strings.Join(logs.Command, " ") != "/executor logs --executor http://kueue-offload-executor:8000 --workload "+executorWorkload+" --follow" {
-		t.Errorf("job-logs: image %s, command %v", logs.Image, logs.Command)
 	}
 	if _, err := services.Get(ctx, st.Shadow.Service, metav1.GetOptions{}); err != nil {
 		t.Fatalf("Service of a running job with a port: %v", err)
@@ -129,33 +132,39 @@ func TestWithShadowManager(t *testing.T) {
 	}
 
 	e.setStatus(0, "node07", terminatedContainer(executorCtn, 0, "Completed", time.Now(), time.Now()))
+	name := st.Shadow.Deployment
 	q = e.poll()
-	st = q.Status
-	if state(q) != "succeeded" || st.Shadow == nil || st.Shadow.Service != "" {
-		t.Fatalf("completed: state %s, shadow %+v", state(q), st.Shadow)
+	if state(q) != "succeeded" || q.Status.Shadow != nil {
+		t.Fatalf("completed: state %s, shadow %+v", state(q), q.Status.Shadow)
 	}
-	if _, err := services.Get(ctx, st.Shadow.Deployment, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+	if _, err := deployments.Get(ctx, name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("the shadow outlived the job: %v", err)
+	}
+	if _, err := services.Get(ctx, name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
 		t.Fatalf("the Service outlived the job: %v", err)
 	}
-	dep, err = deployments.Get(ctx, st.Shadow.Deployment, metav1.GetOptions{})
-	if err != nil {
-		t.Fatalf("the logs-only shadow is gone: %v", err)
+	if list, _ := configMaps.List(ctx, selector); len(list.Items) != 0 {
+		t.Fatalf("%d shadow ConfigMaps outlived the job", len(list.Items))
 	}
-	if names := containerNames(dep); names != "job-logs" {
-		t.Fatalf("logs-only shadow runs %s", names)
-	}
-	before := len(e.kube.Actions())
-	e.poll()
-	for _, a := range e.kube.Actions()[before:] {
-		if a.GetVerb() != "get" && a.GetVerb() != "list" {
-			t.Errorf("an ended job's shadow was changed again: %s %s", a.GetVerb(), a.GetResource().Resource)
+	deletes := func() int {
+		n := 0
+		for _, a := range e.kube.Actions() {
+			if a.GetVerb() == "list" && a.GetResource().Resource == "deployments" {
+				n++
+			}
 		}
+		return n
 	}
-	// A restarted executor renders it for the end once more, unchanged.
+	before := deletes()
+	e.poll()
+	if deletes() != before {
+		t.Errorf("an ended job's shadow was deleted again")
+	}
+	// A restarted executor deletes it once more, finding nothing.
 	e.restart()
 	e.poll()
-	if dep, err = deployments.Get(ctx, st.Shadow.Deployment, metav1.GetOptions{}); err != nil || containerNames(dep) != "job-logs" {
-		t.Fatalf("the logs-only shadow after a restart: %v", err)
+	if deletes() != before+1 {
+		t.Errorf("a restarted executor deleted the shadow %d times", deletes()-before)
 	}
 
 	if err := e.remove(); err != nil {
@@ -169,15 +178,11 @@ func TestWithShadowManager(t *testing.T) {
 	}
 }
 
-// TestShadowOfSinglePod: the shadow of a Workload of one plain pod carries the
-// labels the Service in front of the pod (a Kubeflow Notebook's) selects it by,
-// so the Service reaches the job through the shadow; its pod's IP and readiness
-// go to the request's status.
+// TestShadowOfSinglePod: the shadow carries only its own labels, so no Service
+// of the namespace selects it (the owner pod carries its IP); its pod's IP and
+// readiness go to the request's status.
 func TestShadowOfSinglePod(t *testing.T) {
-	e := newExecutorEnv(t, &v1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: "nb", Namespace: executorNS},
-		Spec:       v1.ServiceSpec{Selector: map[string]string{"statefulset": "nb"}},
-	})
+	e := newExecutorEnv(t)
 	e.d.Config.Shadow = shadowBlock()
 	m, err := NewShadowManager(e.kube, e.d.Config)
 	if err != nil {
@@ -188,9 +193,7 @@ func TestShadowOfSinglePod(t *testing.T) {
 
 	req := testRequest(1)
 	req.Spec.Owner = v1alpha1.OwnerReference{APIVersion: "v1", Kind: "Pod", Name: "nb-0", UID: "0b6c-pod"}
-	req.Spec.OwnerLabels = map[string]string{
-		"statefulset": "nb", "notebook-name": "nb", "hpc-a-proj42": "true", "kueue.x-k8s.io/queue-name": "hpc-a-proj42",
-	}
+	req.Spec.PodSets[0].Template.Labels = map[string]string{"statefulset": "nb", "kueue.x-k8s.io/queue-name": "hpc-a-proj42"}
 	req.Spec.PodSets[0].Template.Spec.Containers[0].Ports = []v1.ContainerPort{{ContainerPort: 8888}}
 	e.submit(req)
 	e.setStatus(0, "node07", runningContainer(executorCtn, time.Now()))
@@ -203,13 +206,16 @@ func TestShadowOfSinglePod(t *testing.T) {
 		t.Fatal(err)
 	}
 	labels := dep.Spec.Template.Labels
-	if labels["statefulset"] != "nb" || labels[shadow.LabelShadowOf] != executorWorkload {
-		t.Errorf("shadow pod labels %v, want the Service's and the shadow's", labels)
+	if labels[shadow.LabelShadowOf] != executorWorkload {
+		t.Errorf("shadow pod labels %v, want the shadow's", labels)
 	}
-	for _, k := range []string{"notebook-name", "hpc-a-proj42", "kueue.x-k8s.io/queue-name"} {
+	for _, k := range []string{"statefulset", "kueue.x-k8s.io/queue-name"} {
 		if _, ok := labels[k]; ok {
 			t.Errorf("shadow pod carries %s: %v", k, labels)
 		}
+	}
+	if list, _ := e.kube.DiscoveryV1().EndpointSlices(executorNS).List(ctx, metav1.ListOptions{}); len(list.Items) != 0 {
+		t.Errorf("the shadow published %d EndpointSlices", len(list.Items))
 	}
 
 	// The Deployment's pod, as the cluster would run it.
@@ -233,17 +239,45 @@ func TestShadowOfSinglePod(t *testing.T) {
 	}
 }
 
-// TestShadowOfJobInheritsNoLabels: only a Workload of one plain pod has owner
-// labels; a Job's shadow keeps its own.
-func TestShadowOfJobInheritsNoLabels(t *testing.T) {
+// TestBatchJobHasNoShadow: a job that forwards no port and opens no reverse
+// tunnel gets no shadow while it runs, and none is deleted when it ends.
+func TestBatchJobHasNoShadow(t *testing.T) {
+	e := newExecutorEnv(t)
+	e.submit(testRequest(1))
+	e.setStatus(0, "node07", runningContainer(executorCtn, time.Now()))
+	if q := e.poll(); state(q) != "running" || q.Status.Shadow != nil {
+		t.Fatalf("running: state %s, shadow %+v", state(q), q.Status.Shadow)
+	}
+	e.setStatus(0, "node07", terminatedContainer(executorCtn, 0, "Completed", time.Now(), time.Now()))
+	if q := e.poll(); state(q) != "succeeded" || q.Status.Shadow != nil {
+		t.Fatalf("completed: state %s, shadow %+v", state(q), q.Status.Shadow)
+	}
+	if len(e.shadow.ensured) != 0 || len(e.shadow.deleted) != 0 {
+		t.Fatalf("shadows ensured %+v, deleted %v", e.shadow.ensured, e.shadow.deleted)
+	}
+}
+
+// TestShadowDeletedOnceAtJobEnd: the shadow of a job that forwards a port goes
+// when the job ends, also when the executor first sees the request ended.
+func TestShadowDeletedOnceAtJobEnd(t *testing.T) {
 	e := newExecutorEnv(t)
 	req := testRequest(1)
 	req.Spec.PodSets[0].Template.Spec.Containers[0].Ports = []v1.ContainerPort{{ContainerPort: 8888}}
 	e.submit(req)
 	e.setStatus(0, "node07", runningContainer(executorCtn, time.Now()))
-	e.poll()
-	if len(e.shadow.ensured) != 1 || e.shadow.ensured[0].Labels != nil {
-		t.Fatalf("shadows %+v, want one without owner labels", e.shadow.ensured)
+	if q := e.poll(); q.Status.Shadow == nil || len(e.shadow.ensured) != 1 {
+		t.Fatalf("running: shadow %+v, ensured %d", q.Status.Shadow, len(e.shadow.ensured))
+	}
+	e.setStatus(0, "node07", terminatedContainer(executorCtn, 0, "Completed", time.Now(), time.Now()))
+	if q := e.poll(); q.Status.Shadow != nil || !slices.Equal(e.shadow.deleted, []string{executorWorkload}) {
+		t.Fatalf("completed: shadow %+v, deleted %v", q.Status.Shadow, e.shadow.deleted)
+	}
+	if e.poll(); len(e.shadow.ensured) != 1 || len(e.shadow.deleted) != 1 {
+		t.Fatalf("ended job polled again: ensured %d, deleted %v", len(e.shadow.ensured), e.shadow.deleted)
+	}
+	e.restart()
+	if e.poll(); len(e.shadow.ensured) != 1 || len(e.shadow.deleted) != 2 {
+		t.Fatalf("after a restart: ensured %d, deleted %v", len(e.shadow.ensured), e.shadow.deleted)
 	}
 }
 
@@ -261,23 +295,6 @@ func (e *executorEnv) nodeConfigMap() *v1.ConfigMap {
 	}
 	e.t.Fatalf("no node ConfigMap among %d shadow ConfigMaps", len(list.Items))
 	return nil
-}
-
-func shadowContainers(t *testing.T, dep *appsv1.Deployment) (forward, logs v1.Container) {
-	t.Helper()
-	var haveForward, haveLogs bool
-	for _, c := range dep.Spec.Template.Spec.Containers {
-		switch c.Name {
-		case "ssh-forward":
-			forward, haveForward = c, true
-		case "job-logs":
-			logs, haveLogs = c, true
-		}
-	}
-	if !haveForward || !haveLogs {
-		t.Fatalf("shadow containers: %s", containerNames(dep))
-	}
-	return forward, logs
 }
 
 func containerNames(dep *appsv1.Deployment) string {

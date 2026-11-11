@@ -16,7 +16,7 @@ ba9f7e85. `htc` is interlink-htcondor-plugin at 5f9ecdb. Kueue paths follow `kue
   and leaves the batch system to the plugin. It speaks only the interLink API.
 - The interLink API server sits in front of every plugin: in the tenant pod for in-cluster use, at
   the site for the edge. The executor uses the same calls as the virtual kubelet, plus
-  `/createPodSets` where the plugin lists it.
+  `/createPodGroup` where the plugin lists it.
 - Queue, account and wall time reach the plugin as annotations that OffloadConfig defines per
   flavor. The executor holds no Slurm flags.
 - A plugin lists `pod-group` in its ping answer when it runs N `/create` calls that share Kueue's
@@ -24,7 +24,7 @@ ba9f7e85. `htc` is interlink-htcondor-plugin at 5f9ecdb. Kueue paths follow `kue
   gang is refused, and a Workload marked `independent-pods` runs as one job per pod.
 - `/create` answers 503 for a transient refusal (submit limit, scheduler down) and 4xx for a
   permanent one.
-- A plugin that also lists `podset-create` gets a pod group in one `POST /createPodSets` and
+- A plugin that also lists `pod-group-create` gets a pod group in one `POST /createPodGroup` and
   submits it as one job without buffering. The executor uses it when listed and keeps per-pod
   `/create` otherwise, and when an API server without the route answers 404; the route is an
   upstream interLink proposal.
@@ -38,7 +38,7 @@ OffloadRequest in the tenant namespace (kueue-native.md 3.2)
    |
 executor, tenant namespace, namespaced Role                       this repo, pkg/executor
    |  PodSets -> member pods in memory; Secrets, ConfigMaps, tokens, downward API;
-   |  stage Jobs; shadow Deployment; log relay; state
+   |  stage Jobs; shadow Deployment; log relay to the virtual node; state
    v  interLink API: /create (PodCreateRequests), /status, /getLogs, /delete, /pinglink
 interLink API server, stock image                     in the tenant pod, or at the site (edge)
    v  interLink plugin contract
@@ -50,8 +50,9 @@ routes to the plugin's mux (slurm `cmd/main.go:224-243`), and it called the plug
 process, `createPod` (slurm `pkg/slurm/executor.go:422`) and `podStatuses` (`:649`). It also ran
 `squeue` and `scancel` itself (`:516`, `:579`) and read the plugin's job directories (`:824-840`,
 `executor_logs.go:228-243`). Another backend would have had to reimplement all of this. The
-executor now runs on its own in the tenant pod, takes OffloadRequests and keeps only `/getLogs`
-and `/healthz` for the shadows (`design.md`, "Executor HTTP API").
+executor now runs on its own in the tenant pod, takes OffloadRequests and keeps only `/getLogs`,
+which the offload controller's virtual node reads for `kubectl logs`, and `/healthz` (`design.md`,
+"Executor HTTP API").
 
 ### 1.2 What moves into pkg/executor
 
@@ -64,7 +65,7 @@ and `/healthz` for the shadows (`design.md`, "Executor HTTP API").
 | `executor_state.go` | gone | the OffloadRequest status holds the job ID, the ranks and the shadow names (`kueue-native.md` section 6, step 6) |
 | `executor_auth.go` | gone | with the HTTP API it guarded (step 6) |
 | `executor_shadow.go`, `executor_reverse.go` | `pkg/executor/shadow.go`, `reverse.go` | none. The srun carrier finds the allocation by a job name that follows the Slurm plugin's naming (`executor_reverse.go:18-24`), so it stays a Slurm-only option; other backends use the ssh carrier |
-| `executor_logs.go`, `executor_logs_client.go` | `pkg/executor/logs.go`, `executor logs` | each rank is read through `/getLogs` with `Follow` instead of from the plugin's files (`executor_logs.go:228-243`), so no shared filesystem is needed. The followed stream ends when every rank's stream ended and `/status` shows their containers terminated: the API server ends a stream it lost from the plugin as if it were complete (il `api/handler.go:242-245`). The 10 s quiet wait goes with the file reads; the plugin's `Follow` ends after the container's last write |
+| `executor_logs.go`, `executor_logs_client.go` | `pkg/executor/logs.go`, read by the virtual node (`pkg/node/logs.go`) | each rank is read through `/getLogs` with `Follow` instead of from the plugin's files (`executor_logs.go:228-243`), so no shared filesystem is needed. The followed stream ends when every rank's stream ended and `/status` shows their containers terminated: the API server ends a stream it lost from the plugin as if it were complete (il `api/handler.go:242-245`). The 10 s quiet wait goes with the file reads; the plugin's `Follow` ends after the container's last write |
 | `executor_config.go`: Executor, Shadow and Staging blocks (`:14-160`) | `pkg/executor/config.go` | `SiteConfig` (`:55-61`) keeps `AllowedAccounts`. `LoginHost`, `User`, `Port`, `KeyFile` and `exportSiteEnv` (`:309`) stay in the plugin for its ssh shims, as an optional `Sites` block of at most one entry (slurm `pkg/slurm/site.go`), so the Shadow block names its login node and user itself and Staging gains `User` (default `Shadow.User`). The plugin's configuration sets `GangSchedulingEnabled` itself: the executor no longer turns it on (`:224-228`) |
 | `pkg/shadow` | `pkg/shadow` | none: it is the virtual kubelet's SSH shadow (slurm `pkg/shadow/render.go:17`) |
 
@@ -98,7 +99,7 @@ the `PodJID` of each answer. The job ID is the last non-empty one, as today
 (`executor.go:420-430`); for independent pods (3.6) every member must name its job, and the job ID
 lists them (`pkg/executor/server.go:367-368`). If a call fails, it sends `POST /delete` for the
 members created so far, which also drops buffered gang members (slurm `Delete.go:83`). A plugin
-that lists `podset-create` gets a pod group's members in one `POST /createPodSets` instead (3.3).
+that lists `pod-group-create` gets a pod group's members in one `POST /createPodGroup` instead (3.3).
 
 Status. The executor sends one `GET /status` with every member (name, namespace, UID, containers)
 and sets `status.phase` to `Pending` or `Running` on each one. The phase is required: the API
@@ -122,11 +123,16 @@ Health. `/healthz` is the API server's `/pinglink`, which reaches the plugin.
 
 The controller knows the account, the flavor and the wall time. The plugin needs them in its own
 annotation syntax. Each OffloadConfig flavor gets `annotations` in place of `partition` and `qos`
-(`api/v1alpha1/offloadconfig_types.go:76-84`). The values are Go text/templates, as the membership
-executor template already is, and the controller expands them with `.Account` (the
-ClusterQueue's label `hpc.interlink.eu/account`, `pkg/offload/workload.go:300`), `.MaxExecSeconds` (the Workload's
-`spec.maximumExecutionTimeSeconds`, `0.16.9 apis/kueue/v1beta2/workload_types.go:77`, 0 when
-unset) and `.MaxExecMinutes` (the same, rounded up).
+(`FlavorTarget`, `api/v1alpha1/offloadconfig_types.go:107-128`). The values are Go text/templates,
+as the membership executor template already is, and the controller expands them with `.Account`
+(the ClusterQueue's label `hpc.interlink.eu/account`, `pkg/offload/workload.go:401`),
+`.MaxExecSeconds` (the job's wall time: the Workload's `spec.maximumExecutionTimeSeconds`,
+`0.16.9 apis/kueue/v1beta2/workload_types.go:77`, else the longest `interlink.eu/time-limit`
+(`HH:MM:SS`) of its PodSets, a template's value winning over the owner's; 0 when neither) and
+`.MaxExecMinutes` (the same in minutes, with the margin for Kueue's own limit that
+[design.md](design.md#offload-controller-behaviour) describes). The request's `spec.maximumExecutionTimeSeconds` carries
+that value, and a flavor's `maxExecutionTimeSeconds` bounds it: a longer job is rejected, since
+Kueue cannot choose a flavor by time.
 
 ```yaml
 spec:
@@ -199,6 +205,23 @@ decoder ignores unknown fields, so older virtual kubelets are not affected. Upst
 field in `pkg/interlink/types.go`. Until it lands, the executor and the plugin decode their own
 copy of the type; the Slurm plugin already carries one (slurm `pkg/slurm/types.go:302-309`).
 
+| Capability | Route | What the executor does with it |
+| --- | --- | --- |
+| `pod-group` | `/create` per member | a pod group as one allocation (3.2) |
+| `pod-group-create` | `POST /createPodGroup` | a pod group in one call (3.3) |
+| `estimate` | `POST /estimate` | asks, before an attempt's first create, when the site would start the job (`design.md`, "Start estimate") |
+
+`/estimate` takes `{"nodes": N, "gpusPerNode": M, "cpusPerNode": C, "time": "HH:MM:SS", "flags":
+"..."}`: one node per member of a pod group, else 1; the most GPUs and CPUs any PodSet asks for
+(the site's `Resources.GPUResource` and its aliases, else any `<vendor>/gpu` resource); the wall
+time rounded up to minutes; the head member's `slurm-job.vk.io/flags`, the flavor's included. The
+API server refuses `nodes` below 1 itself with 400 and forwards the body unchanged otherwise. A
+plugin answers 200 with `{"start": "<RFC 3339>", "raw": "<its scheduler's text>"}`, or an error
+with its own status code, which the API server relays: 400 for a malformed request, 502 when the
+scheduler gives no start time (a per-user submit limit among them), 404 from a plugin without the
+route. The Slurm plugin runs `sbatch --test-only` with those values and the default flavor's
+flags.
+
 ### 3.2 `pod-group`: a gang as one allocation over per-pod /create
 
 A plugin that lists `pod-group` makes this promise. N `/create` calls whose pods carry the same
@@ -216,46 +239,44 @@ executor sends all members of a Workload in one pass and in rank order, as today
 (`executor.go:421-430`). A Workload with several PodSets, such as a JobSet's leader and workers,
 forms one group whose ranks are numbered across the PodSets.
 
-### 3.3 `podset-create`: a pod group in one call
+### 3.3 `pod-group-create`: a pod group in one call
 
-Issue 5 asks for the PodSet itself to reach the plugin. A plugin that lists `podset-create` takes
-the members of a pod group in one call, `POST /createPodSets`, and submits them as one job without
-buffering them. The executor sends:
+Issue 5 asks for the PodSet itself to reach the plugin. A plugin that lists `pod-group-create`
+takes the members of a pod group in one call, `POST /createPodGroup`, and submits them as one job
+without buffering them. The executor sends:
 
 ```go
-type PodSetsCreateRequests struct {
-	GroupUID string                 `json:"groupUID"` // the Workload UID, the pod-group label value
-	PodSets  []PodSetCreateRequests `json:"podSets"`
-}
-
-type PodSetCreateRequests struct {
-	Name string              `json:"name"`
-	Pods []PodCreateRequests `json:"pods"` // each member as /create takes it
+type PodGroupCreateRequests struct {
+	GroupUID string              `json:"groupUID"` // the Workload UID, the pod-group label value
+	Pods     []PodCreateRequests `json:"pods"`     // each member as /create takes it, in rank order
 }
 ```
 
-Ranks follow the order of the pods, PodSet after PodSet, and rank 0 is the head. Each rank is a
-whole pod, not a template and a count: its projected and downward API files differ (pod name, UID,
-rank annotations), and the plugin keeps its per-pod translation. The API server prepares each pod
-as for `/create` (`getData`, then the job script step) and sends the plugin the same shape with
-`RetrievedPodData` in place of `PodCreateRequests`. It relays the answer unchanged: 200 with a
-`[]CreateStruct`, one entry per pod in request order, every `PodJID` the group's job ID; 400 for a
-bad request or a permanent refusal and 503 for a transient one, as `/create` (3.4). Status, logs
-and delete stay per pod, so the shadow and the log relay do not change.
+The call is named after Kubernetes' own PodGroup (`scheduling.k8s.io` Workload and PodGroup,
+KEP-4671), the set of pods scheduled together; PodSet is Kueue's term. The Workload's PodSets are
+flattened in rank order, PodSet after PodSet, and rank 0 is the head; each member still carries
+its PodSet in its annotations. Each rank is a whole pod, not a template and a count: its projected
+and downward API files differ (pod name, UID, rank annotations), and the plugin keeps its per-pod
+translation. The API server prepares each pod as for `/create` (`getData`, then the job script
+step) and sends the plugin the same shape with `RetrievedPodData` in place of
+`PodCreateRequests`. It relays the answer unchanged: 200 with a `[]CreateStruct`, one entry per
+pod in request order, every `PodJID` the group's job ID; 400 for a bad request or a permanent
+refusal and 503 for a transient one, as `/create` (3.4). Status, logs and delete stay per pod, so
+the shadow and the log relay do not change.
 
-- interLink: the types and the route are on the fork's branch `feat/create-podsets`, an upstream
-  proposal. Until they land, the executor carries its own copy of the types
-  (`pkg/executor/interlink.go:114`).
+- interLink: the types and the route are an upstream draft,
+  https://github.com/interlink-hq/interLink/pull/606. Until it lands, the executor carries its
+  own copy of the type (`pkg/executor/interlink.go`, `PodGroupCreateRequests`).
 - Slurm plugin: the handler renders each pod as `/create` does and submits the group as the one
   `sbatch --nodes=N` job of the gang path, with no buffer and no timeout sweep. A retried call
-  whose pods already share a job gets that job again. It lists `podset-create` next to `pod-group`
-  (slurm at 0238623, `pkg/slurm/podsets.go:52`, `:96`, `Status.go:742`).
-- Executor: a pod group on a plugin that lists `podset-create` goes in one `/createPodSets`
-  (`pkg/executor/capabilities.go:121`, `server.go:415`). A failed call, or an answer that does not
-  list every member once in rank order with one job ID, deletes the members as a failed `/create`
-  does. A plugin with only `pod-group`, independent pods and a single pod keep the per-pod
-  `/create` path. So does a pod group whose `/createPodSets` answers 404: the ping that lists
-  `podset-create` passes through any API server, and one without the route submitted nothing.
+  whose pods already share a job gets that job again. It lists `pod-group-create`.
+- Executor: a pod group on a plugin that lists `pod-group-create` goes in one `/createPodGroup`
+  (`createsPodGroup` in `pkg/executor/capabilities.go`, `createPodGroup` in `server.go`). A failed
+  call, or an answer that does not list every member once in rank order with one job ID, deletes
+  the members as a failed `/create` does. A plugin with only `pod-group`, independent pods and a
+  single pod keep the per-pod `/create` path. So does a pod group whose `/createPodGroup` answers
+  404: the ping that lists `pod-group-create` passes through any API server, and one without the
+  route submitted nothing.
 
 It saves N round trips that each carry the Workload's Secrets, and the wait for the last member.
 
@@ -301,6 +322,7 @@ reads it on every PodSet's template (`pkg/executor/capabilities.go:33`).
 | Shape (Workload PodSets) | Plugin with `pod-group` | Plugin without it |
 | --- | --- | --- |
 | single pod, or a Job with parallelism 1 (one PodSet, count 1) | one job | one job |
+| one pod whose template names a site launcher (`interlink.eu/launcher`) | one allocation of one node (a pod group of one) | refused |
 | Job with parallelism N (one PodSet, count N) | one allocation of N ranks | refused; N jobs with `independent-pods` |
 | pod group (k PodSets, N pods) | one allocation | refused; N jobs with `independent-pods` |
 | JobSet (one PodSet per replicated job) | one allocation, ranks numbered across PodSets | refused; N jobs with `independent-pods` |
@@ -347,14 +369,14 @@ OffloadRequest exists, the account reaches the plugin in the flavor annotation (
 the site checks that the user may charge it. The plugin knows nothing about quotas.
 
 Logs work. The executor relays `/getLogs` with Follow through the API server, which streams it
-(`api/logs.go:152`), and the shadow's job-logs container reads from the executor (slurm
-`pkg/shadow/render.go:165-171`). No shared filesystem is involved.
+(`api/logs.go:152`), and the offload controller's virtual node reads it from the executor for
+`kubectl logs` (`design.md`, "Virtual node"). No shared filesystem is involved.
 
 Tunnels work only where the tenant has an SSH key for the site. The shadow reaches the node over
 SSH with a key in the tenant namespace (`executor-template.yaml:60-70`); with such a key, forward
 and reverse tunnels work as they do in-cluster. Often, though, the edge exists because the cluster
 holds no SSH identity for the user. Tunnels then need a stream into the job from the API server,
-keyed by pod, which interLink does not have. Logs-only shadows still work.
+keyed by pod, which interLink does not have. Logs still work: they need no shadow.
 
 ## 5. The API server: always in front
 
@@ -400,9 +422,9 @@ How each shape runs through the HTCondor plugin:
 What is refused or limited:
 - Tunnels. The plugin reports no `nodeName`, and execute nodes are generally not reachable over
   SSH. Where the site's shadow configuration has no login host, the executor refuses
-  `interlink.eu/reverse-forwards` and exposed ports and runs a logs-only shadow
-  (`pkg/executor/server.go:220`). A shadow that tunnels waits for `nodeName`; one that only streams
-  logs is created as soon as the job runs, whatever the backend (`pkg/executor/server.go:801`).
+  `interlink.eu/reverse-forwards` and exposed ports, and no job has a shadow
+  (`validateTunnels` in `pkg/executor/server.go`). A shadow waits for `nodeName`; logs need none:
+  the virtual node reads them from the executor whatever the backend.
 - Staging. `Staging.Command` is the site's configuration; HTCondor's own `transfer_input_files`
   (htc `handles.py:1234`) belongs to the plugin.
 - Logs. Without Follow, each `/getLogs` answers the log so far. While the job runs the executor
@@ -432,7 +454,7 @@ The tests need no HTCondor pool:
 3. The HTCondor plugin's own container, a one-node `htcondor/mini` pool with the plugin (htc
    `docker/Dockerfile:1`), which the plugin's CI already runs. `test/htcondor/run.sh` runs Kueue,
    the offload controller, the executor, a stock API server and that container in kind through
-   these cases: a single pod and its log on the shadow, the account and the wall time in the
+   these cases: a single pod and its log through `kubectl logs`, the account and the wall time in the
    submit file, a Job of 3 with `independent-pods`, a refused Job of 2 pods (a pod group of any
    kind is refused by the same check), an exit code 3, and a `condor_rm` from inside the pool.
 4. Multi-node runs, accounting enforcement and a site's authentication need a real pool.
@@ -490,14 +512,14 @@ project. "Slurm e2e" below means that set of tests.
    OffloadRequests (`pkg/executor/request.go`), the controller creates them (`pkg/offload`), and
    `config/admission` limits who writes them. Test: the unit tests of both sides and of the
    policy (`pkg/offload/policy_test.go`); Slurm e2e.
-8. **HTCondor.** The plugin changes of section 6 go upstream, and the executor gets the logs-only
-   shadow without a node and the tunnel refusal. Test: e2e with the `htcondor/mini` container in
+8. **HTCondor.** The plugin changes of section 6 go upstream, and the executor gets the tunnel
+   refusal without a login node. Test: e2e with the `htcondor/mini` container in
    kind.
 9. **Edge, per user.** The executor is configured with a remote API server URL and a token, which
    the membership controller renders. One API server and plugin run per user on a test login host
    or in the mini container. Open an upstream issue for identity forwarding and per-caller scoping
    (section 4).
-10. **`podset-create`.** Done: the Slurm plugin's `/createPodSets` and the executor's choice by
-    capability (3.3). The API server route is an upstream interLink proposal on the fork's branch
-    `feat/create-podsets`. Test: executor tests against the fake plugin, with and without the
+10. **`pod-group-create`.** Done: the Slurm plugin's `/createPodGroup` and the executor's choice by
+    capability (3.3). The API server route is an upstream interLink draft,
+    https://github.com/interlink-hq/interLink/pull/606. Test: executor tests against the fake plugin, with and without the
     capability; plugin unit tests.

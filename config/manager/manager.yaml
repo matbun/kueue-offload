@@ -29,9 +29,16 @@ spec:
         - --metrics-bind-address=:8080
         - --health-probe-bind-address=:8081
         - --leader-elect
+        env:
+        # The virtual nodes' InternalIP, which the API server dials for kubectl logs, and the
+        # IP address of their kubelet serving certificate
+        - name: POD_IP
+          valueFrom:
+            fieldRef: {fieldPath: status.podIP}
         ports:
         - {name: metrics, containerPort: 8080}
         - {name: probes, containerPort: 8081}
+        - {name: kubelet, containerPort: 10250}
         livenessProbe:
           httpGet: {path: /healthz, port: probes}
         readinessProbe:

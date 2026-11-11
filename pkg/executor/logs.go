@@ -17,6 +17,8 @@ import (
 	"github.com/containerd/containerd/log"
 	commonIL "github.com/interlink-hq/interlink/pkg/interlink"
 	v1 "k8s.io/api/core/v1"
+
+	"github.com/matbun/kueue-offload/pkg/executorapi"
 )
 
 // logsPollInterval is how often a followed workload log checks whether its job
@@ -30,17 +32,23 @@ var logsReopenDelay = 5 * time.Second
 // GetLogsHandler is /getLogs: the workload's logs, each member's read through the
 // interLink API server's /getLogs.
 //
-// Query: workloadUID, container (default: each member's first container), rank,
-// follow, tail, sinceSeconds. With rank, that member's log as the plugin returns it.
-// Without rank, the lines of every member that has the container, prefixed
-// "[rank N] " when there are more than one member: rank by rank, or with follow as
-// they arrive, from the time the job started until every member's stream ended.
-// With follow, tail applies to each member.
+// Query (executorapi): workloadUID, container (default: each member's first
+// container), rank, follow, tail, sinceSeconds, sinceTime, limitBytes, timestamps;
+// previous is refused, an offloaded container has no previous instance. With rank,
+// that member's log as the plugin returns it, refused without follow while the
+// member waits to start. Without rank, the lines of every member that has the
+// container, prefixed "[rank N] " when there are more than one member: rank by
+// rank, or with follow as they arrive, from the time the job started until every
+// member's stream ended. With follow, tail applies to each member.
 func (d *Executor) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	uid := q.Get("workloadUID")
+	uid := q.Get(executorapi.LogsWorkloadUID)
 	if uid == "" {
-		http.Error(w, "workloadUID is required", http.StatusBadRequest)
+		http.Error(w, executorapi.LogsWorkloadUID+" is required", http.StatusBadRequest)
+		return
+	}
+	if q.Get(executorapi.LogsPrevious) == "true" {
+		http.Error(w, "an offloaded container has no previous instance", http.StatusBadRequest)
 		return
 	}
 	req := d.current(r.Context(), uid)
@@ -48,7 +56,7 @@ func (d *Executor) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no job for workload "+uid, http.StatusNotFound)
 		return
 	}
-	container := q.Get("container")
+	container := q.Get(executorapi.LogsContainer)
 	intParam := func(name string) (int, bool) {
 		raw := q.Get(name)
 		if raw == "" {
@@ -61,25 +69,54 @@ func (d *Executor) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		return n, true
 	}
-	tail, ok := intParam("tail")
+	tail, ok := intParam(executorapi.LogsTail)
 	if !ok {
 		return
 	}
-	since, ok := intParam("sinceSeconds")
+	since, ok := intParam(executorapi.LogsSinceSeconds)
 	if !ok {
 		return
 	}
-	follow := q.Get("follow") == "true"
+	limit, ok := intParam(executorapi.LogsLimitBytes)
+	if !ok {
+		return
+	}
+	var sinceTime time.Time
+	if raw := q.Get(executorapi.LogsSinceTime); raw != "" {
+		t, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			http.Error(w, "invalid "+executorapi.LogsSinceTime+" "+strconv.Quote(raw)+": RFC 3339 is required", http.StatusBadRequest)
+			return
+		}
+		sinceTime = t
+	}
+	// The interLink API server refuses both pairs.
+	if tail > 0 && limit > 0 {
+		http.Error(w, executorapi.LogsTail+" and "+executorapi.LogsLimitBytes+" cannot both be set", http.StatusBadRequest)
+		return
+	}
+	if since > 0 && !sinceTime.IsZero() {
+		http.Error(w, executorapi.LogsSinceSeconds+" and "+executorapi.LogsSinceTime+" cannot both be set", http.StatusBadRequest)
+		return
+	}
+	follow := q.Get(executorapi.LogsFollow) == "true"
 	members := memberPods(jobRequestOf(req))
 	logs := memberLogs(members, container)
 	if len(logs) == 0 {
 		http.Error(w, "no container "+container+" in workload "+uid, http.StatusBadRequest)
 		return
 	}
-	opts := commonIL.ContainerLogOpts{Tail: tail, Follow: follow, SinceSeconds: since}
+	opts := commonIL.ContainerLogOpts{
+		Tail:         tail,
+		Follow:       follow,
+		SinceSeconds: since,
+		SinceTime:    sinceTime,
+		LimitBytes:   limit,
+		Timestamps:   q.Get(executorapi.LogsTimestamps) == "true",
+	}
 
-	if q.Has("rank") {
-		rank, ok := intParam("rank")
+	if q.Has(executorapi.LogsRank) {
+		rank, ok := intParam(executorapi.LogsRank)
 		if !ok {
 			return
 		}
@@ -90,6 +127,10 @@ func (d *Executor) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 		i := slices.IndexFunc(logs, func(l memberLog) bool { return l.rank == rank })
 		if i < 0 {
 			http.Error(w, fmt.Sprintf("rank %d of workload %s has no container %s", rank, uid, container), http.StatusBadRequest)
+			return
+		}
+		if !follow && (!started(req) || rankPending(req, rank)) {
+			http.Error(w, fmt.Sprintf("container %s of rank %d is waiting to start", logs[i].container, rank), http.StatusBadRequest)
 			return
 		}
 		if follow && !d.waitForStart(r.Context(), uid) {
@@ -178,7 +219,8 @@ func (d *Executor) GetLogsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // errStreamEnded is a followed stream that ended while its container still runs
-// and cannot be resumed, because the request asked for a tail or a time window.
+// and cannot be resumed, because the request asked for a tail, a time window
+// relative to now or a byte limit.
 var errStreamEnded = errors.New("a stream ended before the job")
 
 // followRank copies one member's followed log to out until its container ended.
@@ -196,7 +238,9 @@ func (d *Executor) followRank(ctx context.Context, uid string, l memberLog, opts
 		case <-time.After(logsReopenDelay):
 		}
 	}
-	resumable := opts.Tail == 0 && opts.SinceSeconds == 0
+	// A reopened stream with a tail, a window relative to now or a byte limit is
+	// not the first one continued.
+	resumable := opts.Tail == 0 && opts.SinceSeconds == 0 && opts.LimitBytes == 0
 	copied, reopened := 0, false
 	var partial []byte
 	for {

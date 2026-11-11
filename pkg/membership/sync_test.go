@@ -2,6 +2,7 @@ package membership
 
 import (
 	"context"
+	"io"
 	"reflect"
 	"sort"
 	"strings"
@@ -44,9 +45,10 @@ func (e *env) executorConfig(ns string) executorConfig {
 	return c
 }
 
-func gpuQuota(t *testing.T, cq kueue.ClusterQueue) int64 {
+// gpuQuota is the GPU quota of a project's Cohort.
+func gpuQuota(t *testing.T, c kueue.Cohort) int64 {
 	t.Helper()
-	for _, rg := range cq.Spec.ResourceGroups {
+	for _, rg := range c.Spec.ResourceGroups {
 		for _, f := range rg.Flavors {
 			for _, r := range f.Resources {
 				if r.Name == "nvidia.com/gpu" {
@@ -55,7 +57,7 @@ func gpuQuota(t *testing.T, cq kueue.ClusterQueue) int64 {
 			}
 		}
 	}
-	t.Fatalf("ClusterQueue %s has no GPU quota", cq.Name)
+	t.Fatalf("Cohort %s has no GPU quota", c.Name)
 	return 0
 }
 
@@ -75,7 +77,7 @@ func TestSyncCreatesMemberships(t *testing.T) {
 		t.Fatalf("ClusterQueues %v, want hpc-a-proj42 and hpc-a-proj99 only", names)
 	}
 	cq := cqs["hpc-a-proj42"]
-	if cq.Spec.CohortName != "hpc-a" || cq.Spec.QueueingStrategy != kueue.BestEffortFIFO {
+	if cq.Spec.CohortName != "hpc-a-proj42-project" || cq.Spec.QueueingStrategy != kueue.BestEffortFIFO {
 		t.Errorf("cohort %q strategy %q", cq.Spec.CohortName, cq.Spec.QueueingStrategy)
 	}
 	if got := cq.Spec.NamespaceSelector.MatchLabels; !reflect.DeepEqual(got, map[string]string{"hpc.interlink.eu/hpc-a-proj42": "true"}) {
@@ -91,10 +93,11 @@ func TestSyncCreatesMemberships(t *testing.T) {
 	if cq.Labels[ManagedByLabel] != ManagedByValue || cq.Labels[v1alpha1.AccountLabel] != "proj42" {
 		t.Errorf("ClusterQueue labels %v", cq.Labels)
 	}
-	if g := gpuQuota(t, cq); g != 64 {
+	cohorts := e.cohorts()
+	if g := gpuQuota(t, cohorts["hpc-a-proj42-project"]); g != 64 {
 		t.Errorf("proj42 GPU quota %d, want 64 from its ProjectQuota", g)
 	}
-	if g := gpuQuota(t, cqs["hpc-a-proj99"]); g != 8 {
+	if g := gpuQuota(t, cohorts["hpc-a-proj99-project"]); g != 8 {
 		t.Errorf("proj99 GPU quota %d, want 8 from defaultProjectQuota", g)
 	}
 	cohort := &kueue.Cohort{}
@@ -219,12 +222,14 @@ func TestRemovedAssociationRevokesOnlyThatMembership(t *testing.T) {
 	if got := e.executorConfig("alice").Sites["hpc-a"].AllowedAccounts; !reflect.DeepEqual(got, []string{"proj42"}) {
 		t.Errorf("executor accounts %v after removal", got)
 	}
-	// ClusterQueues are never deleted.
-	if _, ok := e.clusterQueues()["hpc-a-proj99"]; !ok {
-		t.Errorf("ClusterQueue hpc-a-proj99 deleted")
+	// No namespace holds proj99 any more: its ClusterQueue goes, which Kueue
+	// keeps until the Workloads it admitted end.
+	if got := e.queueNames(); got != "hpc-a-proj42" {
+		t.Errorf("ClusterQueues %q, want hpc-a-proj42 only", got)
 	}
 
-	// alice leaves her last project: the namespace and the executor stay.
+	// alice leaves her last project: the pass that revokes it keeps the
+	// namespace and the executor, which go when she is offboarded.
 	e.setAssociations("hpc-a|proj42|bob\n")
 	e.sync()
 	ns = e.namespace("alice")
@@ -357,6 +362,91 @@ func TestTemplateRefusals(t *testing.T) {
 	}
 }
 
+// partsConfigMap is a template ConfigMap of an entry key, parts and raw files,
+// as kustomize's configMapGenerator writes it.
+func partsConfigMap(data map[string]string) *corev1.ConfigMap {
+	cm := templateConfigMap("")
+	cm.Data = data
+	return cm
+}
+
+func TestTemplateParts(t *testing.T) {
+	// Template syntax, quotes, $ and blank lines in a raw file reach the
+	// rendered object as they are.
+	raw := "{{ .Namespace }} {{ broken\n\"quoted\" 'single' $HOME ${1:-x} \\n\n\n\ttab <&>\n"
+	part := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: kueue-offload-executor\ndata:\n  raw: {{ file \"raw\" | toJson }}\n"
+	e := newEnv(t, partsConfigMap(map[string]string{
+		"template.yaml": `{{ template "a.tpl.yaml" . }}`,
+		"a.tpl.yaml":    part,
+		"raw":           raw,
+	}))
+	e.sync()
+	for _, ns := range []string{"alice", "bob"} {
+		cm := e.executorConfigMap(ns)
+		if cm == nil {
+			t.Fatalf("ConfigMap of the part not applied in %s", ns)
+		}
+		if cm.Data["raw"] != raw {
+			t.Errorf("%s: raw file rendered as %q, want %q", ns, cm.Data["raw"], raw)
+		}
+	}
+
+	if _, err := ParseTemplate(map[string]string{"a.tpl.yaml": part}, "template.yaml"); err == nil || !strings.Contains(err.Error(), `no key "template.yaml"`) {
+		t.Errorf("missing entry key: %v", err)
+	}
+	// Parts share the entry's options: a missing map key is an error there too.
+	tmpl, err := ParseTemplate(map[string]string{"template.yaml": "", "a.tpl.yaml": "{{ .nope }}"}, "template.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpl.ExecuteTemplate(io.Discard, "a.tpl.yaml", map[string]string{}); err == nil {
+		t.Error("a part rendered a missing map key")
+	}
+
+	cases := map[string]struct {
+		data map[string]string
+		want string
+	}{
+		"unknown part": {map[string]string{
+			"template.yaml": "{{ template \"a.tpl.yaml\" . }}\n---\n{{ template \"b.tpl.yaml\" . }}\n",
+			"a.tpl.yaml":    part,
+			"raw":           raw,
+		}, `template "b.tpl.yaml" not defined`},
+		"unknown file": {map[string]string{
+			"template.yaml": "{{ template \"a.tpl.yaml\" . }}\n---\n{{ file \"nope\" }}\n",
+			"a.tpl.yaml":    part,
+			"raw":           raw,
+		}, `no key "nope"`},
+		"part does not parse": {map[string]string{
+			"template.yaml": `{{ template "a.tpl.yaml" . }}`,
+			"a.tpl.yaml":    part,
+			"raw":           raw,
+			"b.tpl.yaml":    "{{ .Namespace ",
+		}, `key "b.tpl.yaml"`},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, partsConfigMap(c.data))
+			_, err := e.r.Sync(context.Background())
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("sync: %v, want an error with %s", err, c.want)
+			}
+			for _, ns := range []string{"alice", "bob"} {
+				if e.executorConfigMap(ns) != nil {
+					t.Errorf("ConfigMap applied in %s from a refused template", ns)
+				}
+			}
+			refused := false
+			for _, ev := range e.drainEvents() {
+				refused = refused || strings.Contains(ev, EventTemplateRefused)
+			}
+			if !refused {
+				t.Errorf("no %s event", EventTemplateRefused)
+			}
+		})
+	}
+}
+
 func TestIdentityConflictSkipsNamespace(t *testing.T) {
 	e := newEnv(t,
 		assocConfigMap("hpc-a|proj42|alice\nhpc-a|proj99|alice2\nhpc-a|proj42|bob\n"),
@@ -405,8 +495,15 @@ func TestCohortAndCheckFromMembership(t *testing.T) {
 	e := newEnv(t, sc, assocConfigMap("hpc-a|proj42|alice\nhpc-a|Bad_Account|alice\n"))
 	e.sync()
 	cq, ok := e.clusterQueues()["hpc-a-proj42"]
-	if !ok || cq.Spec.CohortName != "pool" || cq.Spec.AdmissionChecksStrategy.AdmissionChecks[0].Name != "offload-a" {
+	if !ok || cq.Spec.CohortName != "hpc-a-proj42-project" || cq.Spec.AdmissionChecksStrategy.AdmissionChecks[0].Name != "offload-a" {
 		t.Fatalf("ClusterQueues %v", e.clusterQueues())
+	}
+	cohorts := e.cohorts()
+	if c, ok := cohorts["hpc-a-proj42-project"]; !ok || c.Spec.ParentName != "pool" {
+		t.Errorf("project Cohort %+v, want parent pool", c)
+	}
+	if _, ok := cohorts["pool"]; !ok || len(cohorts) != 2 {
+		t.Errorf("Cohorts %v, want pool and hpc-a-proj42-project", e.cohortNames())
 	}
 	if len(e.clusterQueues()) != 1 {
 		t.Errorf("an account that is not a DNS label got a ClusterQueue")
@@ -431,7 +528,7 @@ func TestParseAssociations(t *testing.T) {
 }
 
 func TestSampleTemplateRenders(t *testing.T) {
-	tmpl, err := ParseTemplate(sampleTemplate(t))
+	tmpl, err := ParseTemplate(map[string]string{"template.yaml": sampleTemplate(t)}, "template.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -63,16 +63,24 @@ type OffloadConfigSpec struct {
 	// estimates records in the OffloadRequest's status.estimate when the job
 	// would start. A start further away than this from when it asked, or no start
 	// time at all (the site takes no further job of the user now), deactivates
-	// the Workload (spec.active false) before the job is submitted, for the
-	// retryStrategy's backoff: Kueue evicts it at once and releases the quota, so
-	// that a job the site would keep waiting does not hold the project's quota
-	// meanwhile, and the controller reactivates it when the backoff is over, which
-	// queues it again. The check stays Pending with the estimate and the time
+	// the Workload (spec.active false) before the job is submitted, for
+	// deferInterval: Kueue evicts it at once and releases the quota, so that a
+	// job the site would keep waiting does not hold the project's quota
+	// meanwhile, and the controller reactivates it when deferInterval is over,
+	// which queues it again and asks the site again. The check stays Pending with the estimate and the time
 	// (event Deferred). These deferrals never reject the Workload: the
 	// OffloadRequest's deferrals counts them apart from the retryStrategy's
 	// retries. Unset: no limit, and the estimate only shows in the check message.
 	// +optional
 	MaxStartDelay *metav1.Duration `json:"maxStartDelay,omitempty"`
+
+	// deferInterval is how long a Workload that maxStartDelay deferred stays
+	// deactivated before the site is asked again, the same after every deferral:
+	// a deferral waits for the site and is not a failure, so it does not back off
+	// as retryStrategy does, and a job queued behind another starts soon after
+	// the site frees a slot. Default 30s.
+	// +optional
+	DeferInterval *metav1.Duration `json:"deferInterval,omitempty"`
 
 	// retryStrategy bounds the new attempts after a job is lost: cancelled on
 	// the site, behind an executor without a heartbeat for executorLostTimeout,

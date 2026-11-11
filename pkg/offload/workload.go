@@ -322,7 +322,7 @@ func (r *WorkloadReconciler) retry(ctx context.Context, s site, wl *kueue.Worklo
 // deferAttempt gives up on an attempt whose job the site would not start
 // within maxStartDelay, before it is submitted, so that a job the site would
 // keep waiting does not hold the quota meanwhile. It deactivates the Workload
-// for Kueue's backoff counted by the attempt, as a user stops one: Kueue evicts
+// for the site's deferInterval, as a user stops one: Kueue evicts
 // it at once, which releases the quota, and queues it again once reactivate
 // sets spec.active back. A Retry with requeueAfterSeconds would keep the
 // quota: Kueue evicts the Workload only when requeueAt has passed. The check
@@ -332,10 +332,8 @@ func (r *WorkloadReconciler) deferAttempt(ctx context.Context, s site, wl *kueue
 	if err := syncSinglePod(ctx, r.Client, r.APIReader, wl.Namespace, owner, nil, r.now()); err != nil {
 		return err
 	}
-	backoff := kueue.AdmissionCheckState{RetryCount: ptr.To(q.Spec.Attempt - 1)}
-	kueueworkload.UpdateAdmissionCheckRequeueState(&backoff, s.backoffBaseSeconds, s.backoffMaxSeconds, clock.RealClock{})
-	after := *backoff.RequeueAfterSeconds
-	until := r.now().Add(time.Duration(after) * time.Second).UTC().Truncate(time.Second)
+	after := int64(s.deferInterval / time.Second)
+	until := r.now().Add(s.deferInterval).UTC().Truncate(time.Second)
 	msg := deferMessage(q.Status.Estimate, until)
 	if err := r.setCheck(ctx, wl, name, kueue.CheckStatePending, msg); err != nil {
 		return err

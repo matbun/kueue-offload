@@ -19,6 +19,11 @@ import (
 
 const limitText = "sbatch: error: QOSMaxSubmitJobPerUserLimit"
 
+// withDeferInterval sets the OffloadConfig's deferInterval.
+func withDeferInterval(d time.Duration) envOption {
+	return withConfig(func(sc *v1alpha1.OffloadConfig) { sc.Spec.DeferInterval = &metav1.Duration{Duration: d} })
+}
+
 // withMaxStartDelay sets the OffloadConfig's maxStartDelay.
 func withMaxStartDelay(d time.Duration) envOption {
 	return withConfig(func(sc *v1alpha1.OffloadConfig) { sc.Spec.MaxStartDelay = &metav1.Duration{Duration: d} })
@@ -66,7 +71,7 @@ func TestEstimateInCheckMessage(t *testing.T) {
 }
 
 // A start within maxStartDelay keeps the attempt; one further away, or none
-// while a submit limit holds, deactivates the Workload for the backoff before
+// while a submit limit holds, deactivates the Workload for deferInterval before
 // the submit, which releases the quota at once, never counted as a retry. The
 // check stays Pending with the reason.
 func TestEstimateDefers(t *testing.T) {
@@ -77,8 +82,8 @@ func TestEstimateDefers(t *testing.T) {
 		msg      string
 	}{
 		{"within", 300 * time.Second, false, "Slurm expects to start 1 node(s) at 2026-10-29T10:05:00Z"},
-		{"beyond", 301 * time.Second, true, "Slurm expects to start 1 node(s) at 2026-10-29T10:05:01Z, in 301 s: Workload deactivated until 2026-10-29T10:01:00Z, quota released"},
-		{"submit limit", -1, true, "no start time from Slurm (QOSMaxSubmitJobPerUserLimit): " + limitText + "; Workload deactivated until 2026-10-29T10:01:00Z, quota released"},
+		{"beyond", 301 * time.Second, true, "Slurm expects to start 1 node(s) at 2026-10-29T10:05:01Z, in 301 s: Workload deactivated until 2026-10-29T10:00:30Z, quota released"},
+		{"submit limit", -1, true, "no start time from Slurm (QOSMaxSubmitJobPerUserLimit): " + limitText + "; Workload deactivated until 2026-10-29T10:00:30Z, quota released"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			// backoffLimitCount 0 rejects at the first lost attempt, but not here.
@@ -101,14 +106,14 @@ func TestEstimateDefers(t *testing.T) {
 			if st.State != kueue.CheckStatePending || st.Message != tt.msg || st.RequeueAfterSeconds != nil || !deleted {
 				t.Fatalf("check = %s %q after %v, request deleted %v", st.State, st.Message, st.RequeueAfterSeconds, deleted)
 			}
-			if ptr.Deref(wl.Spec.Active, true) || wl.Annotations[DeferredUntilAnnotation] != "2026-10-29T10:01:00Z" {
+			if ptr.Deref(wl.Spec.Active, true) || wl.Annotations[DeferredUntilAnnotation] != "2026-10-29T10:00:30Z" {
 				t.Fatalf("Workload active %v, %s %q", wl.Spec.Active, DeferredUntilAnnotation, wl.Annotations[DeferredUntilAnnotation])
 			}
-			if ev := fmt.Sprintf("Normal Deferred %s; requeued in 60s", tt.msg); !hasEvent(e.drainEvents(), ev) {
+			if ev := fmt.Sprintf("Normal Deferred %s; requeued in 30s", tt.msg); !hasEvent(e.drainEvents(), ev) {
 				t.Errorf("no event %q", ev)
 			}
-			if res := e.reconcile(); res.RequeueAfter != time.Minute {
-				t.Errorf("requeued after %v, want the backoff's 1m", res.RequeueAfter)
+			if res := e.reconcile(); res.RequeueAfter != 30*time.Second {
+				t.Errorf("requeued after %v, want deferInterval's 30s", res.RequeueAfter)
 			}
 		})
 	}
@@ -146,22 +151,22 @@ func TestDeferralReactivates(t *testing.T) {
 			e.reconcile()
 			e.loseReservation()
 			e.executorLetsGo(1)
-			if res := e.reconcile(); res.RequeueAfter != time.Minute {
-				t.Errorf("requeued after %v, want 1m", res.RequeueAfter)
+			if res := e.reconcile(); res.RequeueAfter != 30*time.Second {
+				t.Errorf("requeued after %v, want 30s", res.RequeueAfter)
 			}
 			if q := e.request(1); !reflect.DeepEqual(q.Finalizers, []string{v1alpha1.AttemptFinalizer}) {
-				t.Errorf("finalizers %v during the backoff, want the attempt's", q.Finalizers)
+				t.Errorf("finalizers %v during the deferral, want the attempt's", q.Finalizers)
 			}
-			e.now = e.now.Add(59 * time.Second)
+			e.now = e.now.Add(29 * time.Second)
 			if res := e.reconcile(); res.RequeueAfter != time.Second || ptr.Deref(e.workload().Spec.Active, true) {
-				t.Fatalf("reactivated %v before the backoff ended, requeued after %v", e.workload().Spec.Active, res.RequeueAfter)
+				t.Fatalf("reactivated %v before the deferral ended, requeued after %v", e.workload().Spec.Active, res.RequeueAfter)
 			}
 			e.now = e.now.Add(time.Second)
 			e.drainEvents()
 			e.reconcile()
 			wl := e.workload()
 			if !ptr.Deref(wl.Spec.Active, true) || wl.Annotations[DeferredUntilAnnotation] != "" {
-				t.Fatalf("Workload active %v, annotations %v after the backoff", wl.Spec.Active, wl.Annotations)
+				t.Fatalf("Workload active %v, annotations %v after the deferral", wl.Spec.Active, wl.Annotations)
 			}
 			if ev := "Normal Reactivated deferral over"; !hasEvent(e.drainEvents(), ev) {
 				t.Errorf("no event %q", ev)
@@ -184,6 +189,34 @@ func TestDeferralReactivates(t *testing.T) {
 				t.Errorf("owner status %v, want it untouched: %v", got, owners)
 			}
 		})
+	}
+}
+
+// A deferral waits for the site, it is not a failure: every one deactivates the
+// Workload for the same deferInterval, never the retryStrategy's doubling
+// backoff, so a job queued behind a long one starts soon after a slot frees.
+func TestDeferIntervalDoesNotBackOff(t *testing.T) {
+	e := newEnv(t, withMaxStartDelay(5*time.Minute), withDeferInterval(45*time.Second), withRetryStrategy(&kueue.ProvisioningRequestRetryStrategy{
+		BackoffLimitCount: ptr.To[int32](3), BackoffBaseSeconds: ptr.To[int32](60), BackoffMaxSeconds: ptr.To[int32](1800),
+	}))
+	e.reconcile()
+	for attempt := int32(1); attempt <= 3; attempt++ {
+		e.takes(attempt)
+		e.report(attempt, e.estimated(-1))
+		e.reconcile()
+		want := e.now.Add(45 * time.Second).UTC().Format(time.RFC3339)
+		if wl := e.workload(); ptr.Deref(wl.Spec.Active, true) || wl.Annotations[DeferredUntilAnnotation] != want {
+			t.Fatalf("attempt %d: active %v, deferred until %q, want %s", attempt, wl.Spec.Active, wl.Annotations[DeferredUntilAnnotation], want)
+		}
+		e.loseReservation()
+		e.executorLetsGo(attempt)
+		if res := e.reconcile(); res.RequeueAfter != 45*time.Second {
+			t.Fatalf("attempt %d: requeued after %v, want 45s", attempt, res.RequeueAfter)
+		}
+		e.now = e.now.Add(45 * time.Second)
+		e.reconcile()
+		e.reserveAgain()
+		e.reconcile()
 	}
 }
 

@@ -85,8 +85,10 @@ executor stops asking once the attempt's stage-in started or its job was submitt
 While no job is submitted, the controller shows the estimate in the check message: `Slurm expects
 to start N node(s) at <UTC>`. With the OffloadConfig's `maxStartDelay` set, when `startTime -
 probeTime` is above `maxStartDelay` or there is no `startTime`, it deletes the attempt's request and
-deactivates the Workload (`spec.active: false`) for the `retryStrategy` backoff counted by the
-attempt, recording when in the annotation `offload.interlink.eu/deferred-until`. Kueue evicts a
+deactivates the Workload (`spec.active: false`) for `deferInterval` (default 30s), recording when
+in the annotation `offload.interlink.eu/deferred-until`. Every deferral waits the same
+`deferInterval`, never the `retryStrategy` backoff: it waits for the site and is not a failure, so
+a job queued behind another starts soon after the site frees a slot. Kueue evicts a
 deactivated Workload at once, which releases the quota, so that a job the site would keep waiting
 does not hold the project's quota meanwhile. The check stays `Pending` with `..., in <s> s: Workload
 deactivated until <UTC>, quota released` (event `Deferred`). When that time comes the controller
@@ -217,7 +219,7 @@ Per Workload, for each of its checks this controller serves:
 | check `Pending`, no OffloadConfig | nothing, requeue after a minute (the check is inactive) |
 | reserved, owner of an unsupported kind | check `Rejected` |
 | reserved, check `Pending`, no live request | create the next attempt's OffloadRequest ([The OffloadRequest](#the-offloadrequest)); refusals found while building it (account label, flavors, time limit, a RayJob's entrypoint) are `Rejected` |
-| a live request | map its status, newest first in this order: `Accepted=False`: check `Rejected` with the condition's message, owner `Failed` (reason `Rejected`); `Finished=True`: owner's terminal status ([Owners](#owners)), check stays `Pending` with `job N completed` or `job N failed: <message>`; `Evicted=True`: [Retries](#retries) (`job N cancelled: <message>`); no heartbeat for `executorLostTimeout`: [Retries](#retries); `QuotaReserved=True` for `maxQueueTime` without `Admitted`: [Retries](#retries); no job submitted and a `status.estimate` beyond `maxStartDelay`: Workload deactivated for the backoff, check `Pending` ([Start estimate](#start-estimate)); otherwise `Pending` with the state in the message, and a single owner pod's status follows the job ([Notebooks and Services](#notebooks-and-services)) |
+| a live request | map its status, newest first in this order: `Accepted=False`: check `Rejected` with the condition's message, owner `Failed` (reason `Rejected`); `Finished=True`: owner's terminal status ([Owners](#owners)), check stays `Pending` with `job N completed` or `job N failed: <message>`; `Evicted=True`: [Retries](#retries) (`job N cancelled: <message>`); no heartbeat for `executorLostTimeout`: [Retries](#retries); `QuotaReserved=True` for `maxQueueTime` without `Admitted`: [Retries](#retries); no job submitted and a `status.estimate` beyond `maxStartDelay`: Workload deactivated for `deferInterval`, check `Pending` ([Start estimate](#start-estimate)); otherwise `Pending` with the state in the message, and a single owner pod's status follows the job ([Notebooks and Services](#notebooks-and-services)) |
 
 The `Pending` messages: `StagingOut`: `job N ended, staging out: <message>`; `Admitted`: `job N
 running on <node> since <start>`; `QuotaReserved`: `job N queued (<reason>): <message>`;

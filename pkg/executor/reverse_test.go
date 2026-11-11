@@ -138,6 +138,11 @@ func TestReverseRefusals(t *testing.T) {
 			r.Spec.PodSets[0].Template.Annotations[LauncherAnnotation] = "torchrun"
 			return r
 		}(), LauncherAnnotation},
+		{"site launcher from the flavor", enabled, func() *v1alpha1.OffloadRequest {
+			r := reverseRequest(2, reverseTarget+":5000")
+			r.Spec.PodSets[0].Annotations[LauncherAnnotation] = "torchrun"
+			return r
+		}(), LauncherAnnotation},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

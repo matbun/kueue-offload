@@ -186,15 +186,40 @@ func TestKubeRayLabelValue(t *testing.T) {
 	}
 }
 
-func TestRayHeadAloneRefused(t *testing.T) {
+// TestRayHeadAlone: a Ray owner whose worker groups have no replicas, or that
+// has none, runs its head alone, through the launcher; a worker group of no
+// replicas is not sent, and the executor sees the same PodSets.
+func TestRayHeadAlone(t *testing.T) {
 	for _, k := range []ownerKind{rayJobKind, rayClusterKind} {
-		t.Run(k.gvk.Kind, func(t *testing.T) {
-			wl := rayWorkload(k, 0, k == rayJobKind)
-			_, err := buildPodSets(wl, resolveSite(offloadConfig()), "proj42", nil)
-			if err == nil || !strings.Contains(err.Error(), "needs a head and at least one worker") {
-				t.Errorf("err %v", err)
-			}
-		})
+		for name, groups := range map[string]bool{"worker group of 0": true, "no worker group": false} {
+			t.Run(k.gvk.Kind+" "+name, func(t *testing.T) {
+				wl := rayWorkload(k, 0, k == rayJobKind)
+				if !groups {
+					wl.Spec.PodSets = slices.DeleteFunc(wl.Spec.PodSets, func(ps kueue.PodSet) bool { return ps.Count == 0 })
+					wl.Status.Admission.PodSetAssignments = slices.DeleteFunc(wl.Status.Admission.PodSetAssignments,
+						func(a kueue.PodSetAssignment) bool { return ptr.Deref(a.Count, 1) == 0 })
+				}
+				podSets, err := buildPodSets(wl, resolveSite(offloadConfig()), "proj42", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := podSetNames(podSets); !slices.Equal(got, []string{string(rayHeadPodSet)}) || podSets[0].Count != 1 {
+					t.Fatalf("PodSets %v, want the head alone", got)
+				}
+				if got := podSets[0].Template.Annotations[launcherAnnotation]; got == "" {
+					t.Errorf("the head names no launcher")
+				}
+				got, admitted, err := RequestPodSets(wl, func(*metav1.OwnerReference) (metav1.Object, error) {
+					return rayJobObject(map[string]any{"entrypoint": "python train.py"}), nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(got) != 1 || len(admitted) != 1 || got[0].Name != rayHeadPodSet || admitted[0].Name != rayHeadPodSet {
+					t.Errorf("the executor checks against %d PodSets and %d assignments, want the head's", len(got), len(admitted))
+				}
+			})
+		}
 	}
 }
 

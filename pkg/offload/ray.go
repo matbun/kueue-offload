@@ -61,18 +61,26 @@ func rayOwnerOf(wl *kueue.Workload) *metav1.OwnerReference {
 }
 
 // runPodSets are the Workload's PodSets that run, with their assignments: all
-// of them, less a RayJob's submitter, which would submit the entrypoint from the
-// cluster to the head; the head runs it itself.
+// of them, less a Ray owner's worker groups of no replicas and a RayJob's
+// submitter, which would submit the entrypoint from the cluster to the head; the
+// head runs it itself.
 func runPodSets(wl *kueue.Workload) ([]kueue.PodSet, []kueue.PodSetAssignment) {
 	var assignments []kueue.PodSetAssignment
 	if wl.Status.Admission != nil {
 		assignments = wl.Status.Admission.PodSetAssignments
 	}
-	if c := rayOwnerOf(wl); c == nil || c.Kind != rayJobKind.gvk.Kind {
+	c := rayOwnerOf(wl)
+	if c == nil {
 		return wl.Spec.PodSets, assignments
 	}
-	podSets := slices.DeleteFunc(slices.Clone(wl.Spec.PodSets), func(ps kueue.PodSet) bool { return ps.Name == raySubmitterPodSet })
-	assignments = slices.DeleteFunc(slices.Clone(assignments), func(a kueue.PodSetAssignment) bool { return a.Name == raySubmitterPodSet })
+	skip := map[kueue.PodSetReference]bool{}
+	for _, ps := range wl.Spec.PodSets {
+		if ps.Count == 0 || (c.Kind == rayJobKind.gvk.Kind && ps.Name == raySubmitterPodSet) {
+			skip[ps.Name] = true
+		}
+	}
+	podSets := slices.DeleteFunc(slices.Clone(wl.Spec.PodSets), func(ps kueue.PodSet) bool { return skip[ps.Name] })
+	assignments = slices.DeleteFunc(slices.Clone(assignments), func(a kueue.PodSetAssignment) bool { return skip[a.Name] })
 	return podSets, assignments
 }
 
@@ -90,16 +98,14 @@ var rayHeadPorts = []corev1.ContainerPort{
 // dashboard and client ports in its first container, which the shadow then
 // forwards, and carries the labels KubeRay gives the head pod, so that the
 // shadow is published to its head Service <name>-head-svc. A Ray owner of its
-// head alone is refused: the executor makes a pod group, which the launcher
-// needs, of two members or more.
-func rayPodSets(c *metav1.OwnerReference, podSets []v1alpha1.PodSet) error {
+// head alone runs as a pod group of one, which the executor makes for a member
+// that names a launcher.
+func rayPodSets(c *metav1.OwnerReference, podSets []v1alpha1.PodSet) {
 	launcher := RayJobLauncher
 	if c.Kind == rayClusterKind.gvk.Kind {
 		launcher = RayClusterLauncher
 	}
-	var members int32
 	for i := range podSets {
-		members += podSets[i].Count
 		t := &podSets[i].Template
 		if t.Annotations[launcherAnnotation] == "" {
 			if t.Annotations == nil {
@@ -118,11 +124,6 @@ func rayPodSets(c *metav1.OwnerReference, podSets []v1alpha1.PodSet) error {
 		}
 		t.Labels = rayHeadLabels(c.Name, t.Labels)
 	}
-	if members < 2 {
-		return fmt.Errorf("%s %s runs as one batch job through the site's %q launcher, which needs a head and at least one worker: give it a worker group of one replica or more",
-			c.Kind, c.Name, launcher)
-	}
-	return nil
 }
 
 // RequestPodSets is what an OffloadRequest for wl carries of the Workload's
@@ -141,9 +142,7 @@ func RequestPodSets(wl *kueue.Workload, get func(*metav1.OwnerReference) (metav1
 	for i, ps := range podSets {
 		prepared[i] = v1alpha1.PodSet{Name: ps.Name, Count: ps.Count, Template: *ps.Template.DeepCopy()}
 	}
-	if err := rayPodSets(c, prepared); err != nil {
-		return nil, nil, err
-	}
+	rayPodSets(c, prepared)
 	if c.Kind == rayJobKind.gvk.Kind {
 		owner, err := get(c)
 		if err != nil {

@@ -47,7 +47,61 @@ const (
 	GangRankAnnotation = "interlink.eu/gang-rank"
 	GangRoleHead       = "head"
 	GangRoleWorker     = "worker"
+
+	// GangEndAnnotation tells the plugin when a gang without a launcher ends:
+	// GangEndAll, when every rank has run its own command to its end. The
+	// plugin's default ends it with rank 0 and stops the others, the shape of a
+	// driver and its workers, which kueue-offload starts through a launcher.
+	GangEndAnnotation = "interlink.eu/gang-end"
+	GangEndAll        = "all"
 )
+
+// DisableOffloadInitContainersAnnotation names, comma separated, init containers
+// of the template that the job does not run, as the virtual kubelet reads it. The
+// virtual kubelet runs them on the cluster, in the pod's shadow; here they run
+// nowhere, since the pod never leaves its gate.
+const DisableOffloadInitContainersAnnotation = "interlink.eu/disable-offload-init-containers"
+
+// dropDisabledInitContainers removes from tmpl the init containers that its
+// DisableOffloadInitContainersAnnotation names, and the volumes that only they
+// mount, as the virtual kubelet leaves them out of the pod it sends.
+func dropDisabledInitContainers(tmpl *v1.PodTemplateSpec) {
+	names := map[string]bool{}
+	for _, name := range strings.Split(tmpl.Annotations[DisableOffloadInitContainersAnnotation], ",") {
+		if name = strings.TrimSpace(name); name != "" {
+			names[name] = true
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+	spec := &tmpl.Spec
+	var kept, dropped []v1.Container
+	for _, c := range spec.InitContainers {
+		if names[c.Name] {
+			dropped = append(dropped, c)
+		} else {
+			kept = append(kept, c)
+		}
+	}
+	if len(dropped) == 0 {
+		return
+	}
+	spec.InitContainers = kept
+	mountedBy := func(lists ...[]v1.Container) map[string]bool {
+		mounted := map[string]bool{}
+		for _, list := range lists {
+			for _, c := range list {
+				for _, m := range c.VolumeMounts {
+					mounted[m.Name] = true
+				}
+			}
+		}
+		return mounted
+	}
+	onlyDropped, used := mountedBy(dropped), mountedBy(spec.InitContainers, spec.Containers)
+	spec.Volumes = slices.DeleteFunc(spec.Volumes, func(v v1.Volume) bool { return onlyDropped[v.Name] && !used[v.Name] })
+}
 
 // defaultVolumeMode is the file mode the API server defaults volumes to.
 const defaultVolumeMode int32 = 0o644
@@ -94,12 +148,23 @@ func memberPodSet(req jobRequest, i int) int {
 	return -1
 }
 
+// headLauncher is the site launcher the head member names, from its template or
+// its flavor's annotations, which the plugin reads to start the whole gang.
+func headLauncher(req jobRequest) string {
+	ps := req.PodSets[memberPodSet(req, 0)]
+	if l := launcherName(ps.Template); l != "" {
+		return l
+	}
+	return strings.TrimSpace(ps.Annotations[LauncherAnnotation])
+}
+
 // buildMember returns member i of the request as the pod the plugin's create path
 // takes: its own PodSet's template, named after the owner, labelled with its
 // completion index within the whole workload, with its flavor's annotations
-// appended to the template's. A workload of more than one member is a Kueue pod
-// group of that size, member 0 (of the first PodSet) its head, unless its pods are
-// independent (podGroup). References are not resolved here.
+// appended to the template's. A workload of more than one member, or of one that
+// names a site launcher, is a Kueue pod group of that size, member 0 (of the first
+// PodSet) its head, unless its pods are independent (podGroup). References are not
+// resolved here.
 func buildMember(req jobRequest, i int) *v1.Pod {
 	ps := req.PodSets[memberPodSet(req, i)]
 	count := workloadMembers(req)
@@ -144,6 +209,10 @@ func buildMember(req jobRequest, i int) *v1.Pod {
 		default:
 			annotations[k] += " " + v
 		}
+	}
+
+	if podGroup(req) && headLauncher(req) == "" && annotations[GangEndAnnotation] == "" {
+		annotations[GangEndAnnotation] = GangEndAll
 	}
 
 	pod := &v1.Pod{

@@ -138,9 +138,7 @@ func buildPodSets(wl *kueue.Workload, s site, account string, wt *wallTime) ([]v
 		out = append(out, p)
 	}
 	if c := rayOwnerOf(wl); c != nil {
-		if err := rayPodSets(c, out); err != nil {
-			return nil, err
-		}
+		rayPodSets(c, out)
 	}
 	return out, nil
 }

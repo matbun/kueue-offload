@@ -32,9 +32,11 @@ const CapabilityEstimate = "estimate"
 var capabilitiesInterval = 5 * time.Minute
 
 // podGroup reports whether the request's members run as one Kueue pod group:
-// more than one, and not marked independent.
+// more than one, or one whose head names a site launcher, which the plugin
+// starts only for a pod group; and not marked independent.
 func podGroup(req jobRequest) bool {
-	return workloadMembers(req) > 1 && !independentPods(req)
+	n := workloadMembers(req)
+	return (n > 1 || (n == 1 && headLauncher(req) != "")) && !independentPods(req)
 }
 
 // independentPods reports whether every PodSet's template carries
@@ -104,7 +106,7 @@ func (d *Executor) pluginCapabilities(ctx context.Context) ([]string, *refusal) 
 // checkShape refuses a pod group the plugin cannot run as one allocation
 // (backends.md 3.6): its ranks would start as separate jobs, possibly hours
 // apart, each holding its allocation while it waits for the others. A single pod
-// and independent pods run on any plugin.
+// that names no site launcher and independent pods run on any plugin.
 func (d *Executor) checkShape(ctx context.Context, req jobRequest) *refusal {
 	if !podGroup(req) {
 		return nil
@@ -115,6 +117,10 @@ func (d *Executor) checkShape(ctx context.Context, req jobRequest) *refusal {
 	}
 	if slices.Contains(caps, CapabilityPodGroup) {
 		return nil
+	}
+	if workloadMembers(req) == 1 {
+		return permanentError("the workload names site launcher %q, which runs only a pod group, but the site's plugin does not list capability %q",
+			headLauncher(req), CapabilityPodGroup)
 	}
 	return permanentError("the workload's %d pods run as one allocation, but the site's plugin does not list capability %q; "+
 		"annotate the owner with %s: \"true\" to run one job per pod", workloadMembers(req), CapabilityPodGroup, executorapi.IndependentPodsAnnotation)

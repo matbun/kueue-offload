@@ -40,8 +40,9 @@ const (
 	// specHashAnnotation records what a Deployment or Service was rendered from, so
 	// that applying the same Spec again writes nothing and restarts nothing.
 	specHashAnnotation = "interlink.eu/shadow-spec-hash"
-	// nodeAnnotation is set on the shadow's pods when the compute node changes.
-	nodeAnnotation = "interlink.eu/shadow-node"
+	// nodeAnnotation is set on the shadow's pods when the compute node changes, under
+	// kueue-offload's prefix: site policies may freeze interlink.eu/ pod annotations.
+	nodeAnnotation = "offload.interlink.eu/shadow-node"
 )
 
 // ErrNameTaken is returned by Ensure when an object with a shadow's name exists

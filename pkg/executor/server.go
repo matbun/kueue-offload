@@ -81,6 +81,7 @@ func jobRequestOf(q *v1alpha1.OffloadRequest) jobRequest {
 			}
 			ps.Template.Annotations[k] = v
 		}
+		dropDisabledInitContainers(&ps.Template)
 		req.PodSets = append(req.PodSets, ps)
 	}
 	return req

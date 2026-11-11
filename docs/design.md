@@ -157,8 +157,9 @@ RayJob's submitter PodSet is not sent: every PodSet's first container runs a sho
 that hands the entrypoint, the whole `runtimeEnvYAML`, `metadata`, `jobId` and the entrypoint
 resources to the head's Ray job server (found through `RAY_ADDRESS`, which the launcher sets), as
 KubeRay's HTTP submission does, prints the job's logs and exits non-zero unless the job succeeded.
-A RayJob without an entrypoint is refused, and so is a Ray owner without a worker: the executor
-reaches a launcher only for a pod group of more than one member. A RayJob finishes through
+A RayJob without an entrypoint is refused. A Ray owner of its head alone (no worker group, or
+worker groups of 0 replicas, which are not sent) runs on one node, as a pod group of one
+([Workload shapes](#workload-shapes)). A RayJob finishes through
 `status.jobDeploymentStatus` (`Complete` or `Failed`) and `jobStatus` (`SUCCEEDED` or `FAILED`),
 which Kueue's integration reads. A RayCluster has no terminal state that Kueue reads: when its job
 ends the controller deactivates its Workload (`spec.active: false`), which releases the quota, and
@@ -376,7 +377,7 @@ The executor of the namespace whose site is `spec.site` takes a request by addin
 | Field | Meaning |
 | --- | --- |
 | `lastSyncTime` | the heartbeat, on every poll, also when nothing changed ([Executor heartbeat](#executor-heartbeat)) |
-| condition `Accepted` | `True` once taken; `False` for a permanent refusal, with the refusal as message: an account not in `AllowedAccounts`, a site it does not serve, a member outside the site's `Resources` or a Slurm option outside its `AllowedFlags` ([Configuration](#configuration)), a request its Workload does not match (below), PodSets of one allocation with different annotations (or, with a launcher, different containers), several pods in one allocation on a plugin that does not list `pod-group`, exposed ports or reverse forwards on a site with no `Shadow.LoginHost`, more than 9999 members, a stage path outside the staging volumes or on a volume whose claim the namespace lacks, a failed stage-in, a reference it cannot read, a token it may not request, the plugin refusing the job with 400, 403 or 422 |
+| condition `Accepted` | `True` once taken; `False` for a permanent refusal, with the refusal as message: an account not in `AllowedAccounts`, a site it does not serve, a member outside the site's `Resources` or a Slurm option outside its `AllowedFlags` ([Configuration](#configuration)), a request its Workload does not match (below), PodSets of one allocation with different annotations (or, with a launcher, different containers), several pods in one allocation, or one that names a site launcher, on a plugin that does not list `pod-group`, exposed ports or reverse forwards on a site with no `Shadow.LoginHost`, more than 9999 members, a stage path outside the staging volumes or on a volume whose claim the namespace lacks, a failed stage-in, a reference it cannot read, a token it may not request, the plugin refusing the job with 400, 403 or 422 |
 | condition `StagingIn` | `True` while the stage-in Job runs |
 | condition `QuotaReserved` | `True` once the job is submitted and waits in the site's queue; its `lastTransitionTime` starts `maxQueueTime` |
 | condition `Admitted` | `True` while a container of a rank runs, or the head has a node; `False` while the job waits in the site's queue, also while ranks of independent pods wait for the site after the others ended |
@@ -644,7 +645,8 @@ failed ping leaves the request waiting without a heartbeat.
 
 | Shape (Workload PodSets) | Plugin that lists `pod-group` | Plugin without it |
 | --- | --- | --- |
-| one pod: a single pod, a Job with parallelism 1 | one job | one job |
+| one pod that names no site launcher: a single pod, a Job with parallelism 1 | one job | one job |
+| one pod that names a site launcher (`interlink.eu/launcher`, on its template, the owner or the flavor): a 1-node TrainJob, a Ray owner of its head alone | one allocation of one node, a pod group of one, which the plugin starts through the launcher | refused (`Accepted=False`) naming the launcher and `pod-group` |
 | several pods: a Job with parallelism N, a pod group, a JobSet, a TrainJob | one allocation, ranks numbered across the PodSets | refused (`Accepted=False`) naming `pod-group` and `offload.interlink.eu/independent-pods` |
 | several pods, `offload.interlink.eu/independent-pods: "true"` on every template | one job per pod | one job per pod |
 
@@ -657,7 +659,12 @@ or mark the owner independent.
 
 The executor expands each PodSet into `count` member pods that exist only in its memory and sends
 each to `/create`, in rank order. Each template first gets the request's `ownerAnnotations` it
-does not set itself. Members are numbered across the PodSets in request order,
+does not set itself, and then loses the init containers that its
+`interlink.eu/disable-offload-init-containers` names (comma separated, as the virtual kubelet reads
+it) and the volumes that only they mount. The virtual kubelet runs them on the cluster, in the
+shadow; here the pod stays gated and they run nowhere. A site sets it by admission policy for an
+init container that cluster policies inject into every pod and that breaks the site's container
+hooks. Members are numbered across the PodSets in request order,
 and `<count>` below is the total of every PodSet's count:
 
 - member `i` (0-based): `metadata.name` `<owner name>-<i>`, `uid` a name-based UUID of the
@@ -668,11 +675,14 @@ and `<count>` below is the total of every PodSet's count:
 - a Workload of one plain pod is that pod: the member takes the pod's name, and its downward API
   reports the pod's UID (annotation `interlink.eu/downward-uid`), because a workflow engine's
   executor (Argo's) addresses its own pod by name and UID;
-- `count > 1` and not independent pods: also Kueue's pod-group label
+- a pod group (`count > 1`, or one member that names a site launcher, and not independent pods):
+  also Kueue's pod-group label
   `kueue.x-k8s.io/pod-group-name: <workloadUID>` and annotation
   `kueue.x-k8s.io/pod-group-total-count: "<count>"`, and the Slurm plugin's `interlink.eu/gang-rank`
   and `interlink.eu/gang-role` (member 0 of the first PodSet is the head), so the plugin's gang path
-  buffers the members and submits one `sbatch --nodes=<count>`. It answers the members before the
+  buffers the members and submits one `sbatch --nodes=<count>`. When the head names no launcher
+  (`interlink.eu/launcher`), the members also carry `interlink.eu/gang-end: all`: each runs its own
+  command to its end, as a JobSet's replicas do, instead of ending with the head. It answers the members before the
   last with no job ID; the job ID is the last non-empty one. A plugin that lists `pod-group-create`
   gets the members in one `/createPodGroup`, in rank order, and answers every one with the
   job ID ([backends.md](backends.md) 3.3). Independent pods carry none of these
@@ -828,8 +838,9 @@ A head template with `interlink.eu/reverse-forwards` also gets a tunnel from the
 to the listed cluster endpoints (`ssh-reverse`), parsed with the virtual kubelet's rules plus
 `Shadow.Reverse.AllowedTargets`; its set-up goes before rank 0's `slurm-job.vk.io/pre-exec`, as the
 virtual kubelet puts it. It needs `Shadow.Reverse.Enabled` and a plugin that reports a socket
-directory, and a gang with a site launcher cannot have one, because only the head rank has the
-tunnel. Of independent pods only rank 0, the head, has it.
+directory, and a gang of more than one node with a site launcher cannot have one, because only the
+head rank has the tunnel; the plugin sets it up for a gang of one node in the batch shell, before
+the launcher. Of independent pods only rank 0, the head, has it.
 
 `pkg/executor` talks to `pkg/shadow` through this interface:
 

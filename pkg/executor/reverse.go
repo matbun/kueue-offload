@@ -44,8 +44,9 @@ func (d *Executor) reverseTunnel(req jobRequest) (*shadow.ReverseTunnel, *refusa
 		return nil, permanentError("%s is set, but this executor runs no shadows (Shadow.Enabled) to carry the tunnel", shadow.AnnReverseForwards)
 	}
 	// A site launcher starts every rank from the batch shell, where the tunnel's
-	// /etc/hosts would reach ranks on nodes that have no relay.
-	if podGroup(req) && launcherName(ps.Template) != "" {
+	// /etc/hosts would reach ranks on nodes that have no relay. A gang of one node
+	// sets the tunnel up there.
+	if workloadMembers(req) > 1 && podGroup(req) && headLauncher(req) != "" {
 		return nil, permanentError("%s cannot be combined with %s: only the head rank has the tunnel", shadow.AnnReverseForwards, LauncherAnnotation)
 	}
 	rcfg := cfg.Shadow.Reverse

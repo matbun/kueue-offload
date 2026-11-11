@@ -320,6 +320,7 @@ reads it on every PodSet's template (`pkg/executor/capabilities.go:33`).
 | Shape (Workload PodSets) | Plugin with `pod-group` | Plugin without it |
 | --- | --- | --- |
 | single pod, or a Job with parallelism 1 (one PodSet, count 1) | one job | one job |
+| one pod whose template names a site launcher (`interlink.eu/launcher`) | one allocation of one node (a pod group of one) | refused |
 | Job with parallelism N (one PodSet, count N) | one allocation of N ranks | refused; N jobs with `independent-pods` |
 | pod group (k PodSets, N pods) | one allocation | refused; N jobs with `independent-pods` |
 | JobSet (one PodSet per replicated job) | one allocation, ranks numbered across PodSets | refused; N jobs with `independent-pods` |

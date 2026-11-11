@@ -260,9 +260,9 @@ func TestReadyCarriesPodSetUpdates(t *testing.T) {
 	st := e.check("hpc-a")
 	want := []kueue.PodSetUpdate{{
 		Name:         "main",
-		Labels:       map[string]string{v1alpha1.NodeLabel: "kueue-offload-hpc-a"},
+		Labels:       map[string]string{v1alpha1.NodeLabel: "hpc-a-vk"},
 		Annotations:  map[string]string{v1alpha1.WorkloadAnnotation: wlName},
-		NodeSelector: map[string]string{v1alpha1.NodeLabel: "kueue-offload-hpc-a"},
+		NodeSelector: map[string]string{v1alpha1.NodeLabel: "hpc-a-vk"},
 		Tolerations: []corev1.Toleration{
 			{Key: "node.kubernetes.io/not-ready", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute},
 			{Key: "node.kubernetes.io/unreachable", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute},

@@ -160,7 +160,7 @@ func TestLogsFromTheNamespaceExecutor(t *testing.T) {
 	intruder := testPod("train-1", "1")
 	intruder.Namespace = "bob"
 	elsewhere := testPod("train-2", "0")
-	elsewhere.Labels[v1alpha1.NodeLabel] = "kueue-offload-hpc-b"
+	elsewhere.Labels[v1alpha1.NodeLabel] = "hpc-b-vk"
 	var calls []apiCall
 	called := false
 	p = &Provider{Reader: fakeClient(t, &calls, intruder, elsewhere, testWorkload(), testConfig()),

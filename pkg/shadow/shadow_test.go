@@ -200,6 +200,51 @@ func TestEnsureNotebook(t *testing.T) {
 	}
 }
 
+// With Kerberos the shadow logs in with a ticket from the keytab: no key Secret is
+// needed or mounted, and kinit runs before the tunnel and again every 6 h.
+func TestEnsureNotebookKerberos(t *testing.T) {
+	cfg := testConfig()
+	cfg.KeySecret = ""
+	cfg.Kerberos = &KerberosConfig{KeytabSecret: "alice-keytab", KeytabKey: "user.keytab", Principal: "alice@HPC-A.EXAMPLE.ORG", Krb5ConfigMap: "krb5-config"}
+	client, m := newTestManager(t, cfg)
+	if _, err := m.Ensure(t.Context(), notebookSpec()); err != nil {
+		t.Fatal(err)
+	}
+	d := getDeployment(t, client, testShadow)
+	pod := d.Spec.Template.Spec
+	if got := containerNames(pod.InitContainers); !slices.Equal(got, []string{"wait-for-node", "kinit"}) {
+		t.Errorf("init containers %v", got)
+	}
+	if got := containerNames(pod.Containers); !slices.Equal(got, []string{"kinit-renew", "ssh-forward"}) {
+		t.Errorf("containers %v", got)
+	}
+	for _, c := range append(pod.InitContainers, pod.Containers...) {
+		assertShellParses(t, c)
+	}
+	if got := container(t, d, "kinit-renew").Args[0]; !strings.Contains(got, "kinit -k -t /interlink/keytab/user.keytab alice@HPC-A.EXAMPLE.ORG") {
+		t.Errorf("kinit-renew script %q", got)
+	}
+	script := container(t, d, "ssh-forward").Args[0]
+	for _, s := range []string{"-o GSSAPIAuthentication=yes", "-o GSSAPIDelegateCredentials=no"} {
+		if !strings.Contains(script, s) {
+			t.Errorf("ssh-forward script lacks %q", s)
+		}
+	}
+	if strings.Contains(script, "-i /interlink/ssh/") {
+		t.Error("ssh-forward script uses a key")
+	}
+	var volumes []string
+	for _, v := range pod.Volumes {
+		volumes = append(volumes, v.Name)
+	}
+	if !slices.Equal(volumes, []string{"shadow-node", "shadow-keytab", "shadow-krb5cc", "shadow-krb5-config", "shadow-known-hosts"}) {
+		t.Errorf("volumes %v", volumes)
+	}
+	if got := pod.Volumes[1].Secret.SecretName; got != "alice-keytab" {
+		t.Errorf("keytab volume mounts %s", got)
+	}
+}
+
 // A job that forwards no TCP port and has no reverse tunnel gets no shadow:
 // nothing is written.
 func TestEnsureWithoutTunnelsIsNone(t *testing.T) {
@@ -580,6 +625,13 @@ func TestNormalizeConfig(t *testing.T) {
 		t.Errorf("exec mode: %v, %+v", err, execMode)
 	}
 
+	kerberos := testConfig()
+	kerberos.KeySecret = ""
+	kerberos.Kerberos = &KerberosConfig{KeytabSecret: "alice-keytab", KeytabKey: "user.keytab", Principal: "alice@HPC-A.EXAMPLE.ORG"}
+	if err := NormalizeConfig(&kerberos); err != nil {
+		t.Errorf("kerberos without a key secret: %v", err)
+	}
+
 	for name, broken := range map[string]func(*Config){
 		"reverse without login": func(c *Config) { c.LoginHost, c.Reverse.Enabled = "", true },
 		"login host injection":  func(c *Config) { c.LoginHost = "login;id" },
@@ -601,6 +653,12 @@ func TestNormalizeConfig(t *testing.T) {
 			c.Reverse.AllowSocks, c.Reverse.AllowedTargets = true, []string{"mlflow.alice.svc.cluster.local:443"}
 		},
 		"negative wait": func(c *Config) { c.NodeWaitTimeout = "-1m" },
+		"kerberos without principal": func(c *Config) {
+			c.Kerberos = &KerberosConfig{KeytabSecret: "alice-keytab", KeytabKey: "user.keytab"}
+		},
+		"kerberos principal injection": func(c *Config) {
+			c.Kerberos = &KerberosConfig{KeytabSecret: "alice-keytab", KeytabKey: "user.keytab", Principal: "alice@EXAMPLE.ORG;id"}
+		},
 	} {
 		cfg := testConfig()
 		broken(&cfg)

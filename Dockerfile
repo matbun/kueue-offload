@@ -5,7 +5,8 @@ RUN go mod download
 COPY api/ api/
 COPY cmd/ cmd/
 COPY pkg/ pkg/
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/ ./cmd/...
+ARG VERSION=dev
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X github.com/matbun/kueue-offload/pkg/node.KubeletVersion=${VERSION}" -o /out/ ./cmd/...
 
 FROM gcr.io/distroless/static:nonroot
 COPY --from=build /out/ /

@@ -238,7 +238,7 @@ func TestNodeAccessWarning(t *testing.T) {
 // An OffloadConfig whose node name is no label value gets an event and no node.
 func TestNodeNameNotALabelValue(t *testing.T) {
 	cfg := testConfig()
-	cfg.Name = strings.Repeat("a", 60)
+	cfg.Name = strings.Repeat("a", 61)
 	e := newNodeEnv(t, cfg)
 	e.reconcile(t, cfg.Name)
 	nodes := &corev1.NodeList{}

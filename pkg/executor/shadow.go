@@ -45,6 +45,7 @@ func (c Config) shadowConfig() shadow.Config {
 		Port:                s.Port,
 		KeySecret:           s.KeySecret,
 		KeySecretKey:        s.KeySecretKey,
+		Kerberos:            s.Kerberos,
 		KnownHostsConfigMap: s.KnownHostsConfigMap,
 		NodeHostKeys:        s.NodeHostKeys,
 		ForwardTarget:       s.ForwardTarget,

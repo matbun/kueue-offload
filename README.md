@@ -22,7 +22,7 @@ virtual kubelet makes, so any batch system reachable through an interLink plugin
 
 | Component | Where | What it does |
 | --- | --- | --- |
-| offload controller (`cmd/offload-controller`) | one Deployment for every site, namespace `kueue-offload` | Kueue admission check controller (`controllerName: interlink.eu/offload`), each check with its own `OffloadConfig`: hands a Workload whose quota is reserved to the user's executor as an `OffloadRequest` per attempt, keeps the check `Pending` with the batch system's state in its message while the job waits, and sets it `Ready` once the job started, so that Kueue admits the Workload and the owner (Job, JobSet, TrainJob, RayJob, RayCluster or pods) makes its pods. Runs one virtual node per site, `kueue-offload-<OffloadConfig>`: binds those pods to it, shows on each the state of the member it stands for, so that owners end from their pods, and serves their logs from the executor (kubelet API on port 10250). Refuses a wall time above the flavor's queue limit, and releases the quota of a job the site would start too late (its start estimate). Keeps each site's `OffloadWorker` `Active` from its login endpoint. Holds no Secret and creates no pod |
+| offload controller (`cmd/offload-controller`) | one Deployment for every site, namespace `kueue-offload` | Kueue admission check controller (`controllerName: interlink.eu/offload`), each check with its own `OffloadConfig`: hands a Workload whose quota is reserved to the user's executor as an `OffloadRequest` per attempt, keeps the check `Pending` with the batch system's state in its message while the job waits, and sets it `Ready` once the job started, so that Kueue admits the Workload and the owner (Job, JobSet, TrainJob, RayJob, RayCluster or pods) makes its pods. Runs one virtual node per site, `<OffloadConfig>-vk`, whose kubelet version is the kueue-offload release: binds those pods to it, shows on each the state of the member it stands for, so that owners end from their pods, and serves their logs from the executor (kubelet API on port 10250). Refuses a wall time above the flavor's queue limit, and releases the quota of a job the site would start too late (its start estimate). Keeps each site's `OffloadWorker` `Active` from its login endpoint. Holds no Secret and creates no pod |
 | membership controller (`cmd/membership`) | one Deployment per site, namespace `kueue-offload-membership` | from the site's account associations and an `IdentityMap`: a Cohort per project holding its quota, a ClusterQueue per project and queue of the site borrowing from it, the namespace labels Kueue's selectors match, a LocalQueue per membership and queue, and each user's executor from a template; offboards a namespace that leaves the site once nothing of it runs there. Reads Secrets' metadata only, to roll an executor whose Secret was replaced |
 | executor (`cmd/executor`) | the user's namespace, one pod with the interLink API server and the plugin | runs the `OffloadRequest`s of its namespace and reports on them in their status, turning a Workload's PodSets into member pods for the plugin, through the API server: sizes them by the site's rules, resolves their Secrets, ConfigMaps, tokens and downward API, asks the site's start estimate, stages inputs and outputs (also when a started job is deleted), derives the job's state from the plugin's status, renders a shadow (an SSH tunnel whose IP rank 0's pod takes) for a job that exposes ports or tunnels back, and serves the job's logs to the offload controller |
 | interLink API server and plugin | next to the executor, stock images | run the members as one batch job with the user's own key (with Slurm, a pod group of N members is one `sbatch --nodes=N`); the flags of the flavor's queue come from the OffloadConfig |
@@ -63,7 +63,7 @@ spec:
 The Workload's check message follows the job (`job 123 queued`, `running on node07`,
 `completed`). The Job stays suspended while its job waits at the site; once the job started, Kueue
 admits the Workload, the Job makes its pods and the offload controller binds them to the site's
-node, `kueue-offload-hpc-a`. There they show the job: `Pending`, `Running` once their member runs,
+node, `hpc-a-vk`. There they show the job: `Pending`, `Running` once their member runs,
 then `Succeeded` or `Failed` with the member's exit codes, and the Job completes or fails from
 them. `kubectl logs <pod>` prints the member's output (`-f`, `--tail`, `--limit-bytes` as on any
 pod), also after the job ended. `kubectl exec <pod> -- <command>` runs the command on the member's
@@ -128,7 +128,7 @@ needs an interLink API server built with `PodStatus.SocketDir`, and the start es
 volume such as csi-rclone works; see [docs/design.md](docs/design.md#job-directory)). The virtual
 nodes need the cluster's `kubernetes.io/kubelet-serving` signer to issue their serving certificate,
 a role granting the controller patch and delete on its nodes and patch on their status by name
-(`kueue-offload-<OffloadConfig>`, [docs/design.md](docs/design.md#virtual-node)), and the API server to reach the controller pod on port 10250
+(`<OffloadConfig>-vk`, [docs/design.md](docs/design.md#virtual-node)), and the API server to reach the controller pod on port 10250
 ([docs/design.md](docs/design.md#virtual-node)).
 
 ## License

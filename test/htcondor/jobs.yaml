@@ -1,6 +1,6 @@
 # The Jobs of the e2e cases. None of them runs a container in the cluster:
 # kueue-offload runs them in the HTCondor pool, Kueue admits each once its job
-# started there, and its pods are bound to the virtual node kueue-offload-hpc-a,
+# started there, and its pods are bound to the virtual node hpc-a-vk,
 # which shows the job's state and serves its logs. backoffLimit 0: an attempt is
 # one allocation, and retries go through Kueue.
 #

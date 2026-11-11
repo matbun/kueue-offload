@@ -712,3 +712,28 @@ func TestPendingAgainClearsLogsMessage(t *testing.T) {
 		t.Errorf("pod %s %q, command %q", p.Status.Phase, p.Status.Message, p.Annotations[LogsAnnotation])
 	}
 }
+
+// A member of a group that failed before the job ended (a user deleted it) is
+// never replaced: when the group's job completes, that member is annotated
+// retriable-in-group "false" and keeps its phase, the others end Succeeded, so
+// Kueue finishes the group instead of waiting for a replacement.
+func TestDeletedGroupMemberNotRetriable(t *testing.T) {
+	e := newEnv(t, podOwned(2), func(objs *[]client.Object, _ *interceptor.Funcs) {
+		for _, o := range *objs {
+			if p, ok := o.(*corev1.Pod); ok && p.Name == "train-1" {
+				p.Status = corev1.PodStatus{Phase: corev1.PodFailed, Reason: "Deleted"}
+			}
+		}
+	})
+	e.submitted()
+	e.report(1, e.finished(true, ""))
+	e.reconcile()
+	gone := e.pod("train-1")
+	if gone.Annotations[podconstants.RetriableInGroupAnnotationKey] != podconstants.RetriableInGroupAnnotationValue || gone.Status.Phase != corev1.PodFailed || gone.Status.Reason != "Deleted" {
+		t.Errorf("train-1 = %s %s %v, want Failed Deleted, annotated", gone.Status.Phase, gone.Status.Reason, gone.Annotations)
+	}
+	ok := e.pod("train-0")
+	if _, annotated := ok.Annotations[podconstants.RetriableInGroupAnnotationKey]; annotated || ok.Status.Phase != corev1.PodSucceeded {
+		t.Errorf("train-0 = %s %v, want Succeeded, not annotated", ok.Status.Phase, ok.Annotations)
+	}
+}

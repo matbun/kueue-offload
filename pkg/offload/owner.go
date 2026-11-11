@@ -175,6 +175,8 @@ func finishOwner(ctx context.Context, c client.Client, r client.Reader, namespac
 			return nil
 		}
 		return deactivateWorkload(ctx, c, r, o.workload, o.uid)
+	case trainJobKind:
+		return finishTrainJob(ctx, c, r, key, o.ref.UID, out, now)
 	default:
 		return finishConditions(ctx, c, r, k, key, o.ref.UID, out, now)
 	}
@@ -324,14 +326,34 @@ func finishConditions(ctx context.Context, c client.Client, r client.Reader, k o
 	return client.IgnoreNotFound(c.Status().Patch(ctx, done, client.MergeFrom(obj)))
 }
 
+// finishTrainJob ends a TrainJob through its JobSet, the TrainJob's name, which
+// the Trainer copies Completed and Failed from: it removes a Failed condition
+// written on the TrainJob itself at its next reconcile. The TrainJob gets the
+// condition as well, for the time until then.
+func finishTrainJob(ctx context.Context, c client.Client, r client.Reader, key types.NamespacedName, uid types.UID, o jobOutcome, now time.Time) error {
+	js := &unstructured.Unstructured{}
+	js.SetGroupVersionKind(jobSetKind.gvk)
+	err := r.Get(ctx, key, js)
+	switch {
+	case err == nil && metav1.IsControlledBy(js, &metav1.ObjectMeta{UID: uid}):
+		if err := finishConditions(ctx, c, r, jobSetKind, key, js.GetUID(), o, now); err != nil {
+			return err
+		}
+	case err != nil && !apierrors.IsNotFound(err):
+		return err
+	}
+	return finishConditions(ctx, c, r, trainJobKind, key, uid, o, now)
+}
+
 // finishPods sets every owner pod's phase to Succeeded or Failed, with a
 // terminated status for each of its containers and Ready False, so a workflow
 // engine that reads the main container sees how the step ended; the message
 // ends with the logs command of a pod that has one (LogsAnnotation). Kueue then
 // removes its finalizers and marks the Workload Finished. A failed pod of a group is
-// first annotated retriable-in-group "false": without it Kueue waits for
-// replacement pods and never finishes the group. The pods stay gated:
-// spec.nodeName is never set. Pods already terminal or gone are skipped.
+// first annotated retriable-in-group "false", as is a member that failed or is being
+// deleted before the job ended: without it Kueue waits for replacement pods and
+// never finishes the group. The pods stay gated:
+// spec.nodeName is never set. A pod already terminal keeps its phase; one gone is skipped.
 func finishPods(ctx context.Context, c client.Client, r client.Reader, namespace string, refs []metav1.OwnerReference, o jobOutcome, now time.Time) error {
 	phase := corev1.PodFailed
 	if o.succeeded {
@@ -345,14 +367,13 @@ func finishPods(ctx context.Context, c client.Client, r client.Reader, namespace
 			}
 			return err
 		}
-		if pod.UID != ref.UID || podFinished(pod) {
+		if pod.UID != ref.UID {
 			continue
 		}
-		msg := o.message
-		if cmd := pod.Annotations[LogsAnnotation]; cmd != "" {
-			msg += "; logs: " + cmd
-		}
-		if !o.succeeded && pod.Labels[podconstants.GroupNameLabel] != "" &&
+		// The group's one job has ended, so no pod of it is replaced: also a member
+		// that failed or is being deleted before the job ended (a user deleted it)
+		failing := !o.succeeded || pod.Status.Phase == corev1.PodFailed || pod.DeletionTimestamp != nil
+		if failing && pod.Labels[podconstants.GroupNameLabel] != "" &&
 			pod.Annotations[podconstants.RetriableInGroupAnnotationKey] != podconstants.RetriableInGroupAnnotationValue {
 			annotated := pod.DeepCopy()
 			metav1.SetMetaDataAnnotation(&annotated.ObjectMeta, podconstants.RetriableInGroupAnnotationKey, podconstants.RetriableInGroupAnnotationValue)
@@ -363,6 +384,13 @@ func finishPods(ctx context.Context, c client.Client, r client.Reader, namespace
 				return err
 			}
 			pod = annotated
+		}
+		if podFinished(pod) {
+			continue
+		}
+		msg := o.message
+		if cmd := pod.Annotations[LogsAnnotation]; cmd != "" {
+			msg += "; logs: " + cmd
 		}
 		done := pod.DeepCopy()
 		done.Status.Phase, done.Status.Reason, done.Status.Message = phase, o.reason, msg

@@ -1,11 +1,16 @@
 package offload
 
 import (
+	"context"
 	"reflect"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
 	"github.com/matbun/kueue-offload/api/v1alpha1"
@@ -121,6 +126,64 @@ func TestCustomOwnerRejected(t *testing.T) {
 			c := condition(t, e.custom(k), "Failed")
 			if c == nil || c["status"] != "True" || c["reason"] != ReasonRejected || c["message"] != msg {
 				t.Errorf("condition Failed = %v, want True %s", c, ReasonRejected)
+			}
+		})
+	}
+}
+
+// A TrainJob ends through its JobSet: the Trainer copies the JobSet's Completed
+// or Failed onto the TrainJob and removes a Failed written on the TrainJob alone.
+// A JobSet of that name the TrainJob does not control is left alone.
+func TestTrainJobFinishedThroughJobSet(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		failed     bool
+		controlled bool
+	}{
+		{"failed", true, true},
+		{"completed", false, true},
+		{"foreign JobSet", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			child := func(objs *[]client.Object, _ *interceptor.Funcs) {
+				js := newUnstructured(jobSetKind)
+				js.SetName("train")
+				js.SetNamespace(testNS)
+				js.SetUID("0b6c-jobset")
+				owner := customUID
+				if !tc.controlled {
+					owner = "0b6c-other"
+				}
+				js.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: trainJobKind.gvk.GroupVersion().String(),
+					Kind: "TrainJob", Name: "train", UID: owner, Controller: ptr.To(true)}})
+				*objs = append(*objs, js)
+			}
+			e := newEnv(t, customOwned(trainJobKind), child)
+			e.submitted()
+			e.report(1, e.finished(!tc.failed, "rank 0 exited with code 1"))
+			e.reconcile()
+			js := newUnstructured(jobSetKind)
+			if err := e.c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: "train"}, js); err != nil {
+				t.Fatal(err)
+			}
+			ty, terminal := "Completed", "Completed"
+			if tc.failed {
+				ty, terminal = "Failed", "Failed"
+			}
+			c := condition(t, js, ty)
+			state, _, _ := unstructured.NestedString(js.Object, "status", "terminalState")
+			if tc.controlled && (c == nil || c["status"] != "True" || state != terminal) {
+				t.Errorf("JobSet condition %s = %v, terminalState %q", ty, c, state)
+			}
+			if !tc.controlled && (c != nil || state != "") {
+				t.Errorf("a JobSet the TrainJob does not control was finished: %v %q", c, state)
+			}
+			tty := "Complete"
+			if tc.failed {
+				tty = "Failed"
+			}
+			if c := condition(t, e.custom(trainJobKind), tty); c == nil || c["status"] != "True" {
+				t.Errorf("TrainJob condition %s = %v", tty, c)
 			}
 		})
 	}

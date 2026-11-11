@@ -152,6 +152,12 @@ func render(cfg Config, spec Spec, name string, ports []portMapping, logsOnly bo
 	if logsOnly {
 		service = nil
 	}
+	// A shadow with tunnels runs one pod at a time: a rolling update would run two
+	// ssh-reverse binding the same sockets on the node. The logs-only shadow an
+	// ended job flips to rolls, so its log stays readable while the new pod starts.
+	if !logsOnly {
+		deployment.Spec.Strategy = appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType}
+	}
 
 	labels := ownerLabels(spec.WorkloadUID)
 	setLabels(&deployment.ObjectMeta, labels)

@@ -298,6 +298,11 @@ func TestTerminalFlipsToLogsOnly(t *testing.T) {
 	if _, err := m.Ensure(t.Context(), spec); err != nil {
 		t.Fatal(err)
 	}
+	// While it tunnels, one pod at a time: a rolling update would hold every
+	// tunnel twice.
+	if d := getDeployment(t, client, testShadow); d.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Errorf("tunnel shadow strategy %+v, want Recreate", d.Spec.Strategy)
+	}
 	spec.Terminal = true
 	ref, err := m.Ensure(t.Context(), spec)
 	if err != nil {
@@ -306,6 +311,10 @@ func TestTerminalFlipsToLogsOnly(t *testing.T) {
 	assertLogsOnly(t, client, ref)
 	if ref.Deployment != testShadow {
 		t.Errorf("ref %+v", ref)
+	}
+	// The flip rolls: the old pod serves the log until the new one is ready.
+	if d := getDeployment(t, client, testShadow); d.Spec.Strategy.Type == appsv1.RecreateDeploymentStrategyType {
+		t.Errorf("logs-only strategy %+v, want a rolling update", d.Spec.Strategy)
 	}
 }
 

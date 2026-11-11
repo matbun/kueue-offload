@@ -838,6 +838,9 @@ instead.
 At a terminal state the executor renders it once more as logs-only: no `ssh-forward`, no
 `ssh-reverse`, no init containers, no Service, only `job-logs`, which prints the whole log and
 then stays idle, so `kubectl logs <shadow> -c job-logs` still shows the output after the job ended.
+While it tunnels, the shadow's Deployment uses the `Recreate` strategy, so a reverse tunnel is
+never held by two pods. The logs-only shadow it flips to rolls, so its log stays readable while the
+new pod starts; for a few seconds both pods print it, and `kubectl logs deploy/<shadow>` reads one.
 
 `kubectl logs` shows what the kubelet keeps: the container's newest log file, rotated at
 `containerLogMaxSize` (10Mi by default, about 40 bytes of timestamp and stream tags per line

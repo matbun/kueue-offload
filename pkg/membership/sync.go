@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -128,8 +129,10 @@ func (r *Reconciler) Sync(ctx context.Context) (time.Duration, error) {
 		}
 	}
 
-	if err := r.apply(ctx, r.cohort(s), kueue.GroupVersion.WithKind("Cohort")); err != nil {
-		errs = append(errs, fmt.Errorf("cohort %s: %w", s.cohort, err))
+	if len(p.Accounts) > 0 {
+		if err := r.apply(ctx, r.cohort(s), kueue.GroupVersion.WithKind("Cohort")); err != nil {
+			errs = append(errs, fmt.Errorf("cohort %s: %w", s.cohort, err))
+		}
 	}
 	for _, a := range p.Accounts {
 		cq, err := r.clusterQueue(ctx, s, a)
@@ -168,16 +171,23 @@ func (r *Reconciler) Sync(ctx context.Context) (time.Duration, error) {
 	}
 	membershipCount.WithLabelValues(r.Site).Set(float64(memberships))
 
-	leaving, err := r.revoke(ctx, sc, s, p, tmpl)
+	nss := &corev1.NamespaceList{}
+	if err := r.Client.List(ctx, nss); err != nil {
+		return 0, errors.Join(append(errs, err)...)
+	}
+	leaving, err := r.revoke(ctx, sc, s, p, tmpl, nss.Items)
 	if err != nil {
 		errs = append(errs, err)
+	}
+	if err := r.writeStatus(ctx, sc, len(p.Tenants), leaving); err != nil {
+		errs = append(errs, fmt.Errorf("status: %w", err))
 	}
 
 	after := s.interval
 	if unavailable && after > unavailableRecheck {
 		after = unavailableRecheck
 	}
-	if leaving && after > offboardRecheck {
+	if leaving > 0 && after > offboardRecheck {
 		after = offboardRecheck
 	}
 	return after, errors.Join(errs...)
@@ -497,30 +507,33 @@ func (r *Reconciler) prepareObjects(objs []*unstructured.Unstructured, s site, n
 }
 
 // revoke removes the memberships that disappeared: the label and the
-// LocalQueue. A namespace with no membership of the site left is offboarded
-// from the next pass on, so that the OffloadRequests of quota Kueue reserved
-// before are visible. It reports whether a namespace waits to be offboarded.
-func (r *Reconciler) revoke(ctx context.Context, sc *v1alpha1.OffloadConfig, s site, p plan, executor *template.Template) (bool, error) {
+// LocalQueue at once, the ClusterQueue once no namespace holds the account or
+// waits to be offboarded from it. A namespace with no membership of the site
+// left is offboarded from the next pass on, so that the OffloadRequests of
+// quota Kueue reserved before are visible. It returns the number of namespaces
+// that wait to be offboarded.
+func (r *Reconciler) revoke(ctx context.Context, sc *v1alpha1.OffloadConfig, s site, p plan, executor *template.Template, nss []corev1.Namespace) (int, error) {
 	var errs []error
-	leaving := false
-	nss := &corev1.NamespaceList{}
-	if err := r.Client.List(ctx, nss); err != nil {
-		return false, err
-	}
-	for i := range nss.Items {
-		ns := &nss.Items[i]
+	leaving := 0
+	held := append([]string(nil), p.Accounts...)
+	for i := range nss {
+		ns := &nss[i]
 		if _, ok := p.Tenants[ns.Name]; ok || ns.DeletionTimestamp != nil {
 			continue
 		}
 		var err error
 		switch {
 		case hasKey(ns.Annotations, AccountsAnnotation(s.name)):
+			held = append(held, splitList(ns.Annotations[AccountsAnnotation(s.name)])...)
 			err = r.patchMemberships(ctx, s, ns, nil, "")
-			leaving = true
+			leaving++
 		case hasKey(ns.Annotations, LeftAnnotation(s.name)):
 			var done bool
 			done, err = r.offboard(ctx, sc, s, executor, ns)
-			leaving = leaving || !done
+			if !done {
+				held = append(held, splitList(ns.Annotations[LeftAnnotation(s.name)])...)
+				leaving++
+			}
 		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("namespace %s: %w", ns.Name, err))
@@ -528,7 +541,7 @@ func (r *Reconciler) revoke(ctx context.Context, sc *v1alpha1.OffloadConfig, s s
 	}
 	lqs := &kueue.LocalQueueList{}
 	if err := r.Client.List(ctx, lqs, client.MatchingLabels(managedLabels(s.name))); err != nil {
-		return leaving, errors.Join(append(errs, err)...)
+		errs = append(errs, err)
 	}
 	for i := range lqs.Items {
 		lq := &lqs.Items[i]
@@ -540,7 +553,57 @@ func (r *Reconciler) revoke(ctx context.Context, sc *v1alpha1.OffloadConfig, s s
 			errs = append(errs, fmt.Errorf("LocalQueue %s/%s: %w", lq.Namespace, lq.Name, err))
 		}
 	}
+	if err := r.prune(ctx, s, held); err != nil {
+		errs = append(errs, err)
+	}
 	return leaving, errors.Join(errs...)
+}
+
+// prune deletes the site's ClusterQueues of the accounts not in keep, and its
+// Cohort once keep is empty. Kueue keeps a deleted ClusterQueue until the
+// Workloads it admitted end.
+func (r *Reconciler) prune(ctx context.Context, s site, keep []string) error {
+	var errs []error
+	cqs := &kueue.ClusterQueueList{}
+	if err := r.Client.List(ctx, cqs, client.MatchingLabels(managedLabels(s.name))); err != nil {
+		return err
+	}
+	for i := range cqs.Items {
+		cq := &cqs.Items[i]
+		if contains(keep, cq.Labels[AccountLabel]) || !cq.DeletionTimestamp.IsZero() {
+			continue
+		}
+		if err := r.Client.Delete(ctx, cq, client.Preconditions{UID: &cq.UID}); client.IgnoreNotFound(err) != nil {
+			errs = append(errs, fmt.Errorf("ClusterQueue %s: %w", cq.Name, err))
+		}
+	}
+	if len(keep) > 0 {
+		return errors.Join(errs...)
+	}
+	cohort := &kueue.Cohort{}
+	err := r.Client.Get(ctx, types.NamespacedName{Name: s.cohort}, cohort)
+	switch {
+	case apierrors.IsNotFound(err):
+		err = nil
+	case err == nil && cohort.Labels[ManagedByLabel] == ManagedByValue && cohort.Labels[SiteLabel] == s.name && cohort.DeletionTimestamp.IsZero():
+		err = client.IgnoreNotFound(r.Client.Delete(ctx, cohort, client.Preconditions{UID: &cohort.UID}))
+	}
+	if err != nil {
+		errs = append(errs, fmt.Errorf("Cohort %s: %w", s.cohort, err))
+	}
+	return errors.Join(errs...)
+}
+
+// writeStatus records the site's member and leaving namespaces in the
+// OffloadConfig's status when they changed.
+func (r *Reconciler) writeStatus(ctx context.Context, sc *v1alpha1.OffloadConfig, members, leaving int) error {
+	m, l := int32(members), int32(leaving)
+	if ptr.Equal(sc.Status.Members, &m) && ptr.Equal(sc.Status.Leaving, &l) {
+		return nil
+	}
+	orig := sc.DeepCopy()
+	sc.Status = v1alpha1.OffloadConfigStatus{Members: &m, Leaving: &l}
+	return r.Client.Status().Patch(ctx, sc, client.MergeFrom(orig))
 }
 
 func sortedTenants(p plan) []string {

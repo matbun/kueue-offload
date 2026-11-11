@@ -21,6 +21,12 @@ spec:
     - jsonPath: .spec.pollInterval
       name: Poll
       type: string
+    - jsonPath: .status.members
+      name: Members
+      type: integer
+    - jsonPath: .status.leaving
+      name: Leaving
+      type: integer
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -467,7 +473,28 @@ spec:
             required:
             - workers
             type: object
+          status:
+            description: |-
+              OffloadConfigStatus counts the memberships of the site, as its membership
+              controller found them at the end of its last pass.
+            properties:
+              leaving:
+                description: |-
+                  leaving is the number of namespaces that left the site and are not
+                  offboarded yet: a job of theirs at the site has not ended, or their
+                  offboard Jobs or the controller's objects in them are still there. With
+                  members and leaving at 0 the site has no tenant left, and the controller
+                  has deleted its ClusterQueues and Cohort.
+                format: int32
+                type: integer
+              members:
+                description: members is the number of namespaces that hold a membership
+                  of the site.
+                format: int32
+                type: integer
+            type: object
         type: object
     served: true
     storage: true
-    subresources: {}
+    subresources:
+      status: {}

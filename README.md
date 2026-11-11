@@ -87,24 +87,22 @@ a complete example.
 
 ## Uninstall
 
-The reverse order, so that nothing is left behind and no job is lost:
+In two steps, so that no job is lost and nothing is left behind:
 
-1. With no Workload running at the site and no pod on a claim the executor template made (the
-   claim would stay Terminating until the pod ends), take every tenant off: delete the
-   `IdentityMap`s (or their entries) and wait until each member namespace has lost its
-   `hpc.interlink.eu/<site>-accounts` and `hpc.interlink.eu/<site>-left` annotations. The
-   membership controller offboards each one ([docs/design.md](docs/design.md#offboarding)): the
-   OffloadRequests of finished Workloads, whose executor cleans up after their jobs, the
-   `offboardTemplate` Jobs, then its objects, labels and annotations. Namespaces and their Secrets
-   stay.
-2. Delete the membership and offload controllers, then the Cohorts and ClusterQueues labelled
-   `hpc.interlink.eu/managed-by=kueue-offload-membership`, then each site's objects (OffloadConfig,
-   OffloadWorker, AdmissionCheck, ResourceFlavors, the ConfigMaps in `kueue-offload-membership`).
-3. `kubectl delete -k config/admission`, `config/rbac/executor`, `config/rbac/membership`,
-   `config/rbac`, the namespaces of `config/manager` and `config/membership`, and last
-   `kubectl delete -f config/crd/bases`. An OffloadRequest left at that point keeps its executor's
-   finalizer and blocks the CRD: release it as [docs/design.md](docs/design.md#who-may-write-it)
-   says.
+1. Take every tenant off: delete the `IdentityMap`s (or their entries). Each membership controller
+   offboards its namespaces ([docs/design.md](docs/design.md#offboarding)): once nothing of a
+   namespace runs at the site, the OffloadRequests of its finished Workloads, whose executor cleans
+   up after their jobs, the `offboardTemplate` Jobs, then its objects, the executor's stage Jobs,
+   its labels and annotations; then each ClusterQueue no namespace holds, and the site's Cohort.
+   Namespaces and their Secrets stay. The step is done when `kubectl get offloadconfigs` shows
+   `MEMBERS` and `LEAVING` at 0 for every site and
+   `kubectl get clusterqueues,cohorts,persistentvolumeclaims -A -l hpc.interlink.eu/managed-by=kueue-offload-membership`
+   finds nothing: a claim the executor template made stays Terminating until the pods that mount
+   it end.
+2. Delete the rest, in any order (`kubectl delete -k` of what was applied, or the Argo CD
+   Application with its resources). No OffloadRequest is left at that point; one that is (its
+   executor gone for good) keeps its finalizer and blocks the CRD: release it as
+   [docs/design.md](docs/design.md#who-may-write-it) says.
 
 ## Requirements
 

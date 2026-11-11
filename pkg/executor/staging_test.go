@@ -112,7 +112,7 @@ func TestStageIn(t *testing.T) {
 
 	job := e.stageJob(stageInJob)
 	pod := job.Spec.Template.Spec
-	if job.Labels[StageOfLabel] != executorWorkload || job.Labels[StageDirectionLabel] != "in" ||
+	if job.Labels[StageOfLabel] != executorWorkload || job.Labels[StageDirectionLabel] != "in" || job.Labels[v1alpha1.SiteLabel] != executorSite ||
 		job.Spec.Template.Labels["sidecar.istio.io/inject"] != "false" || *job.Spec.BackoffLimit != 0 || pod.RestartPolicy != v1.RestartPolicyNever {
 		t.Fatalf("stage Job: %+v", job)
 	}

@@ -204,6 +204,7 @@ func newEnv(t *testing.T, objs ...client.Object) *env {
 	// NetworkPolicy ("expected objects with types from the same schema"), so
 	// apply merges with the deduced converter, which treats lists as atomic.
 	e.c = fake.NewClientBuilder().WithScheme(s).WithRESTMapper(testMapper(s)).WithObjects(list...).
+		WithStatusSubresource(&v1alpha1.OffloadConfig{}).
 		WithTypeConverters(managedfields.NewDeducedTypeConverter()).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {

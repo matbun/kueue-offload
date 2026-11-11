@@ -26,9 +26,10 @@ const (
 	StageOutAnnotation = "interlink.eu/stage-out"
 )
 
-// Labels of a stage Job.
+// Labels of a stage Job, which also carries v1alpha1.SiteLabel: the membership
+// controller deletes the stage Jobs of its site when it offboards the namespace.
 const (
-	StageOfLabel        = "interlink.eu/stage-of"
+	StageOfLabel        = v1alpha1.StageOfLabel
 	StageDirectionLabel = "interlink.eu/stage-direction"
 )
 
@@ -158,9 +159,11 @@ func stageJobName(req jobRequest, direction string) string {
 // sees them, the site key and, for a Kerberos volume, the keytab.
 func (d *Executor) stageJob(req jobRequest, direction string, paths []string) *batchv1.Job {
 	st := d.Config.Staging
+	site, _ := d.Config.Site()
 	labels := map[string]string{
 		StageOfLabel:              req.WorkloadUID,
 		StageDirectionLabel:       direction,
+		v1alpha1.SiteLabel:        site,
 		"sidecar.istio.io/inject": "false",
 	}
 	env := []v1.EnvVar{

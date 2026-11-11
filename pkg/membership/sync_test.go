@@ -220,9 +220,10 @@ func TestRemovedAssociationRevokesOnlyThatMembership(t *testing.T) {
 	if got := e.executorConfig("alice").Sites["hpc-a"].AllowedAccounts; !reflect.DeepEqual(got, []string{"proj42"}) {
 		t.Errorf("executor accounts %v after removal", got)
 	}
-	// ClusterQueues are never deleted.
-	if _, ok := e.clusterQueues()["hpc-a-proj99"]; !ok {
-		t.Errorf("ClusterQueue hpc-a-proj99 deleted")
+	// No namespace holds proj99 any more: its ClusterQueue goes, which Kueue
+	// keeps until the Workloads it admitted end.
+	if got := e.queueNames(); got != "hpc-a-proj42" {
+		t.Errorf("ClusterQueues %q, want hpc-a-proj42 only", got)
 	}
 
 	// alice leaves her last project: the pass that revokes it keeps the

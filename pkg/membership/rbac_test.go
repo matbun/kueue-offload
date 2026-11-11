@@ -107,7 +107,9 @@ func TestMembershipRBAC(t *testing.T) {
 				}
 				// Jobs: a Job whose pod template changed is replaced, since the template is immutable.
 				// OffloadRequests: offboarding deletes those of finished Workloads.
-				if has(r.Verbs, "delete") && !(has(r.APIGroups, "kueue.x-k8s.io") && name == "localqueues") && !(d.Kind == "Role" && name == "leases") &&
+				// ClusterQueues and Cohorts: those of accounts no namespace holds any more.
+				kueueObject := has(r.APIGroups, "kueue.x-k8s.io") && (name == "localqueues" || name == "clusterqueues" || name == "cohorts")
+				if has(r.Verbs, "delete") && !kueueObject && !(d.Kind == "Role" && name == "leases") &&
 					!(has(r.APIGroups, "batch") && name == "jobs") && !(has(r.APIGroups, "interlink.eu") && res == "offloadrequests") {
 					t.Errorf("%s %s grants delete on %s", d.Kind, d.Metadata.Name, res)
 				}

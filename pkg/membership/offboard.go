@@ -27,7 +27,8 @@ var jobKind = batchv1.SchemeGroupVersion.WithKind("Job")
 // the namespace runs at the site. It first deletes the OffloadRequests of its
 // finished Workloads, so that the executor cleans up after their jobs, then
 // runs the offboard Jobs once, then deletes the objects it made there for the
-// site and its own labels and annotations. A failed offboard Job is reported and
+// site, the stage Jobs of the site's executor, and its own labels and
+// annotations. A failed offboard Job is reported and
 // does not stop the rest, as what it would clean up cannot be reached
 // otherwise. The Secrets of the namespace stay, so that adding it back restores
 // it. It reports whether the namespace is done.
@@ -98,6 +99,17 @@ func (r *Reconciler) offboard(ctx context.Context, sc *v1alpha1.OffloadConfig, s
 			client.PropagationPolicy(metav1.DeletePropagationBackground))
 		if err != nil && !meta.IsNoMatchError(err) {
 			return false, fmt.Errorf("deleting %s objects: %w", gvk.Kind, err)
+		}
+	}
+	// The stage Jobs the site's executor made, which nothing owns: those that
+	// copied outputs back stay a day after they ended, for their logs.
+	for _, w := range s.workers {
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(jobKind)
+		err := r.Client.DeleteAllOf(ctx, u, client.InNamespace(ns.Name), client.MatchingLabels{v1alpha1.SiteLabel: w},
+			client.HasLabels{v1alpha1.StageOfLabel}, client.PropagationPolicy(metav1.DeletePropagationBackground))
+		if err != nil {
+			return false, fmt.Errorf("deleting the stage Jobs of %s: %w", w, err)
 		}
 	}
 

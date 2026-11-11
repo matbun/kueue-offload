@@ -217,10 +217,29 @@ type ConfigMapKeyRef struct {
 	Key string `json:"key"`
 }
 
+// OffloadConfigStatus counts the memberships of the site, as its membership
+// controller found them at the end of its last pass.
+type OffloadConfigStatus struct {
+	// members is the number of namespaces that hold a membership of the site.
+	// +optional
+	Members *int32 `json:"members,omitempty"`
+
+	// leaving is the number of namespaces that left the site and are not
+	// offboarded yet: a job of theirs at the site has not ended, or their
+	// offboard Jobs or the controller's objects in them are still there. With
+	// members and leaving at 0 the site has no tenant left, and the controller
+	// has deleted its ClusterQueues and Cohort.
+	// +optional
+	Leaving *int32 `json:"leaving,omitempty"`
+}
+
 // +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
 // +kubebuilder:printcolumn:name="Workers",type=string,JSONPath=`.spec.workers`
 // +kubebuilder:printcolumn:name="Poll",type=string,JSONPath=`.spec.pollInterval`
+// +kubebuilder:printcolumn:name="Members",type=integer,JSONPath=`.status.members`
+// +kubebuilder:printcolumn:name="Leaving",type=integer,JSONPath=`.status.leaving`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // OffloadConfig holds the parameters of an offload AdmissionCheck and, for the
@@ -229,7 +248,8 @@ type OffloadConfig struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec OffloadConfigSpec `json:"spec,omitempty"`
+	Spec   OffloadConfigSpec   `json:"spec,omitempty"`
+	Status OffloadConfigStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true

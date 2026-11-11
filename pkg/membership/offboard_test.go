@@ -2,7 +2,9 @@ package membership
 
 import (
 	"context"
+	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -524,5 +526,113 @@ metadata:
 	}
 	if e.executorConfigMap("alice") != nil {
 		t.Errorf("executor ConfigMap left")
+	}
+}
+
+// Offboarding deletes the stage Jobs the site's executor left in the namespace
+// (a stage-out Job stays a day after it ended, for its log), not those of
+// another site's executor.
+func TestOffboardDeletesTheSiteStageJobs(t *testing.T) {
+	stageJob := func(name, site string) *batchv1.Job {
+		return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "bob",
+			Labels: map[string]string{v1alpha1.StageOfLabel: name + "-uid", v1alpha1.SiteLabel: site}}}
+	}
+	own, other := stageJob("stage-out-aaaaaaaa-1", testSite), stageJob("stage-out-bbbbbbbb-1", "hpc-b")
+	e := newEnv(t, own, other)
+	e.sync()
+	e.setIdentities(defaultIdentities().Spec.Entries[0])
+	e.sync()
+	if !e.get(client.ObjectKeyFromObject(own), &batchv1.Job{}) {
+		t.Fatalf("stage Job deleted in the pass that revoked the membership")
+	}
+	e.sync()
+	if len(e.executorObjects("bob")) != 0 {
+		t.Fatalf("bob not offboarded: %v", e.executorObjects("bob"))
+	}
+	if e.get(client.ObjectKeyFromObject(own), &batchv1.Job{}) {
+		t.Errorf("stage Job of the site left after the offboarding")
+	}
+	if !e.get(client.ObjectKeyFromObject(other), &batchv1.Job{}) {
+		t.Errorf("stage Job of site hpc-b deleted")
+	}
+}
+
+// status is the OffloadConfig's status as members/leaving.
+func (e *env) status() string {
+	e.t.Helper()
+	sc := &v1alpha1.OffloadConfig{}
+	e.get(types.NamespacedName{Name: testSite}, sc)
+	if sc.Status.Members == nil || sc.Status.Leaving == nil {
+		return "unset"
+	}
+	return fmt.Sprintf("%d/%d", *sc.Status.Members, *sc.Status.Leaving)
+}
+
+// queueNames names the ClusterQueues, sorted.
+func (e *env) queueNames() string {
+	e.t.Helper()
+	var names []string
+	for n := range e.clusterQueues() {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ",")
+}
+
+func (e *env) cohortExists() bool {
+	e.t.Helper()
+	return e.get(types.NamespacedName{Name: testSite}, &kueue.Cohort{})
+}
+
+// Once no namespace holds an account or waits to be offboarded from it, its
+// ClusterQueue goes; once the site has none, its Cohort goes. The
+// OffloadConfig's status counts the members and the namespaces leaving.
+func TestLastTenantGoneDeletesQueuesAndCohort(t *testing.T) {
+	e := newEnv(t, offboardConfig(nil), offboardConfigMap(offboardText))
+	e.sync()
+	if got := e.status(); got != "2/0" {
+		t.Errorf("status %s, want 2 members and none leaving", got)
+	}
+	e.workload("bob", "train-1", false)
+	e.offloadRequest("bob", "train-1", testSite)
+
+	e.setIdentities()
+	e.sync()
+	if got := e.status(); got != "0/2" {
+		t.Errorf("status %s after the IdentityMap emptied, want 0 members and 2 leaving", got)
+	}
+	e.sync()
+	if got := e.queueNames(); got != "hpc-a-proj42,hpc-a-proj99" || !e.cohortExists() {
+		t.Fatalf("ClusterQueues %q, Cohort %v while both namespaces leave", got, e.cohortExists())
+	}
+
+	// alice, the only one in proj99, is offboarded; bob's job still runs.
+	e.endJob("alice", "offboard", batchv1.JobComplete)
+	e.sync()
+	if got := e.queueNames(); got != "hpc-a-proj42" {
+		t.Errorf("ClusterQueues %q once alice is offboarded, want hpc-a-proj42 only", got)
+	}
+	if got := e.status(); got != "0/1" {
+		t.Errorf("status %s, want bob leaving", got)
+	}
+
+	e.finishWorkload("bob", "train-1")
+	e.sync()
+	e.finalize("bob", "train-1")
+	e.sync()
+	if got := e.queueNames(); got != "hpc-a-proj42" || !e.cohortExists() {
+		t.Fatalf("ClusterQueues %q, Cohort %v while bob's offboard Job runs", got, e.cohortExists())
+	}
+	e.endJob("bob", "offboard", batchv1.JobComplete)
+	e.sync()
+	if got := e.queueNames(); got != "" || e.cohortExists() {
+		t.Errorf("ClusterQueues %q, Cohort %v left with no tenant", got, e.cohortExists())
+	}
+	if got := e.status(); got != "0/0" {
+		t.Errorf("status %s, want 0/0", got)
+	}
+	e.sync()
+	if e.cohortExists() || e.queueNames() != "" {
+		t.Errorf("Cohort or ClusterQueues made again for a site with no tenant")
 	}
 }

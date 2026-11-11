@@ -65,6 +65,11 @@ const AttemptFinalizer = "offload.interlink.eu/attempt"
 // only the requests of its own site.
 const SiteLabel = "offload.interlink.eu/site"
 
+// StageOfLabel on a stage Job names the Workload whose paths it copies. The
+// executor labels its stage Jobs with SiteLabel too, so that the membership
+// controller deletes those of the site when it offboards the namespace.
+const StageOfLabel = "interlink.eu/stage-of"
+
 // WorkloadReference names a Workload in the OffloadRequest's namespace.
 type WorkloadReference struct {
 	// +kubebuilder:validation:MinLength=1

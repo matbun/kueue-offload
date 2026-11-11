@@ -769,14 +769,15 @@ namespace that runs `Staging.Command`. Every path must be absolute, clean and be
 - Deleting the request deletes the stage-in Job (propagation `Background`), also for a request
   whose stage-in never let it be submitted. A stage-out Job is not deleted: it has
   `ttlSecondsAfterFinished` 86400 and `activeDeadlineSeconds` `Staging.StageOutTimeout`, so its log
-  stays readable for a day.
+  stays readable for a day, or until the namespace is offboarded from the site.
 
 Events on the owner: `StageOut` (`copying <paths>`), then `StagedOut` (`copied back <paths>`) or
 `StageOutFailed` (`copying back <paths> failed (<why>), see the logs of Job <name>`), after a normal
 end as after a delete.
 
-A stage Job has labels `interlink.eu/stage-of: <workloadUID>`, `interlink.eu/stage-direction: in|out`
-and `sidecar.istio.io/inject: "false"`, `backoffLimit: 0`, `restartPolicy: Never`, requests
+A stage Job has labels `interlink.eu/stage-of: <workloadUID>`, `interlink.eu/stage-direction: in|out`,
+`offload.interlink.eu/site: <the executor's site>` (offboarding deletes the site's stage Jobs) and
+`sidecar.istio.io/inject: "false"`, `backoffLimit: 0`, `restartPolicy: Never`, requests
 50m/64Mi, limits 2 CPU/2Gi, the site key at `/ssh` and the known hosts at
 `/etc/ssh/ssh_known_hosts`, and mounts only the volumes its paths are on. The command's contract is
 its environment: `STAGE_DIRECTION` (`in`/`out`), `STAGE_PATHS`, `REMOTE`
@@ -964,7 +965,8 @@ minutes), every minute while an executor is not available or a namespace is leav
 
 With Kueue v1beta2 field names (the reference cluster runs Kueue 0.16.9):
 
-- a Cohort named `membership.cohort` (default: the site name);
+- while the site has an account with members, a Cohort named `membership.cohort` (default: the
+  site name);
 - per account with members, a ClusterQueue `<site>-<account>` labelled
   `hpc.interlink.eu/account: <account>` (the offload controller charges that account) with
   `cohortName` the site's Cohort,
@@ -976,7 +978,16 @@ With Kueue v1beta2 field names (the reference cluster runs Kueue 0.16.9):
 - per membership, a LocalQueue `<site>-<account>` in the member's namespace.
 
 The ResourceFlavors, the AdmissionCheck and the OffloadConfig are the deployment's. A membership
-that disappears loses its label and its LocalQueue at once ([Offboarding](#offboarding)).
+that disappears loses its label and its LocalQueue at once ([Offboarding](#offboarding)). The
+ClusterQueue of an account goes once no namespace holds it or waits to be offboarded from it (Kueue
+keeps a deleted ClusterQueue until the Workloads it admitted end), and the Cohort once the site has
+no ClusterQueue left; the controller needs `delete` on `clusterqueues` and `cohorts`.
+
+At the end of each pass the controller writes to the OffloadConfig's `status.members` the number of
+member namespaces and to `status.leaving` the number of namespaces that wait to be offboarded, when
+they changed (`patch` on `offloadconfigs/status`); `kubectl get offloadconfigs` shows both. With
+both at 0 after the last membership went, every namespace is offboarded and the site's
+ClusterQueues and Cohort are deleted.
 
 ### Offboarding
 
@@ -995,7 +1006,9 @@ associations), the controller records the accounts it had in the annotation
    failed Job gives a Warning event `OffboardFailed` about the Namespace (so in namespace
    `default`) and does not stop the rest.
 4. It deletes, with `deletecollection`, the namespace's objects labelled with its `managed-by` and
-   `site` labels, of every kind the executor template renders for those accounts and of Jobs.
+   `site` labels, of every kind the executor template renders for those accounts and of Jobs, and
+   the stage Jobs of the site's executor (labels `interlink.eu/stage-of` and
+   `offload.interlink.eu/site: <worker>`, [Staging](#staging)), which outlive their requests.
    A claim it made that a pod still mounts stays Terminating until that pod ends.
 5. It removes its labels (the tenant label only when no other site keeps the namespace, the
    `namespaceLabels` only where it added them) and its annotations, and records an event

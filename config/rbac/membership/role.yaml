@@ -86,6 +86,12 @@ rules:
 - apiGroups:
   - interlink.eu
   resources:
+  - offloadconfigs/status
+  verbs:
+  - patch
+- apiGroups:
+  - interlink.eu
+  resources:
   - offloadrequests
   verbs:
   - delete
@@ -95,15 +101,6 @@ rules:
   resources:
   - clusterqueues
   - cohorts
-  verbs:
-  - create
-  - get
-  - list
-  - patch
-  - watch
-- apiGroups:
-  - kueue.x-k8s.io
-  resources:
   - localqueues
   verbs:
   - create

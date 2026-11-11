@@ -65,9 +65,11 @@ The Workload's check message follows the job (`job 123 queued`, `running on node
 admits the Workload, the Job makes its pods and the offload controller binds them to the site's
 node, `kueue-offload-hpc-a`. There they show the job: `Pending`, `Running` once their member runs,
 then `Succeeded` or `Failed` with the member's exit codes, and the Job completes or fails from
-them. `kubectl logs <pod>` prints the member's output (`-f`, `--tail`, `--since`, `--limit-bytes`
-as on any pod), also after the job ended. `kubectl exec` answers that exec is not supported:
-interLink's plugin API has no exec call.
+them. `kubectl logs <pod>` prints the member's output (`-f`, `--tail`, `--limit-bytes` as on any
+pod), also after the job ended. `kubectl exec <pod> -- <command>` runs the command on the member's
+compute node, in a new container of the pod's image with its mounts and environment, where the
+site's plugin can reach the node (the Slurm plugin's `ExecPrefix`); elsewhere it answers that the
+site offers no exec.
 
 ## Build and deploy
 

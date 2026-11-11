@@ -33,6 +33,10 @@ type Config struct {
 type InterLinkConfig struct {
 	// URL is the API server's address, e.g. http://localhost:3000.
 	URL string `yaml:"URL"`
+	// PluginURL is the plugin's own address, e.g. http://127.0.0.1:4000, for
+	// what the API server does not carry: kubectl exec, through the plugin's
+	// /exec. Empty: exec is refused.
+	PluginURL string `yaml:"PluginURL"`
 }
 
 // ExecutorConfig is the executor's own behaviour.
@@ -249,6 +253,13 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("InterLink.URL %q is not an http(s) URL", c.InterLink.URL)
 	}
 	c.InterLink.URL = strings.TrimRight(c.InterLink.URL, "/")
+	if c.InterLink.PluginURL != "" {
+		u, err := url.Parse(c.InterLink.PluginURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("InterLink.PluginURL %q is not an http(s) URL", c.InterLink.PluginURL)
+		}
+		c.InterLink.PluginURL = strings.TrimRight(c.InterLink.PluginURL, "/")
+	}
 
 	if len(c.Sites) != 1 {
 		return fmt.Errorf("Sites needs exactly one entry, found %d: run one executor per site", len(c.Sites))

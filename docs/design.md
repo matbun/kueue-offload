@@ -511,6 +511,15 @@ answer, and `kubectl logs -f` ends.
 No authentication: the sample's NetworkPolicy lets only the offload controller's pods (namespace
 `kueue-offload`, label `app: kueue-offload`) reach the port.
 
+### /exec
+
+Query: `workloadUID`, `rank` and `container` (default: the member's first), then the kubelet's exec
+parameters (`command`, `tty`, `input`, `output`, `error`), in the kubelet's exec protocol (SPDY or
+WebSocket). A running rank's stream goes to the plugin's `/exec` at `InterLink.PluginURL` with
+`namespace`, `pod` (the member's UID at the plugin), `container` and `node` (its compute node). 501
+without `PluginURL`, 404 for no job, 400 for an unknown rank or container or a rank that does not
+run.
+
 ### GET /healthz
 
 200 `ok` while the API server answers `/pinglink`, which reaches the plugin; a success is trusted
@@ -904,7 +913,7 @@ Here, as on the virtual kubelet:
   the probe in the job, for example a notebook's test of the socket its server listens on. The
   StatefulSet counts it ready, and the notebook controller copies `readyReplicas` to the Notebook.
 - `kubectl logs` of the pod, and the UI's log tab, show the job's output; `kubectl exec`, and the
-  UI's terminal, answer that exec is not supported.
+  UI's terminal, run a command on the member's compute node where the site offers exec (below).
 - A job that stops without ending (requeued at the site, lost, retried in place) shows the pod
   `Pending` until the next attempt runs; at the end the pod takes the rank's terminal state.
 
@@ -974,15 +983,23 @@ taint) is left as it is.
 
 Logs: `kubectl logs <pod>` reaches the node's kubelet API, which asks the executor of the pod's
 namespace (`GET /getLogs` with the Workload's UID, the rank and the container) at the
-OffloadConfig's `executorService` and `executorPort`, and streams the answer: `-f`, `--tail`,
-`--since`, `--since-time`, `--limit-bytes` and `--timestamps` as on any pod, `--previous` refused
-([GET /getLogs](#get-getlogs)). Nothing is stored in the cluster, so no kubelet log file bounds a
-large log. Exec, attach and port-forward are not supported: `kubectl exec` answers "exec into an
-offloaded container is not supported: the interLink plugin API has no exec call". Supporting it
-needs an exec call in interLink's plugin API, an executor route that streams stdin, stdout, stderr
-and resizes, and in each plugin a way to run the command in the job's container on the member's
-node; the virtual kubelet has none of these either. `kubectl port-forward` to a pod's Service
-reaches the shadow.
+OffloadConfig's `executorService` and `executorPort`, and streams the answer: `-f`, `--tail` and
+`--limit-bytes` as on any pod, `--since`, `--since-time` and `--timestamps` as the plugin gives them
+(the Slurm plugin writes no timestamps), `--previous` refused ([GET /getLogs](#get-getlogs)).
+Nothing is stored in the cluster, so no kubelet log file bounds a large log.
+
+`kubectl exec` goes the same way (`RunInContainer`, executor `/exec`): the node opens the kubelet's
+exec protocol to the executor, which checks that the rank runs and passes the stream, protocol
+upgrade and all, to the plugin's `/exec` (the executor's `InterLink.PluginURL`, since interLink's
+API server has no exec call), with the member's pod UID at the plugin and its compute node. The
+Slurm plugin runs there, through its `ExecPrefix` (an ssh to the node through the login node, for
+example), `exec-<container>.sh`, which it wrote at submit in the pod's files directory: the
+container's runtime command, image, mounts and environment, with the command given in place of the
+container's. The command so runs in a new container of the pod's image next to the running one, not
+in its processes' namespaces; a terminal gets its first size, later resizes are not passed on; the
+exit code is the command's. A plugin without `ExecPrefix` answers 501 and kubectl prints why; so
+does an executor without `PluginURL`. Attach is not supported. `kubectl port-forward` to a pod's
+Service reaches the shadow.
 
 Kubelet API (`pkg/node/server.go`): one HTTPS listener on `:10250` for every node of the
 controller. Clients are authenticated as a kubelet does, with the API server's client CA

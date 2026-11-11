@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +16,8 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/node/api/statsv1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
@@ -30,9 +31,6 @@ const (
 	defaultExecutorService = "kueue-offload-executor"
 	defaultExecutorPort    = 8000
 )
-
-// execUnsupported is what kubectl exec prints.
-const execUnsupported = "exec into an offloaded container is not supported: the interLink plugin API has no exec call"
 
 // Provider answers the kubelet API of the virtual nodes from the cache and the
 // executors.
@@ -176,9 +174,68 @@ func (p *Provider) config(ctx context.Context, node string) (*v1alpha1.OffloadCo
 	return nil, errdefs.NotFoundf("no OffloadConfig has node %s", node)
 }
 
-// RunInContainer refuses: interLink's plugin API has no exec call.
-func (p *Provider) RunInContainer(context.Context, string, string, string, []string, vkapi.AttachIO) error {
-	return errors.New(execUnsupported)
+// RunInContainer runs cmd in container of the member a pod stands for, through
+// the executor of the pod's namespace (executorapi.ExecPath), with the
+// kubelet's exec protocol: the executor passes it to the plugin, which runs
+// it on the member's compute node in the container's runtime. A non-zero exit
+// is the command's exit code.
+func (p *Provider) RunInContainer(ctx context.Context, namespace, podName, container string, cmd []string, attach vkapi.AttachIO) error {
+	pod, wl, cfg, err := p.member(ctx, namespace, podName)
+	if err != nil {
+		return err
+	}
+	q := url.Values{}
+	q.Set(executorapi.ExecWorkloadUID, string(wl.UID))
+	q.Set(executorapi.ExecRank, strconv.Itoa(rankAnnotation(pod)))
+	q.Set(executorapi.ExecContainer, container)
+	for _, c := range cmd {
+		q.Add("command", c)
+	}
+	opts := remotecommand.StreamOptions{Stdin: attach.Stdin(), Tty: attach.TTY()}
+	if out := attach.Stdout(); out != nil {
+		opts.Stdout = out
+		q.Set("output", "1")
+	}
+	if errOut := attach.Stderr(); errOut != nil {
+		opts.Stderr = errOut
+		q.Set("error", "1")
+	}
+	if opts.Stdin != nil {
+		q.Set("input", "1")
+	}
+	if opts.Tty {
+		q.Set("tty", "1")
+		if sizes := attach.Resize(); sizes != nil {
+			opts.TerminalSizeQueue = termSizes{ctx: ctx, sizes: sizes}
+		}
+	}
+	u, err := url.Parse(p.baseURL(cfg, namespace) + executorapi.ExecPath + "?" + q.Encode())
+	if err != nil {
+		return err
+	}
+	exec, err := remotecommand.NewSPDYExecutor(&rest.Config{Host: u.Scheme + "://" + u.Host}, http.MethodPost, u)
+	if err != nil {
+		return err
+	}
+	return exec.StreamWithContext(ctx, opts)
+}
+
+// termSizes passes the exec's terminal sizes on to the executor.
+type termSizes struct {
+	ctx   context.Context
+	sizes <-chan vkapi.TermSize
+}
+
+func (t termSizes) Next() *remotecommand.TerminalSize {
+	select {
+	case s, ok := <-t.sizes:
+		if !ok {
+			return nil
+		}
+		return &remotecommand.TerminalSize{Width: s.Width, Height: s.Height}
+	case <-t.ctx.Done():
+		return nil
+	}
 }
 
 // GetStatsSummary has no pod statistics: the jobs' usage is the site's. The

@@ -130,6 +130,7 @@ func New(cfg Config, il *InterLink, kube kubernetes.Interface, c client.Client, 
 // mux.
 func (d *Executor) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET "+executorapi.GetLogsPath, d.GetLogsHandler)
+	mux.HandleFunc(executorapi.ExecPath, d.ExecHandler)
 	mux.HandleFunc("GET /healthz", d.HealthzHandler)
 }
 

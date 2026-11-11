@@ -2,7 +2,10 @@ package node
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,12 +14,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/mux"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	vkapi "github.com/virtual-kubelet/virtual-kubelet/node/api"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
+	utilexec "k8s.io/utils/exec"
 
 	"github.com/matbun/kueue-offload/api/v1alpha1"
 	"github.com/matbun/kueue-offload/pkg/executorapi"
@@ -224,16 +229,68 @@ func TestLogsPreviousThroughHandler(t *testing.T) {
 	}
 }
 
-// exec answers that the plugin API has no exec call; the summary names the
-// only node.
-func TestExecAndStats(t *testing.T) {
+// The summary names the only node.
+func TestStats(t *testing.T) {
 	var calls []apiCall
 	p := &Provider{Reader: fakeClient(t, &calls, testConfig())}
-	if err := p.RunInContainer(context.Background(), testNS, "train-1", "main", []string{"sh"}, nil); err == nil || err.Error() != execUnsupported {
-		t.Errorf("exec error %v", err)
-	}
 	s, err := p.GetStatsSummary(context.Background())
 	if err != nil || s.Node.NodeName != testNode || s.Pods != nil {
 		t.Errorf("summary %+v, %v", s, err)
+	}
+}
+
+type execAttach struct{ out *bytes.Buffer }
+
+func (a execAttach) Stdin() io.Reader              { return nil }
+func (a execAttach) Stdout() io.WriteCloser        { return nopWriteCloser{a.out} }
+func (a execAttach) Stderr() io.WriteCloser        { return nil }
+func (a execAttach) TTY() bool                     { return false }
+func (a execAttach) Resize() <-chan vkapi.TermSize { return nil }
+
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
+
+// kubectl exec reaches the executor of the pod's namespace with the pod's
+// Workload UID, rank and container, and the command, in the kubelet's exec
+// protocol: the output comes back, and a non-zero exit is the command's code.
+func TestExecThroughTheExecutor(t *testing.T) {
+	var queries []url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != executorapi.ExecPath {
+			http.NotFound(w, r)
+			return
+		}
+		queries = append(queries, r.URL.Query())
+		r = mux.SetURLVars(r, map[string]string{"namespace": testNS, "pod": "train-1", "container": "main"})
+		vkapi.HandleContainerExec(func(_ context.Context, _, _, _ string, cmd []string, a vkapi.AttachIO) error {
+			fmt.Fprintf(a.Stdout(), "ran %s\n", strings.Join(cmd, " "))
+			if cmd[0] == "false" {
+				return utilexec.CodeExitError{Err: errors.New("exit status 3"), Code: 3}
+			}
+			return nil
+		})(w, r)
+	}))
+	t.Cleanup(srv.Close)
+	var calls []apiCall
+	c := fakeClient(t, &calls, testPod("train-1", "1"), testWorkload(), testConfig())
+	p := &Provider{Reader: c, executorURL: func(*v1alpha1.OffloadConfig, string) string { return srv.URL }}
+
+	out := &bytes.Buffer{}
+	if err := p.RunInContainer(context.Background(), testNS, "train-1", "main", []string{"hostname", "-f"}, execAttach{out}); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "ran hostname -f\n" {
+		t.Errorf("output %q", out.String())
+	}
+	want := url.Values{executorapi.ExecWorkloadUID: {"uid-wl"}, executorapi.ExecRank: {"1"}, executorapi.ExecContainer: {"main"},
+		"command": {"hostname", "-f"}, "output": {"1"}}
+	if len(queries) != 1 || queries[0].Encode() != want.Encode() {
+		t.Fatalf("queries %v, want %v", queries, want)
+	}
+	err := p.RunInContainer(context.Background(), testNS, "train-1", "main", []string{"false"}, execAttach{&bytes.Buffer{}})
+	var code utilexec.ExitError
+	if !errors.As(err, &code) || code.ExitStatus() != 3 {
+		t.Errorf("err %v, want exit code 3", err)
 	}
 }

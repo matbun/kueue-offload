@@ -9,6 +9,17 @@ package executorapi
 // container of one member of a Workload's live job, or of every member.
 const GetLogsPath = "/getLogs"
 
+// ExecPath is the executor's exec: a command in a running member's container,
+// with the kubelet's exec protocol. Its query is ExecWorkloadUID, ExecRank and
+// ExecContainer, then the kubelet's command, tty, input, output and error.
+const ExecPath = "/exec"
+
+const (
+	ExecWorkloadUID = "workloadUID"
+	ExecRank        = "rank"
+	ExecContainer   = "container"
+)
+
 // Query parameters of GetLogsPath. workloadUID is required; container defaults
 // to each member's first container; without rank, every member's lines, each
 // prefixed "[rank N] " when there are more than one. follow, timestamps and

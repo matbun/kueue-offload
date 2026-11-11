@@ -142,6 +142,10 @@ type Membership struct {
 	// executorTemplate holds a Go text/template that renders the executor objects
 	// of one tenant namespace as multi-document YAML. It may produce only
 	// namespaced objects. Unset means no executor objects are rendered.
+	// The key is the template. The other keys of that ConfigMap whose names end
+	// in .tpl.yaml are templates of their own name, for
+	// {{ template "<key>" . }}, and file "<key>" returns a key's content as it
+	// is, for example {{ file "known_hosts" | toJson }}.
 	// +optional
 	ExecutorTemplate *ConfigMapKeyRef `json:"executorTemplate,omitempty"`
 
@@ -156,7 +160,9 @@ type Membership struct {
 	// When they succeed, the controller deletes the objects it made for the
 	// namespace and the site; the Secrets the tenant made stay, so that adding
 	// the namespace back restores it. Unset: the objects are deleted without
-	// running anything.
+	// running anything. As in executorTemplate, the key is the template, the
+	// other *.tpl.yaml keys of that ConfigMap are templates of their own name,
+	// and file "<key>" returns a key's content.
 	// +optional
 	OffboardTemplate *ConfigMapKeyRef `json:"offboardTemplate,omitempty"`
 

@@ -5,3 +5,4 @@ resources:
 - executor-template.yaml
 - identitymap.yaml
 - projectquota.yaml
+- manager.yaml

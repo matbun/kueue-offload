@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"text/template"
@@ -42,9 +43,40 @@ var templateFuncs = template.FuncMap{
 	},
 }
 
-// ParseTemplate parses an executor template. Missing map keys are errors.
-func ParseTemplate(text string) (*template.Template, error) {
-	return template.New("executor").Option("missingkey=error").Funcs(templateFuncs).Parse(text)
+// ParseTemplate parses key of a template ConfigMap's data. Every other key
+// whose name ends in .tpl.yaml is parsed as a template of that name, for
+// {{ template "<key>" . }}; the function file returns any key's content as it
+// is. Missing map keys are errors.
+func ParseTemplate(data map[string]string, key string) (*template.Template, error) {
+	text, ok := data[key]
+	if !ok {
+		return nil, fmt.Errorf("no key %q", key)
+	}
+	file := func(k string) (string, error) {
+		v, ok := data[k]
+		if !ok {
+			return "", fmt.Errorf("no key %q", k)
+		}
+		return v, nil
+	}
+	t, err := template.New(key).Option("missingkey=error").Funcs(templateFuncs).
+		Funcs(template.FuncMap{"file": file}).Parse(text)
+	if err != nil {
+		return nil, err
+	}
+	var parts []string
+	for k := range data {
+		if k != key && strings.HasSuffix(k, ".tpl.yaml") {
+			parts = append(parts, k)
+		}
+	}
+	slices.Sort(parts)
+	for _, k := range parts {
+		if _, err := t.New(k).Parse(data[k]); err != nil {
+			return nil, fmt.Errorf("key %q: %w", k, err)
+		}
+	}
+	return t, nil
 }
 
 // renderObjects executes the template and splits its output into objects.

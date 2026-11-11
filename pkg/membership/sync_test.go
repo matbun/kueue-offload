@@ -2,6 +2,7 @@ package membership
 
 import (
 	"context"
+	"io"
 	"reflect"
 	"sort"
 	"strings"
@@ -358,6 +359,91 @@ func TestTemplateRefusals(t *testing.T) {
 	}
 }
 
+// partsConfigMap is a template ConfigMap of an entry key, parts and raw files,
+// as kustomize's configMapGenerator writes it.
+func partsConfigMap(data map[string]string) *corev1.ConfigMap {
+	cm := templateConfigMap("")
+	cm.Data = data
+	return cm
+}
+
+func TestTemplateParts(t *testing.T) {
+	// Template syntax, quotes, $ and blank lines in a raw file reach the
+	// rendered object as they are.
+	raw := "{{ .Namespace }} {{ broken\n\"quoted\" 'single' $HOME ${1:-x} \\n\n\n\ttab <&>\n"
+	part := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: kueue-offload-executor\ndata:\n  raw: {{ file \"raw\" | toJson }}\n"
+	e := newEnv(t, partsConfigMap(map[string]string{
+		"template.yaml": `{{ template "a.tpl.yaml" . }}`,
+		"a.tpl.yaml":    part,
+		"raw":           raw,
+	}))
+	e.sync()
+	for _, ns := range []string{"alice", "bob"} {
+		cm := e.executorConfigMap(ns)
+		if cm == nil {
+			t.Fatalf("ConfigMap of the part not applied in %s", ns)
+		}
+		if cm.Data["raw"] != raw {
+			t.Errorf("%s: raw file rendered as %q, want %q", ns, cm.Data["raw"], raw)
+		}
+	}
+
+	if _, err := ParseTemplate(map[string]string{"a.tpl.yaml": part}, "template.yaml"); err == nil || !strings.Contains(err.Error(), `no key "template.yaml"`) {
+		t.Errorf("missing entry key: %v", err)
+	}
+	// Parts share the entry's options: a missing map key is an error there too.
+	tmpl, err := ParseTemplate(map[string]string{"template.yaml": "", "a.tpl.yaml": "{{ .nope }}"}, "template.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpl.ExecuteTemplate(io.Discard, "a.tpl.yaml", map[string]string{}); err == nil {
+		t.Error("a part rendered a missing map key")
+	}
+
+	cases := map[string]struct {
+		data map[string]string
+		want string
+	}{
+		"unknown part": {map[string]string{
+			"template.yaml": "{{ template \"a.tpl.yaml\" . }}\n---\n{{ template \"b.tpl.yaml\" . }}\n",
+			"a.tpl.yaml":    part,
+			"raw":           raw,
+		}, `template "b.tpl.yaml" not defined`},
+		"unknown file": {map[string]string{
+			"template.yaml": "{{ template \"a.tpl.yaml\" . }}\n---\n{{ file \"nope\" }}\n",
+			"a.tpl.yaml":    part,
+			"raw":           raw,
+		}, `no key "nope"`},
+		"part does not parse": {map[string]string{
+			"template.yaml": `{{ template "a.tpl.yaml" . }}`,
+			"a.tpl.yaml":    part,
+			"raw":           raw,
+			"b.tpl.yaml":    "{{ .Namespace ",
+		}, `key "b.tpl.yaml"`},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t, partsConfigMap(c.data))
+			_, err := e.r.Sync(context.Background())
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("sync: %v, want an error with %s", err, c.want)
+			}
+			for _, ns := range []string{"alice", "bob"} {
+				if e.executorConfigMap(ns) != nil {
+					t.Errorf("ConfigMap applied in %s from a refused template", ns)
+				}
+			}
+			refused := false
+			for _, ev := range e.drainEvents() {
+				refused = refused || strings.Contains(ev, EventTemplateRefused)
+			}
+			if !refused {
+				t.Errorf("no %s event", EventTemplateRefused)
+			}
+		})
+	}
+}
+
 func TestIdentityConflictSkipsNamespace(t *testing.T) {
 	e := newEnv(t,
 		assocConfigMap("hpc-a|proj42|alice\nhpc-a|proj99|alice2\nhpc-a|proj42|bob\n"),
@@ -432,7 +518,7 @@ func TestParseAssociations(t *testing.T) {
 }
 
 func TestSampleTemplateRenders(t *testing.T) {
-	tmpl, err := ParseTemplate(sampleTemplate(t))
+	tmpl, err := ParseTemplate(map[string]string{"template.yaml": sampleTemplate(t)}, "template.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}

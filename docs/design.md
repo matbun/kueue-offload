@@ -998,7 +998,11 @@ removed at offboarding. A namespace that does not exist is created.
 ### Executor health
 
 Each tenant namespace gets the site's executor objects from the `membership.executorTemplate` Go
-template (namespaced objects only).
+template (namespaced objects only). The key it names is the template; as for
+`membership.offboardTemplate`, the other keys of that ConfigMap ending in `.tpl.yaml` are templates
+of their own name for `{{ template "<key>" . }}`, and `file "<key>"` returns a key's content
+unparsed (`{{ file "known_hosts" | toJson }}` is a YAML string), so a kustomize
+`configMapGenerator` can build the ConfigMap from plain files with no rendering step.
 
 The controller reads Secrets only as metadata (`PartialObjectMetadata`, RBAC `get` on Secrets, no
 `list` or `watch`): the `resourceVersion` of each Secret a rendered pod template mounts or reads

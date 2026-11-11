@@ -118,7 +118,7 @@ func TestSampleExecutorConfigLoads(t *testing.T) {
 	if err := yaml.Unmarshal(raw, cm); err != nil {
 		t.Fatal(err)
 	}
-	tmpl, err := membership.ParseTemplate(cm.Data["template.yaml"])
+	tmpl, err := membership.ParseTemplate(cm.Data, "template.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}

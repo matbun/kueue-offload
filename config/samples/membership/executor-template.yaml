@@ -1,7 +1,10 @@
 # The executor objects of one tenant namespace. The membership controller executes
 # this Go text/template once per namespace with .Namespace, .Site, .HPCUser,
 # .Accounts (sorted), .Image, .ExecutorService and .ExecutorPort, and applies every
-# document in that namespace. Functions: join, quote, toJson.
+# document in that namespace. Functions: join, quote, toJson, and file "<key>", the
+# content of another key of this ConfigMap as it is ({{ file "known_hosts" | toJson }}).
+# Every other key ending in .tpl.yaml is a template of that name, included with
+# {{ template "<key>" . }}, so a template can be split into parts.
 #
 # The tenant pod runs three containers, as interLink's own in-cluster deployment
 # does: the executor (.Image, the kueue-offload image), a stock interLink API

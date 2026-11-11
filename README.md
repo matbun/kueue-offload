@@ -71,17 +71,18 @@ pod also shows in its status message.
 make test                          # unit tests; the executor's run an interLink API server built
                                    # from INTERLINK_SRC (default ../interLink-hardening)
 make docker-build IMG=<image>      # /offload-controller, /membership and /executor in one image
-kubectl apply --server-side -f config/crd/bases
-kubectl apply -k config/rbac; kubectl apply -k config/rbac/membership; kubectl apply -k config/rbac/executor
-kubectl apply -k config/admission  # who may write an OffloadRequest
+kubectl apply --server-side -k config/default     # CRDs, RBAC, who may write an OffloadRequest,
+                                                  # the offload controller (image kueue-offload)
+kubectl apply --server-side -k config/membership  # its namespace and RBAC, the executors' ClusterRole
 ```
 
-Then the offload controller of `config/manager`, once for every site, and per site: an
+One offload controller serves every site. Then per site: an
 `OffloadWorker`, a `ResourceFlavor` per batch queue, an `AdmissionCheck` naming the site's
 `OffloadConfig`, the `OffloadConfig` itself (naming the worker, with its `membership` block), the
 associations and executor template ConfigMaps in `kueue-offload-membership`, an `IdentityMap`,
-optional `ProjectQuota`s, and the membership Deployment of `config/membership` with
-`--site=<site>`. `config/samples/membership` has a complete example.
+optional `ProjectQuota`s, and the membership Deployment of
+`config/samples/membership/manager.yaml` with `--site=<site>`. `config/samples/membership` has
+a complete example.
 
 ## Uninstall
 

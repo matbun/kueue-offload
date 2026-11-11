@@ -256,7 +256,7 @@ metadata:
 		objs = append(objs, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: n, Namespace: "alice"}})
 	}
 	e := newEnv(t, objs...)
-	tmpl, err := ParseTemplate(text)
+	tmpl, err := ParseTemplate(map[string]string{"template.yaml": text}, "template.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -118,9 +118,9 @@ func (r *Reconciler) Sync(ctx context.Context) (time.Duration, error) {
 	var errs []error
 	var tmpl *template.Template
 	if s.template != nil {
-		text, err := r.readConfigMap(ctx, *s.template)
+		data, err := r.readConfigMapData(ctx, *s.template)
 		if err == nil {
-			tmpl, err = ParseTemplate(text)
+			tmpl, err = ParseTemplate(data, s.template.Key)
 		}
 		if err != nil {
 			r.warn(sc, EventTemplateRefused, "executor template: "+err.Error())
@@ -189,18 +189,24 @@ func (r *Reconciler) warn(regarding runtime.Object, reason, note string) {
 
 // readConfigMap reads one key of a ConfigMap in the controller's namespace.
 func (r *Reconciler) readConfigMap(ctx context.Context, ref v1alpha1.ConfigMapKeyRef) (string, error) {
+	data, err := r.readConfigMapData(ctx, ref)
+	return data[ref.Key], err
+}
+
+// readConfigMapData reads the data of a ConfigMap in the controller's namespace
+// that holds ref.Key.
+func (r *Reconciler) readConfigMapData(ctx context.Context, ref v1alpha1.ConfigMapKeyRef) (map[string]string, error) {
 	if ref.Namespace != r.Namespace {
-		return "", fmt.Errorf("ConfigMap %s/%s is outside the controller's namespace %s", ref.Namespace, ref.Name, r.Namespace)
+		return nil, fmt.Errorf("ConfigMap %s/%s is outside the controller's namespace %s", ref.Namespace, ref.Name, r.Namespace)
 	}
 	cm := &corev1.ConfigMap{}
 	if err := r.Client.Get(ctx, types.NamespacedName{Namespace: ref.Namespace, Name: ref.Name}, cm); err != nil {
-		return "", err
+		return nil, err
 	}
-	v, ok := cm.Data[ref.Key]
-	if !ok {
-		return "", fmt.Errorf("ConfigMap %s/%s has no key %q", ref.Namespace, ref.Name, ref.Key)
+	if _, ok := cm.Data[ref.Key]; !ok {
+		return nil, fmt.Errorf("ConfigMap %s/%s has no key %q", ref.Namespace, ref.Name, ref.Key)
 	}
-	return v, nil
+	return cm.Data, nil
 }
 
 func managedLabels(site string) map[string]string {

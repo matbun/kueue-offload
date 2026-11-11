@@ -164,10 +164,10 @@ func (r *Reconciler) siteRequests(ctx context.Context, s site, ns string) ([]str
 // runOffboardJobs applies the Jobs of the offboard template and reports whether
 // they all ended.
 func (r *Reconciler) runOffboardJobs(ctx context.Context, sc *v1alpha1.OffloadConfig, s site, ns *corev1.Namespace, data TemplateData) (bool, error) {
-	text, err := r.readConfigMap(ctx, *s.offboard)
+	cm, err := r.readConfigMapData(ctx, *s.offboard)
 	var objs []*unstructured.Unstructured
 	if err == nil {
-		objs, err = renderOffboard(text, data)
+		objs, err = renderOffboard(cm, s.offboard.Key, data)
 	}
 	if err == nil {
 		err = r.prepareObjects(objs, s, data.Namespace)
@@ -199,9 +199,10 @@ func (r *Reconciler) runOffboardJobs(ctx context.Context, sc *v1alpha1.OffloadCo
 	return done, nil
 }
 
-// renderOffboard renders the offboard template, which may hold Jobs only.
-func renderOffboard(text string, data TemplateData) ([]*unstructured.Unstructured, error) {
-	t, err := ParseTemplate(text)
+// renderOffboard renders the offboard template, key of cm, which may hold Jobs
+// only.
+func renderOffboard(cm map[string]string, key string, data TemplateData) ([]*unstructured.Unstructured, error) {
+	t, err := ParseTemplate(cm, key)
 	if err != nil {
 		return nil, err
 	}

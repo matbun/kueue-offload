@@ -1108,6 +1108,31 @@ func TestUnlistedFlavorRejected(t *testing.T) {
 	}
 }
 
+// The membership controller's ClusterQueue of queue debug of proj42: the
+// account is its label, not a part of its name, and the flags are those of
+// the flavor admitted, as on the ClusterQueue of every flavor.
+func TestQueueClusterQueueResolvesAccountAndFlavor(t *testing.T) {
+	e := newEnv(t, func(objs *[]client.Object, _ *interceptor.Funcs) {
+		for _, o := range *objs {
+			switch o := o.(type) {
+			case *kueue.ClusterQueue:
+				o.Name = "hpc-a-proj42-debug"
+				o.Labels = map[string]string{v1alpha1.AccountLabel: "proj42", "hpc.interlink.eu/queue": "debug"}
+			case *kueue.Workload:
+				o.Status.Admission.ClusterQueue = "hpc-a-proj42-debug"
+				o.Status.Admission.PodSetAssignments[0].Flavors = map[corev1.ResourceName]kueue.ResourceFlavorReference{"cpu": "hpc-a-debug", "nvidia.com/gpu": "hpc-a-debug"}
+			}
+		}
+	})
+	e.reconcile()
+	if got, want := e.request(1).Spec.PodSets[0].Annotations[flagsKey], "--account=proj42 --partition=gpu --qos=debug --time=30"; got != want {
+		t.Errorf("flags %q, want %q", got, want)
+	}
+	if e.failed() != "" {
+		t.Errorf("failed %q", e.failed())
+	}
+}
+
 func TestRequestNameIsBounded(t *testing.T) {
 	if got := requestName("wl", "hpc-a", 3); got != "wl-hpc-a-3" {
 		t.Errorf("short name %q", got)

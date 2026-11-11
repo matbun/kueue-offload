@@ -3,6 +3,7 @@ package membership
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"text/template"
 
@@ -32,7 +33,7 @@ var jobKind = batchv1.SchemeGroupVersion.WithKind("Job")
 // does not stop the rest, as what it would clean up cannot be reached
 // otherwise. The Secrets of the namespace stay, so that adding it back restores
 // it. It reports whether the namespace is done.
-func (r *Reconciler) offboard(ctx context.Context, sc *v1alpha1.OffloadConfig, s site, executor *template.Template, ns *corev1.Namespace) (bool, error) {
+func (r *Reconciler) offboard(ctx context.Context, sc *v1alpha1.OffloadConfig, s site, p plan, executor *template.Template, ns *corev1.Namespace) (bool, error) {
 	logger := log.FromContext(ctx).WithValues("site", s.name, "namespace", ns.Name)
 	running, finished, err := r.siteRequests(ctx, s, ns.Name)
 	if err != nil {
@@ -53,11 +54,14 @@ func (r *Reconciler) offboard(ctx context.Context, sc *v1alpha1.OffloadConfig, s
 		logger.Info("namespace left the site, the executor cleans up after its finished jobs", "requests", names)
 		return false, nil
 	}
+	accounts := splitList(ns.Annotations[LeftAnnotation(s.name)])
 	data := TemplateData{
 		Namespace:       ns.Name,
 		Site:            s.name,
 		HPCUser:         ns.Annotations[UserAnnotation(s.name)],
-		Accounts:        splitList(ns.Annotations[LeftAnnotation(s.name)]),
+		Accounts:        accounts,
+		Queues:          s.queueNames(),
+		QueuesOf:        p.queuesOf(s, accounts),
 		Image:           s.executorImage,
 		ExecutorService: s.executorService,
 		ExecutorPort:    s.executorPort,
@@ -113,16 +117,44 @@ func (r *Reconciler) offboard(ctx context.Context, sc *v1alpha1.OffloadConfig, s
 		}
 	}
 
+	// A namespaceLabels key that another site the namespace is a member of
+	// sets too stays, recorded as that site's, which removes it when it
+	// offboards the namespace.
+	others, err := r.namespaceLabelsOfOtherSites(ctx, s.name, ns)
+	if err != nil {
+		return false, err
+	}
 	labels := map[string]any{}
+	handed := map[string][]string{}
 	for _, k := range splitList(ns.Annotations[LabelsAnnotation(s.name)]) {
-		if hasKey(ns.Labels, k) {
+		if !hasKey(ns.Labels, k) {
+			continue
+		}
+		if len(others[k]) == 0 {
 			labels[k] = nil
+			continue
+		}
+		for _, o := range others[k] {
+			keys, ok := handed[o]
+			if !ok {
+				keys = splitList(ns.Annotations[LabelsAnnotation(o)])
+			}
+			if !contains(keys, k) {
+				keys = append(keys, k)
+			}
+			handed[o] = keys
 		}
 	}
 	if hasKey(ns.Labels, TenantLabel) && !memberOfOtherSite(ns, s.name) {
 		labels[TenantLabel] = nil
 	}
 	annotations := map[string]any{LeftAnnotation(s.name): nil, OffboardedAnnotation(s.name): nil}
+	for o, keys := range handed {
+		sort.Strings(keys)
+		if v := strings.Join(keys, ","); v != ns.Annotations[LabelsAnnotation(o)] {
+			annotations[LabelsAnnotation(o)] = v
+		}
+	}
 	for _, k := range []string{UserAnnotation(s.name), LabelsAnnotation(s.name), ExecutorAnnotation(s.name)} {
 		if hasKey(ns.Annotations, k) {
 			annotations[k] = nil
@@ -248,6 +280,25 @@ func (r *Reconciler) deleteOffboardJobs(ctx context.Context, s site, ns string) 
 	u.SetGroupVersionKind(jobKind)
 	return r.Client.DeleteAllOf(ctx, u, client.InNamespace(ns), client.MatchingLabels(labels),
 		client.PropagationPolicy(metav1.DeletePropagationBackground))
+}
+
+// namespaceLabelsOfOtherSites maps each membership.namespaceLabels key of the
+// sites other than site that ns is a member of to those sites.
+func (r *Reconciler) namespaceLabelsOfOtherSites(ctx context.Context, site string, ns *corev1.Namespace) (map[string][]string, error) {
+	l := &v1alpha1.OffloadConfigList{}
+	if err := r.Client.List(ctx, l); err != nil {
+		return nil, err
+	}
+	out := map[string][]string{}
+	for _, sc := range l.Items {
+		if sc.Name == site || sc.Spec.Membership == nil || !hasKey(ns.Annotations, AccountsAnnotation(sc.Name)) {
+			continue
+		}
+		for k := range sc.Spec.Membership.NamespaceLabels {
+			out[k] = append(out[k], sc.Name)
+		}
+	}
+	return out, nil
 }
 
 // memberOfOtherSite reports whether ns holds a membership of a site other than

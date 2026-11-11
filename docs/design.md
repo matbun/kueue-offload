@@ -1042,31 +1042,112 @@ The membership controller keeps one site's Kueue objects, namespace labels and e
 with the site's Slurm associations (a ConfigMap holding
 `sacctmgr --parsable2 --noheader show assoc format=cluster,account,user`) and the `IdentityMap`s,
 which map a Kubernetes user to a namespace and a site user. It never infers a mapping from names.
+Every ConfigMap of its namespace labelled `hpc.interlink.eu/associations: <site>` adds the rows of
+its key `associations`, in the same format, for rows that no `sacctmgr` run produces (a fixture
+user, a site whose rows are written by hand); a row in several of them counts once, and a labelled
+ConfigMap without that key stops the pass, as a missing associations ConfigMap does.
 It runs a pass when its OffloadConfig, an IdentityMap, a ProjectQuota of the site, a ConfigMap of
 its namespace or an executor Deployment changes, and every `membership.syncInterval` (default 15
 minutes), every minute while an executor is not available or a namespace is leaving the site.
 
 ### Kueue objects per site and project
 
+A project is a site account. Several namespaces (users) can be members of one project, and one
+namespace of several projects, on one site or on several. Each site lists in `membership.queues`
+the batch queues a member picks by name, `{name, flavors}`, for example `debug` on the flavor of a
+debug QOS and `long` on that of a production QOS; each flavor must be in `flavors`, and the names
+`all` and `project` are reserved. A queue name that is not a DNS label or is reserved, a queue or
+flavor listed twice, a queue with no flavor and a flavor not in `flavors` refuse the whole
+OffloadConfig: the pass changes nothing and records a `SyncFailed` event. A queue none of whose
+flavors has quota on the site (in `membership.defaultProjectQuota` or a ProjectQuota of the site),
+which could admit nothing, is left out of the pass as if it were not listed, with a
+`MembershipSkipped` Warning event, and the rest of the pass goes on, revocations included; a queue
+with quota on some of its flavors only admits on those, with the same event. A queue none of whose
+flavors has quota in one project's quota (its ProjectQuota, else `membership.defaultProjectQuota`)
+is left out for that project alone, with a `MembershipSkipped` event: no ClusterQueue, no
+LocalQueues, and not in `.QueuesOf` (below).
+
 With Kueue v1beta2 field names (the reference cluster runs Kueue 0.16.9):
 
+```
+Cohort <site>                          membership.cohort, default the site name
+  Cohort <site>-<account>-project      the project's quota, lendingLimit 0
+    ClusterQueue <site>-<account>          every flavor of the quota
+    ClusterQueue <site>-<account>-<queue>  the queue's flavors only, one per queue
+```
+
 - while the site has an account with members, a Cohort named `membership.cohort` (default: the
-  site name);
-- per account with members, a ClusterQueue `<site>-<account>` labelled
-  `hpc.interlink.eu/account: <account>` (the offload controller charges that account) with
-  `cohortName` the site's Cohort,
-  `namespaceSelector` on `hpc.interlink.eu/<site>-<account>: "true"`, `queueingStrategy:
-  BestEffortFIFO`, `preemption.withinClusterQueue` and `reclaimWithinCohort` `Never`,
+  site name), with no quota;
+- per account with members, a Cohort `<site>-<account>-project` with `parentName` the site's
+  Cohort and `resourceGroups` from the ProjectQuota `<site>-<account>`, else from
+  `membership.defaultProjectQuota`, with `lendingLimit: 0` set on every resource, so that a
+  project never lends its quota to another; a `borrowingLimit` is kept as given;
+- per account with members, a ClusterQueue `<site>-<account>` of every flavor of the project's quota
+  and a ClusterQueue `<site>-<account>-<queue>` per queue with only the queue's flavors (resource
+  groups with none of them are dropped; a queue none of whose flavors the quota has gets none). Each
+  is labelled `hpc.interlink.eu/account: <account>` (the offload controller charges that account)
+  and, but the one of every flavor, `hpc.interlink.eu/queue: <queue>`, and has `cohortName` the
+  project's Cohort, `nominalQuota: 0` and no limits on every resource, so that every Workload
+  borrows from the project's Cohort and the queues of a project share its quota, `namespaceSelector`
+  on `hpc.interlink.eu/<site>-<account>: "true"`, `queueingStrategy: BestEffortFIFO`,
+  `preemption.withinClusterQueue` and `reclaimWithinCohort` `Never`, and
   `admissionChecksStrategy.admissionChecks: [{name: <membership.admissionCheck, default the site
-  name>}]`, and `resourceGroups` from the ProjectQuota `<site>-<account>`, else from
-  `membership.defaultProjectQuota`;
-- per membership, a LocalQueue `<site>-<account>` in the member's namespace.
+  name>}]`;
+- per membership, the LocalQueues `<site>-<account>` and `<site>-<account>-<queue>` in the
+  member's namespace, each pointing at the ClusterQueue of the same name.
+
+On the ClusterQueue of every flavor Kueue takes the first flavor with room, as before queues
+existed; on a queue's ClusterQueue the user chooses the batch queue. The offload controller reads
+the account from the label and the batch queue from the flavor Kueue admitted, so it treats every
+ClusterQueue of a project alike. The executor template gets the site's queue names, in their
+order, as `.Queues`, and per account the names of those it has a LocalQueue of, in the same order,
+as `.QueuesOf` (a map from account to list), to name the LocalQueues in what it renders (Katib trial
+templates, PodDefaults): `{{ range $a := .Accounts }}{{ range index $.QueuesOf $a }}` names
+`<site>-<account>-<queue>`. A queue skipped for the whole site, as one without quota, is in
+neither; one skipped for an account alone (no quota in the project's, a name taken or too long,
+below) is in `.Queues` only.
+
+With `membership.admissionFairSharing: true`, every ClusterQueue of the site gets
+`admissionScope.admissionMode: UsageBasedAdmissionFairSharing`: within one ClusterQueue, Kueue
+admits first the Workloads of the LocalQueue whose recent usage is lowest, so that one member of a
+project cannot keep the others out of its queues. It needs `admissionFairSharing` in Kueue's
+configuration (`usageHalfLifeTime`, `usageSamplingInterval`, `resourceWeights`). Kueue orders by
+usage only inside one ClusterQueue: between the queues of a project, which all borrow, it falls
+back to priority and creation time, and a member's usage in one queue does not count in another.
+
+Two accounts can render the same name: account `<a>-<queue>` has the ClusterQueue of queue `<queue>`
+of account `<a>`. Kueue keeps Cohort and ClusterQueue names apart, so the controller checks the name
+of a project Cohort against the site's Cohorts and `membership.cohort` only, and the name of a
+ClusterQueue, which its LocalQueues share, against the site's ClusterQueues only: the Cohort of
+account `<a>` and the queue of every flavor of account `<a>-project` are both `<site>-<a>-project`,
+and both accounts keep their memberships. The controller never gives a name two owners of one kind:
+the account whose ClusterQueue or Cohort holds a name keeps it, and the names no object holds go
+first to every account's Cohort and ClusterQueue of every flavor, then to the other queues, each in
+account name order. A queue whose name another account holds is skipped for that account alone (no
+ClusterQueue, no LocalQueues), with a `MembershipSkipped` event naming the owner, and the account
+keeps its other queues. Templates name `<site>-<account>` for every account of `.Accounts`, so an
+account whose Cohort name is another account's Cohort, or whose `<site>-<account>` is another
+account's ClusterQueue, is left out of the pass, as an account that is not a DNS label is. `.Queues` still lists every queue of the site and `.QueuesOf` leaves the skipped
+queue out for that account; the queue of every flavor is in neither.
+
+Every name an account renders must be a DNS label. An account whose names are not, for any reason
+but their length, is left out of the pass with a `MembershipSkipped` event. A queue name
+`<site>-<account>-<queue>` longer than 63 characters is skipped for that account alone, as a taken
+name is, with a `MembershipSkipped` event, and the accounts with shorter names keep the queue. An
+account whose Cohort name `<site>-<account>-project` is longer than 63 characters, or is
+`membership.cohort` (a project Cohort cannot be its own parent), is left out of the pass with a
+`MembershipSkipped` event, unless the site has a ClusterQueue or Cohort labelled with the account: then the pass stops, with a `SyncFailed` event, and nothing is changed or
+revoked, because those are queues a controller made before project Cohorts, and leaving the account
+out would revoke them.
 
 The ResourceFlavors, the AdmissionCheck and the OffloadConfig are the deployment's. A membership
-that disappears loses its label and its LocalQueue at once ([Offboarding](#offboarding)). The
-ClusterQueue of an account goes once no namespace holds it or waits to be offboarded from it (Kueue
-keeps a deleted ClusterQueue until the Workloads it admitted end), and the Cohort once the site has
-no ClusterQueue left; the controller needs `delete` on `clusterqueues` and `cohorts`.
+that disappears loses its label and its LocalQueues at once ([Offboarding](#offboarding)). A queue
+dropped from `membership.queues`, or left out for one account, loses its ClusterQueues and
+LocalQueues at once. The ClusterQueues of an account go once no namespace holds it or waits to be
+offboarded from it, and its Cohort at the first pass after no ClusterQueue in it is left: Kueue
+keeps a deleted ClusterQueue, under its finalizer, until the Workloads it admitted end, and those
+use the Cohort's quota. The site's Cohort goes once the site has no account left; the controller
+needs `delete` on `clusterqueues` and `cohorts`.
 
 At the end of each pass the controller writes to the OffloadConfig's `status.members` the number of
 member namespaces and to `status.leaving` the number of namespaces that wait to be offboarded, when
@@ -1095,9 +1176,11 @@ associations), the controller records the accounts it had in the annotation
    the stage Jobs of the site's executor (labels `interlink.eu/stage-of` and
    `offload.interlink.eu/site: <worker>`, [Staging](#staging)), which outlive their requests.
    A claim it made that a pod still mounts stays Terminating until that pod ends.
-5. It removes its labels (the tenant label only when no other site keeps the namespace, the
-   `namespaceLabels` only where it added them) and its annotations, and records an event
-   `Offboarded`.
+5. It removes its labels and its annotations, and records an event `Offboarded`. The tenant label
+   goes only when no other site keeps the namespace, and the `namespaceLabels` only where it added
+   them. A `namespaceLabels` key that another site the namespace is still a member of sets too
+   stays, and goes into that site's `hpc.interlink.eu/<site>-labels`, so that that site removes it
+   when it offboards the namespace.
 
 The namespace and its Secrets stay, so adding the namespace back restores everything at the next
 sync. A namespace deleted outright is not offboarded: there is no finalizer on namespaces. The
@@ -1115,7 +1198,8 @@ offboarding), and removes only labels it set. The OffloadConfig's `membership.na
 added to every member namespace too, for example the label the cluster's
 `managedJobsNamespaceSelector` selects, so that Kueue manages every tenant's jobs; those the
 namespace did not have already are recorded in `hpc.interlink.eu/<site>-labels`, and only those are
-removed at offboarding. A namespace that does not exist is created.
+removed at offboarding, unless another site of the namespace sets them too
+([Offboarding](#offboarding)). A namespace that does not exist is created.
 
 ### Executor health
 
@@ -1125,6 +1209,12 @@ template (namespaced objects only). The key it names is the template; as for
 of their own name for `{{ template "<key>" . }}`, and `file "<key>"` returns a key's content
 unparsed (`{{ file "known_hosts" | toJson }}` is a YAML string), so a kustomize
 `configMapGenerator` can build the ConfigMap from plain files with no rendering step.
+
+Once it applied a namespace's objects, the controller deletes, with `deletecollection` and a
+`metadata.name!=` field selector, the objects of the namespace labelled with its `managed-by` and
+`site` labels, of every kind the render holds, that the render no longer holds: those of a revoked
+account or of a dropped queue, such as their PodDefaults. Objects without those labels are never
+deleted, nor LocalQueues, which are revoked on their own.
 
 The controller reads Secrets only as metadata (`PartialObjectMetadata`, RBAC `get` on Secrets, no
 `list` or `watch`): the `resourceVersion` of each Secret a rendered pod template mounts or reads

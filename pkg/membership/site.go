@@ -3,7 +3,10 @@
 package membership
 
 import (
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -30,6 +33,13 @@ const (
 	// charges.
 	SiteLabel    = labelPrefix + "site"
 	AccountLabel = v1alpha1.AccountLabel
+	// QueueLabel names, on the ClusterQueues and LocalQueues of one of
+	// membership.queues, that queue. The queue of every flavor has none.
+	QueueLabel = labelPrefix + "queue"
+	// AssociationsLabel marks a ConfigMap of the controller's namespace whose
+	// key AssociationsKey holds more association rows of the site it names.
+	AssociationsLabel = labelPrefix + "associations"
+	AssociationsKey   = "associations"
 	// OffboardLabel marks the Jobs of the offboard template.
 	OffboardLabel = labelPrefix + "offboard"
 
@@ -101,7 +111,13 @@ type site struct {
 	// workers label the site's OffloadRequests.
 	workers      []string
 	defaultQuota []kueue.ResourceGroup
+	queues       []v1alpha1.MembershipQueue
+	fairSharing  bool
 }
+
+// reservedQueues are queue names that would make a project's names ambiguous:
+// <site>-<account>-project is its Cohort.
+var reservedQueues = []string{"all", "project"}
 
 func resolveSite(sc *v1alpha1.OffloadConfig) (site, error) {
 	m := sc.Spec.Membership
@@ -124,6 +140,8 @@ func resolveSite(sc *v1alpha1.OffloadConfig) (site, error) {
 		namespaceLabels: m.NamespaceLabels,
 		workers:         sc.Spec.Workers,
 		defaultQuota:    m.DefaultProjectQuota,
+		queues:          m.Queues,
+		fairSharing:     m.AdmissionFairSharing,
 	}
 	if s.slurmCluster == "" {
 		return site{}, fmt.Errorf("OffloadConfig %s: membership.slurmCluster is empty", sc.Name)
@@ -152,8 +170,147 @@ func resolveSite(sc *v1alpha1.OffloadConfig) (site, error) {
 			return site{}, fmt.Errorf("OffloadConfig %s: membership.namespaceLabels %s=%q: %s", sc.Name, k, v, strings.Join(errs, "; "))
 		}
 	}
+	seen := map[string]bool{}
+	for _, q := range s.queues {
+		if err := checkQueue(q, sc.Spec.Flavors, seen); err != nil {
+			return site{}, fmt.Errorf("OffloadConfig %s: membership.queues %q: %w", sc.Name, q.Name, err)
+		}
+		seen[q.Name] = true
+	}
 	return s, nil
 }
 
-// queueName is the ClusterQueue and LocalQueue name of an account.
-func (s site) queueName(account string) string { return s.queuePrefix + account }
+// checkQueue says why a queue cannot be rendered. seen holds the names of the
+// queues before it.
+func checkQueue(q v1alpha1.MembershipQueue, flavors map[string]v1alpha1.FlavorTarget, seen map[string]bool) error {
+	if errs := validation.IsDNS1123Label(q.Name); len(errs) > 0 {
+		return errors.New(strings.Join(errs, "; "))
+	}
+	if contains(reservedQueues, q.Name) {
+		return fmt.Errorf("the name is reserved")
+	}
+	if seen[q.Name] {
+		return fmt.Errorf("listed twice")
+	}
+	if len(q.Flavors) == 0 {
+		return fmt.Errorf("no flavor")
+	}
+	for i, f := range q.Flavors {
+		if _, ok := flavors[string(f)]; !ok {
+			return fmt.Errorf("flavor %s is not in flavors", f)
+		}
+		if slices.Contains(q.Flavors[:i], f) {
+			return fmt.Errorf("flavor %s listed twice", f)
+		}
+	}
+	return nil
+}
+
+// dropQueuesWithoutQuota leaves out of the site's queues those none of whose
+// flavors has quota in the default or in a ProjectQuota of the site, which
+// could admit nothing, and says so in msgs; a queue that lacks quota on some
+// of its flavors only is kept and reported too.
+func (s *site) dropQueuesWithoutQuota(quotas map[string][]kueue.ResourceGroup) (msgs []string) {
+	have := map[kueue.ResourceFlavorReference]bool{}
+	for _, groups := range append([][]kueue.ResourceGroup{s.defaultQuota}, slices.Collect(maps.Values(quotas))...) {
+		for _, g := range groups {
+			for _, f := range g.Flavors {
+				have[f.Name] = true
+			}
+		}
+	}
+	var kept []v1alpha1.MembershipQueue
+	for _, q := range s.queues {
+		var missing []string
+		for _, f := range q.Flavors {
+			if !have[f] {
+				missing = append(missing, string(f))
+			}
+		}
+		what := fmt.Sprintf("membership.queues %q: flavor %s has no quota in defaultProjectQuota or a ProjectQuota of the site", q.Name, strings.Join(missing, ", "))
+		if len(missing) > 1 {
+			what = fmt.Sprintf("membership.queues %q: flavors %s have no quota in defaultProjectQuota or a ProjectQuota of the site", q.Name, strings.Join(missing, ", "))
+		}
+		switch {
+		case len(missing) == len(q.Flavors):
+			msgs = append(msgs, what+", the queue is skipped")
+			continue
+		case len(missing) > 0:
+			msgs = append(msgs, what+", the queue admits on its other flavors")
+		}
+		kept = append(kept, q)
+	}
+	s.queues = kept
+	return msgs
+}
+
+// queueNames are the names of the site's queues, in their order.
+func (s site) queueNames() []string {
+	out := make([]string, 0, len(s.queues))
+	for _, q := range s.queues {
+		out = append(out, q.Name)
+	}
+	return out
+}
+
+// queueName is the ClusterQueue and LocalQueue name of a queue of an account:
+// <site>-<account> for the queue of every flavor (queue ""), else
+// <site>-<account>-<queue>.
+func (s site) queueName(account, queue string) string {
+	if queue == "" {
+		return s.queuePrefix + account
+	}
+	return s.queuePrefix + account + "-" + queue
+}
+
+// projectQuota is an account's quota, its ProjectQuota in quotas, else the
+// site's default, and from names it in a message.
+func (s site) projectQuota(quotas map[string][]kueue.ResourceGroup, account string) (quota []kueue.ResourceGroup, from string) {
+	if q, ok := quotas[account]; ok {
+		return q, "ProjectQuota " + s.name + "-" + account
+	}
+	return s.defaultQuota, "defaultProjectQuota"
+}
+
+// projectCohort is the name of an account's Cohort.
+func (s site) projectCohort(account string) string { return s.queuePrefix + account + "-project" }
+
+// fits reports whether a ClusterQueue, LocalQueue or Cohort name is no longer
+// than a DNS label.
+func fits(name string) bool { return len(name) <= validation.DNS1123LabelMaxLength }
+
+// accountQueues are the queues of every account: "" for the one of every
+// flavor, then the site's queues.
+func (s site) accountQueues() []string { return append([]string{""}, s.queueNames()...) }
+
+// accountNames are the names the controller renders for an account: its
+// ClusterQueues, which its LocalQueues share, and its Cohort.
+func (s site) accountNames(account string) []string {
+	var out []string
+	for _, q := range s.accountQueues() {
+		out = append(out, s.queueName(account, q))
+	}
+	return append(out, s.projectCohort(account))
+}
+
+// isQueueOf reports whether name is the ClusterQueue or LocalQueue of one of
+// the account's queues.
+func (s site) isQueueOf(account, name string) bool {
+	for _, q := range s.accountQueues() {
+		if s.queueName(account, q) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// queueFlavors are the flavors of a queue of the site, nil for the queue of
+// every flavor.
+func (s site) queueFlavors(queue string) []kueue.ResourceFlavorReference {
+	for _, q := range s.queues {
+		if q.Name == queue {
+			return q.Flavors
+		}
+	}
+	return nil
+}

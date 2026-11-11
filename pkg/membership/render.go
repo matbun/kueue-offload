@@ -26,6 +26,15 @@ type TemplateData struct {
 	// Accounts are the tenant's accounts on the site, sorted; in the offboard
 	// template, those the namespace had before it left.
 	Accounts []string
+	// Queues are the names of the site's membership.queues, in their order,
+	// less those none of whose flavors has quota.
+	Queues []string
+	// QueuesOf maps each of Accounts to the names of Queues it has the
+	// LocalQueue <site>-<account>-<queue> of, in their order: a queue whose
+	// name is too long or held by another account, or none of whose flavors
+	// has quota in the account's quota, is left out for that account. Each
+	// account has the LocalQueue <site>-<account> of every flavor too.
+	QueuesOf map[string][]string
 	// Image is membership.executorImage of the OffloadConfig.
 	Image string
 	// ExecutorService and ExecutorPort are where the virtual node reads job

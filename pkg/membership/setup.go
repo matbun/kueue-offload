@@ -21,8 +21,9 @@ import (
 // +kubebuilder:rbac:groups=interlink.eu,resources=offloadconfigs/status,verbs=patch
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;patch
 // +kubebuilder:rbac:groups="",namespace=kueue-offload-membership,resources=configmaps,verbs=get;list;watch
-// The ClusterQueue of an account no namespace holds any more is deleted, and
-// the Cohort once the site has none.
+// The ClusterQueues and the Cohort of an account no namespace holds any more
+// are deleted, the ClusterQueues of a queue the site dropped, and the site's
+// Cohort once the site has no account.
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=clusterqueues;cohorts,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=localqueues,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps;services;serviceaccounts;persistentvolumeclaims,verbs=create;patch;deletecollection

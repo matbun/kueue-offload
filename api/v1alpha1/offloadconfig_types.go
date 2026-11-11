@@ -108,10 +108,11 @@ type OffloadConfigSpec struct {
 	// flavors maps a ResourceFlavor name to the batch queue its quota stands for,
 	// as annotations the backend's plugin reads (for Slurm, the sbatch flags in
 	// slurm-job.vk.io/flags). A project with several queues on one machine (say a
-	// debug, a production and an interactive QOS) is one ClusterQueue with one
-	// flavor each, and the flavor Kueue assigns decides where the job is submitted.
-	// A PodSet none of whose admitted flavors is listed is rejected: its job would
-	// carry no account.
+	// debug, a production and an interactive QOS) has one flavor each, and the
+	// flavor Kueue assigns decides where the job is submitted: on the project's
+	// ClusterQueue of every flavor, the first with room; on the ClusterQueue of
+	// one of membership.queues, only that queue's flavors. A PodSet none of whose
+	// admitted flavors is listed is rejected: its job would carry no account.
 	// +optional
 	Flavors map[string]FlavorTarget `json:"flavors,omitempty"`
 
@@ -155,7 +156,10 @@ type Membership struct {
 
 	// associations holds the output of
 	// sacctmgr --parsable2 --noheader show assoc format=cluster,account,user.
-	// Rows with an empty user are account rows and are skipped.
+	// Rows with an empty user are account rows and are skipped. Every ConfigMap
+	// of the controller's namespace labelled hpc.interlink.eu/associations=<site>
+	// adds the rows of its key associations, in the same format; a row in
+	// several of them counts once.
 	Associations ConfigMapKeyRef `json:"associations"`
 
 	// executorTemplate holds a Go text/template that renders the executor objects
@@ -192,8 +196,8 @@ type Membership struct {
 	// +optional
 	NamespaceLabels map[string]string `json:"namespaceLabels,omitempty"`
 
-	// cohort is the Kueue Cohort of the site's ClusterQueues. Unset means the
-	// site name.
+	// cohort is the site's Kueue Cohort, the parent of the Cohort of each of its
+	// projects, <site>-<account>-project. Unset means the site name.
 	// +optional
 	Cohort string `json:"cohort,omitempty"`
 
@@ -202,17 +206,59 @@ type Membership struct {
 	// +optional
 	AdmissionCheck string `json:"admissionCheck,omitempty"`
 
-	// defaultProjectQuota is the quota of a project that has no ProjectQuota.
+	// defaultProjectQuota is the quota of a project that has no ProjectQuota:
+	// the resourceGroups of its project Cohort.
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=16
 	// +optional
 	DefaultProjectQuota []kueue.ResourceGroup `json:"defaultProjectQuota,omitempty"`
+
+	// queues are the batch queues a member picks by name. Each project gets,
+	// next to its ClusterQueue <site>-<account> of every flavor of its quota,
+	// one ClusterQueue <site>-<account>-<name> per queue with only the queue's
+	// flavors, and each member namespace a LocalQueue of each. All of them
+	// borrow the project's quota from its Cohort, so the queues of a project
+	// share one quota. Each flavor must be listed in flavors. A queue none of
+	// whose flavors has quota on the site (defaultProjectQuota or a
+	// ProjectQuota of the site) is skipped with a Warning event.
+	// +listType=map
+	// +listMapKey=name
+	// +kubebuilder:validation:MaxItems=16
+	// +optional
+	Queues []MembershipQueue `json:"queues,omitempty"`
+
+	// admissionFairSharing sets admissionScope.admissionMode
+	// UsageBasedAdmissionFairSharing on every ClusterQueue of the site, so that
+	// Kueue admits first, within one ClusterQueue, the Workloads of the
+	// LocalQueue with the least recent usage: the members of a project take
+	// turns on its queues. It takes effect only with admissionFairSharing in
+	// Kueue's configuration.
+	// +optional
+	AdmissionFairSharing bool `json:"admissionFairSharing,omitempty"`
 
 	// syncInterval is how often the memberships are synchronised when
 	// nothing changed.
 	// +kubebuilder:default="15m"
 	// +optional
 	SyncInterval *metav1.Duration `json:"syncInterval,omitempty"`
+}
+
+// MembershipQueue is one batch queue of a site, named after the flavors it
+// admits on.
+type MembershipQueue struct {
+	// name ends the names of the queue's ClusterQueues and LocalQueues,
+	// <site>-<account>-<name>. "all" and "project" are reserved.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:XValidation:rule="self != 'all' && self != 'project'",message="all and project are reserved"
+	Name string `json:"name"`
+
+	// flavors are the ResourceFlavors the queue admits on.
+	// +listType=set
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	Flavors []kueue.ResourceFlavorReference `json:"flavors"`
 }
 
 // ConfigMapKeyRef selects one key of a ConfigMap. The membership controller
@@ -237,7 +283,7 @@ type OffloadConfigStatus struct {
 	// offboarded yet: a job of theirs at the site has not ended, or their
 	// offboard Jobs or the controller's objects in them are still there. With
 	// members and leaving at 0 the site has no tenant left, and the controller
-	// has deleted its ClusterQueues and Cohort.
+	// has deleted its ClusterQueues and Cohorts.
 	// +optional
 	Leaving *int32 `json:"leaving,omitempty"`
 }

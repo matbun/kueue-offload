@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"text/template"
@@ -12,8 +13,10 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -89,14 +92,21 @@ func (r *Reconciler) Sync(ctx context.Context) (time.Duration, error) {
 		return 0, err
 	}
 
-	text, err := r.readConfigMap(ctx, s.associations)
+	rows, bad, err := r.associations(ctx, s)
 	if err != nil {
 		r.warn(sc, EventSyncFailed, "associations: "+err.Error())
 		return 0, fmt.Errorf("associations: %w", err)
 	}
-	rows, bad := ParseAssociations(text)
 	if len(bad) > 0 {
 		logger.Info("ignoring malformed association rows", "rows", bad)
+	}
+	quotas, err := r.projectQuotas(ctx, s)
+	if err != nil {
+		return 0, err
+	}
+	for _, msg := range s.dropQueuesWithoutQuota(quotas) {
+		logger.Info("skipped", "reason", msg)
+		r.warn(sc, EventSkipped, msg)
 	}
 	maps := &v1alpha1.IdentityMapList{}
 	if err := r.Client.List(ctx, maps); err != nil {
@@ -106,11 +116,17 @@ func (r *Reconciler) Sync(ctx context.Context) (time.Duration, error) {
 	for _, m := range maps.Items {
 		entries = append(entries, m.Spec.Entries...)
 	}
-	p, err := buildPlan(s, rows, entries, r.Namespace)
+	owners, err := r.owners(ctx, s)
+	if err != nil {
+		return 0, err
+	}
+	p, err := buildPlan(s, rows, entries, r.Namespace, owners)
 	if err != nil {
 		r.warn(sc, EventSyncFailed, err.Error())
 		return 0, err
 	}
+	p.skipQueuesWithoutQuota(s, quotas)
+	p.claimNames(s, owners)
 	for _, msg := range p.Skipped {
 		logger.Info("skipped", "reason", msg)
 		r.warn(sc, EventSkipped, msg)
@@ -135,12 +151,15 @@ func (r *Reconciler) Sync(ctx context.Context) (time.Duration, error) {
 		}
 	}
 	for _, a := range p.Accounts {
-		cq, err := r.clusterQueue(ctx, s, a)
-		if err == nil {
-			err = r.apply(ctx, cq, kueue.GroupVersion.WithKind("ClusterQueue"))
+		quota, _ := s.projectQuota(quotas, a)
+		if err := r.apply(ctx, projectCohort(s, a, quota), kueue.GroupVersion.WithKind("Cohort")); err != nil {
+			errs = append(errs, fmt.Errorf("Cohort %s: %w", s.projectCohort(a), err))
+			continue
 		}
-		if err != nil {
-			errs = append(errs, fmt.Errorf("ClusterQueue %s: %w", s.queueName(a), err))
+		for _, q := range p.queues(s, a) {
+			if err := r.apply(ctx, clusterQueue(s, a, q, quota), kueue.GroupVersion.WithKind("ClusterQueue")); err != nil {
+				errs = append(errs, fmt.Errorf("ClusterQueue %s: %w", s.queueName(a, q), err))
+			}
 		}
 	}
 
@@ -154,12 +173,14 @@ func (r *Reconciler) Sync(ctx context.Context) (time.Duration, error) {
 			continue
 		}
 		for _, a := range t.Accounts {
-			if err := r.apply(ctx, localQueue(s, ns, a), kueue.GroupVersion.WithKind("LocalQueue")); err != nil {
-				errs = append(errs, fmt.Errorf("LocalQueue %s/%s: %w", ns, s.queueName(a), err))
+			for _, q := range p.queues(s, a) {
+				if err := r.apply(ctx, localQueue(s, ns, a, q), kueue.GroupVersion.WithKind("LocalQueue")); err != nil {
+					errs = append(errs, fmt.Errorf("LocalQueue %s/%s: %w", ns, s.queueName(a, q), err))
+				}
 			}
 		}
 		if tmpl != nil {
-			if err := r.applyExecutor(ctx, sc, s, tmpl, t); err != nil {
+			if err := r.applyExecutor(ctx, sc, s, p, tmpl, t); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -197,6 +218,86 @@ func (r *Reconciler) warn(regarding runtime.Object, reason, note string) {
 	r.Recorder.Eventf(regarding, nil, corev1.EventTypeWarning, reason, "Sync", "%s", note)
 }
 
+// associations reads the rows of the site's associations ConfigMap and of every
+// ConfigMap of the controller's namespace labelled AssociationsLabel=<site>, in
+// its key AssociationsKey, each row once. bad are the malformed rows.
+func (r *Reconciler) associations(ctx context.Context, s site) (rows []Association, bad []string, err error) {
+	text, err := r.readConfigMap(ctx, s.associations)
+	if err != nil {
+		return nil, nil, err
+	}
+	texts := []string{text}
+	cms := &corev1.ConfigMapList{}
+	if err := r.Client.List(ctx, cms, client.InNamespace(r.Namespace), client.MatchingLabels{AssociationsLabel: s.name}); err != nil {
+		return nil, nil, err
+	}
+	sort.Slice(cms.Items, func(i, j int) bool { return cms.Items[i].Name < cms.Items[j].Name })
+	for _, cm := range cms.Items {
+		t, ok := cm.Data[AssociationsKey]
+		if !ok {
+			return nil, nil, fmt.Errorf("ConfigMap %s/%s is labelled %s=%s and has no key %q", cm.Namespace, cm.Name, AssociationsLabel, s.name, AssociationsKey)
+		}
+		texts = append(texts, t)
+	}
+	seen := map[Association]bool{}
+	for _, t := range texts {
+		rs, b := ParseAssociations(t)
+		bad = append(bad, b...)
+		for _, a := range rs {
+			if !seen[a] {
+				seen[a] = true
+				rows = append(rows, a)
+			}
+		}
+	}
+	return rows, bad, nil
+}
+
+// projectQuotas are the resourceGroups of the site's ProjectQuotas, by account.
+func (r *Reconciler) projectQuotas(ctx context.Context, s site) (map[string][]kueue.ResourceGroup, error) {
+	l := &v1alpha1.ProjectQuotaList{}
+	if err := r.Client.List(ctx, l); err != nil {
+		return nil, err
+	}
+	out := map[string][]kueue.ResourceGroup{}
+	for _, pq := range l.Items {
+		if pq.Spec.Site != s.name {
+			continue
+		}
+		if pq.Name != s.name+"-"+pq.Spec.Account {
+			log.FromContext(ctx).Info("ignoring ProjectQuota whose spec does not match its name", "name", pq.Name)
+			continue
+		}
+		out[pq.Spec.Account] = pq.Spec.ResourceGroups
+	}
+	return out, nil
+}
+
+// owners maps the names of the site's ClusterQueues and project Cohorts, each
+// kind apart, to the account they are labelled with.
+func (r *Reconciler) owners(ctx context.Context, s site) (nameOwners, error) {
+	out := nameOwners{clusterQueues: map[string]string{}, cohorts: map[string]string{}}
+	cqs := &kueue.ClusterQueueList{}
+	if err := r.Client.List(ctx, cqs, client.MatchingLabels(managedLabels(s.name))); err != nil {
+		return nameOwners{}, err
+	}
+	for _, cq := range cqs.Items {
+		if a := cq.Labels[AccountLabel]; a != "" {
+			out.clusterQueues[cq.Name] = a
+		}
+	}
+	cohorts := &kueue.CohortList{}
+	if err := r.Client.List(ctx, cohorts, client.MatchingLabels(managedLabels(s.name))); err != nil {
+		return nameOwners{}, err
+	}
+	for _, c := range cohorts.Items {
+		if a := c.Labels[AccountLabel]; a != "" {
+			out.cohorts[c.Name] = a
+		}
+	}
+	return out, nil
+}
+
 // readConfigMap reads one key of a ConfigMap in the controller's namespace.
 func (r *Reconciler) readConfigMap(ctx context.Context, ref v1alpha1.ConfigMapKeyRef) (string, error) {
 	data, err := r.readConfigMapData(ctx, ref)
@@ -229,28 +330,65 @@ func accountLabels(site, account string) map[string]string {
 	return l
 }
 
+// queueLabels label the ClusterQueue and LocalQueues of a queue of an account.
+func queueLabels(site, account, queue string) map[string]string {
+	l := accountLabels(site, account)
+	if queue != "" {
+		l[QueueLabel] = queue
+	}
+	return l
+}
+
 func (r *Reconciler) cohort(s site) *kueue.Cohort {
 	return &kueue.Cohort{ObjectMeta: metav1.ObjectMeta{Name: s.cohort, Labels: managedLabels(s.name)}}
 }
 
-// clusterQueue is the ClusterQueue of one account. Its quota comes from the
-// ProjectQuota <site>-<account>, else from the site's default.
-func (r *Reconciler) clusterQueue(ctx context.Context, s site, account string) (*kueue.ClusterQueue, error) {
-	quota := s.defaultQuota
-	pq := &v1alpha1.ProjectQuota{}
-	err := r.Client.Get(ctx, types.NamespacedName{Name: s.name + "-" + account}, pq)
-	switch {
-	case err == nil && pq.Spec.Site == s.name && pq.Spec.Account == account:
-		quota = pq.Spec.ResourceGroups
-	case err == nil:
-		log.FromContext(ctx).Info("ignoring ProjectQuota whose spec does not match its name", "name", pq.Name)
-	case !apierrors.IsNotFound(err):
-		return nil, err
+// projectCohort is the Cohort of one account, a child of the site's, that
+// holds the project's quota: its ProjectQuota, else the site's default. It
+// lends nothing to the site's Cohort, so another project cannot take it.
+func projectCohort(s site, account string, quota []kueue.ResourceGroup) *kueue.Cohort {
+	groups := make([]kueue.ResourceGroup, 0, len(quota))
+	for _, g := range quota {
+		g = *g.DeepCopy()
+		for i := range g.Flavors {
+			for j := range g.Flavors[i].Resources {
+				g.Flavors[i].Resources[j].LendingLimit = resource.NewQuantity(0, resource.DecimalSI)
+			}
+		}
+		groups = append(groups, g)
 	}
-	return &kueue.ClusterQueue{
-		ObjectMeta: metav1.ObjectMeta{Name: s.queueName(account), Labels: accountLabels(s.name, account)},
+	return &kueue.Cohort{
+		ObjectMeta: metav1.ObjectMeta{Name: s.projectCohort(account), Labels: accountLabels(s.name, account)},
+		Spec:       kueue.CohortSpec{ParentName: kueue.CohortReference(s.cohort), ResourceGroups: groups},
+	}
+}
+
+// clusterQueue is the ClusterQueue of a queue of an account: the flavors of
+// the project's quota that the queue admits on (all of them for queue ""), at
+// nominal quota 0, so that every Workload borrows from the project's Cohort.
+func clusterQueue(s site, account, queue string, quota []kueue.ResourceGroup) *kueue.ClusterQueue {
+	flavors := s.queueFlavors(queue)
+	var groups []kueue.ResourceGroup
+	for _, g := range quota {
+		out := kueue.ResourceGroup{CoveredResources: slices.Clone(g.CoveredResources)}
+		for _, f := range g.Flavors {
+			if queue != "" && !slices.Contains(flavors, f.Name) {
+				continue
+			}
+			fq := kueue.FlavorQuotas{Name: f.Name}
+			for _, rq := range f.Resources {
+				fq.Resources = append(fq.Resources, kueue.ResourceQuota{Name: rq.Name, NominalQuota: *resource.NewQuantity(0, resource.DecimalSI)})
+			}
+			out.Flavors = append(out.Flavors, fq)
+		}
+		if len(out.Flavors) > 0 {
+			groups = append(groups, out)
+		}
+	}
+	cq := &kueue.ClusterQueue{
+		ObjectMeta: metav1.ObjectMeta{Name: s.queueName(account, queue), Labels: queueLabels(s.name, account, queue)},
 		Spec: kueue.ClusterQueueSpec{
-			CohortName: kueue.CohortReference(s.cohort),
+			CohortName: kueue.CohortReference(s.projectCohort(account)),
 			NamespaceSelector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{ProjectLabel(s.name, account): "true"},
 			},
@@ -262,15 +400,19 @@ func (r *Reconciler) clusterQueue(ctx context.Context, s site, account string) (
 			AdmissionChecksStrategy: &kueue.AdmissionChecksStrategy{
 				AdmissionChecks: []kueue.AdmissionCheckStrategyRule{{Name: kueue.AdmissionCheckReference(s.check)}},
 			},
-			ResourceGroups: quota,
+			ResourceGroups: groups,
 		},
-	}, nil
+	}
+	if s.fairSharing {
+		cq.Spec.AdmissionScope = &kueue.AdmissionScope{AdmissionMode: kueue.UsageBasedAdmissionFairSharing}
+	}
+	return cq
 }
 
-func localQueue(s site, ns, account string) *kueue.LocalQueue {
+func localQueue(s site, ns, account, queue string) *kueue.LocalQueue {
 	return &kueue.LocalQueue{
-		ObjectMeta: metav1.ObjectMeta{Name: s.queueName(account), Namespace: ns, Labels: accountLabels(s.name, account)},
-		Spec:       kueue.LocalQueueSpec{ClusterQueue: kueue.ClusterQueueReference(s.queueName(account))},
+		ObjectMeta: metav1.ObjectMeta{Name: s.queueName(account, queue), Namespace: ns, Labels: queueLabels(s.name, account, queue)},
+		Spec:       kueue.LocalQueueSpec{ClusterQueue: kueue.ClusterQueueReference(s.queueName(account, queue))},
 	}
 }
 
@@ -444,14 +586,18 @@ func (r *Reconciler) patchNamespace(ctx context.Context, name string, labels, an
 	return r.Client.Patch(ctx, target, client.RawPatch(types.MergePatchType, body), client.FieldOwner(FieldManager))
 }
 
-// applyExecutor renders the executor objects of one tenant and applies them. A
+// applyExecutor renders the executor objects of one tenant and applies them,
+// then deletes the site's objects of the kinds rendered that the render no
+// longer holds, such as those of a revoked account or a dropped queue. A
 // rendered set with any refused object is not applied at all.
-func (r *Reconciler) applyExecutor(ctx context.Context, sc *v1alpha1.OffloadConfig, s site, tmpl *template.Template, t *tenant) error {
+func (r *Reconciler) applyExecutor(ctx context.Context, sc *v1alpha1.OffloadConfig, s site, p plan, tmpl *template.Template, t *tenant) error {
 	objs, err := renderObjects(tmpl, TemplateData{
 		Namespace:       t.Namespace,
 		Site:            s.name,
 		HPCUser:         t.HPCUser,
 		Accounts:        append([]string(nil), t.Accounts...),
+		Queues:          s.queueNames(),
+		QueuesOf:        p.queuesOf(s, t.Accounts),
 		Image:           s.executorImage,
 		ExecutorService: s.executorService,
 		ExecutorPort:    s.executorPort,
@@ -466,9 +612,30 @@ func (r *Reconciler) applyExecutor(ctx context.Context, sc *v1alpha1.OffloadConf
 	if err := r.stampSecretVersions(ctx, objs, t.Namespace); err != nil {
 		return fmt.Errorf("executor objects of namespace %s: %w", t.Namespace, err)
 	}
+	rendered := map[schema.GroupVersionKind][]fields.Selector{}
+	var kinds []schema.GroupVersionKind
 	for _, u := range objs {
 		if err := r.applyUnstructured(ctx, u); err != nil {
 			return fmt.Errorf("applying %s %s/%s: %w", u.GetKind(), t.Namespace, u.GetName(), err)
+		}
+		gvk := u.GroupVersionKind()
+		if _, ok := rendered[gvk]; !ok {
+			kinds = append(kinds, gvk)
+		}
+		rendered[gvk] = append(rendered[gvk], fields.OneTermNotEqualSelector("metadata.name", u.GetName()))
+	}
+	for _, gvk := range kinds {
+		// The controller's own LocalQueues are revoked on their own.
+		if gvk.GroupKind() == kueue.GroupVersion.WithKind("LocalQueue").GroupKind() {
+			continue
+		}
+		u := &unstructured.Unstructured{}
+		u.SetGroupVersionKind(gvk)
+		err := r.Client.DeleteAllOf(ctx, u, client.InNamespace(t.Namespace), client.MatchingLabels(managedLabels(s.name)),
+			client.MatchingFieldsSelector{Selector: fields.AndSelectors(rendered[gvk]...)},
+			client.PropagationPolicy(metav1.DeletePropagationBackground))
+		if err != nil {
+			return fmt.Errorf("deleting the %s objects of namespace %s the template no longer renders: %w", gvk.Kind, t.Namespace, err)
 		}
 	}
 	return nil
@@ -507,11 +674,13 @@ func (r *Reconciler) prepareObjects(objs []*unstructured.Unstructured, s site, n
 }
 
 // revoke removes the memberships that disappeared: the label and the
-// LocalQueue at once, the ClusterQueue once no namespace holds the account or
-// waits to be offboarded from it. A namespace with no membership of the site
-// left is offboarded from the next pass on, so that the OffloadRequests of
-// quota Kueue reserved before are visible. It returns the number of namespaces
-// that wait to be offboarded.
+// LocalQueues at once, the ClusterQueues and the Cohort once no namespace
+// holds the account or waits to be offboarded from it. A queue dropped from
+// the site, or left out for an account, loses its LocalQueues and
+// ClusterQueues at once. A namespace with no membership of the site left is
+// offboarded from the next pass on, so that the OffloadRequests of quota Kueue
+// reserved before are visible. It returns the number of namespaces that wait
+// to be offboarded.
 func (r *Reconciler) revoke(ctx context.Context, sc *v1alpha1.OffloadConfig, s site, p plan, executor *template.Template, nss []corev1.Namespace) (int, error) {
 	var errs []error
 	leaving := 0
@@ -529,7 +698,7 @@ func (r *Reconciler) revoke(ctx context.Context, sc *v1alpha1.OffloadConfig, s s
 			leaving++
 		case hasKey(ns.Annotations, LeftAnnotation(s.name)):
 			var done bool
-			done, err = r.offboard(ctx, sc, s, executor, ns)
+			done, err = r.offboard(ctx, sc, s, p, executor, ns)
 			if !done {
 				held = append(held, splitList(ns.Annotations[LeftAnnotation(s.name)])...)
 				leaving++
@@ -546,35 +715,59 @@ func (r *Reconciler) revoke(ctx context.Context, sc *v1alpha1.OffloadConfig, s s
 	for i := range lqs.Items {
 		lq := &lqs.Items[i]
 		a := lq.Labels[AccountLabel]
-		if p.hasMembership(lq.Namespace, a) && lq.Name == s.queueName(a) {
+		if p.hasQueue(s, lq.Namespace, a, lq.Name) {
 			continue
 		}
 		if err := r.Client.Delete(ctx, lq); err != nil && !apierrors.IsNotFound(err) {
 			errs = append(errs, fmt.Errorf("LocalQueue %s/%s: %w", lq.Namespace, lq.Name, err))
 		}
 	}
-	if err := r.prune(ctx, s, held); err != nil {
+	if err := r.prune(ctx, s, p, held); err != nil {
 		errs = append(errs, err)
 	}
 	return leaving, errors.Join(errs...)
 }
 
-// prune deletes the site's ClusterQueues of the accounts not in keep, and its
-// Cohort once keep is empty. Kueue keeps a deleted ClusterQueue until the
-// Workloads it admitted end.
-func (r *Reconciler) prune(ctx context.Context, s site, keep []string) error {
+// prune deletes the site's ClusterQueues of the accounts not in keep, of
+// queues the site no longer has and of queues the plan leaves out for an
+// account, the project Cohorts of the accounts not in keep once no
+// ClusterQueue in them is left, and the site's Cohort once keep is empty. Kueue
+// keeps a deleted ClusterQueue, under its finalizer, until the Workloads it
+// admitted end, and their quota is the project Cohort's.
+func (r *Reconciler) prune(ctx context.Context, s site, p plan, keep []string) error {
 	var errs []error
 	cqs := &kueue.ClusterQueueList{}
 	if err := r.Client.List(ctx, cqs, client.MatchingLabels(managedLabels(s.name))); err != nil {
 		return err
 	}
+	// inUse are the Cohorts a ClusterQueue that is left is in.
+	inUse := map[kueue.CohortReference]bool{}
 	for i := range cqs.Items {
 		cq := &cqs.Items[i]
-		if contains(keep, cq.Labels[AccountLabel]) || !cq.DeletionTimestamp.IsZero() {
+		a := cq.Labels[AccountLabel]
+		if contains(keep, a) && s.isQueueOf(a, cq.Name) && !p.skipsQueue(s, a, cq.Name) || !cq.DeletionTimestamp.IsZero() {
+			inUse[cq.Spec.CohortName] = true
 			continue
 		}
 		if err := r.Client.Delete(ctx, cq, client.Preconditions{UID: &cq.UID}); client.IgnoreNotFound(err) != nil {
 			errs = append(errs, fmt.Errorf("ClusterQueue %s: %w", cq.Name, err))
+		}
+		if err := r.APIReader.Get(ctx, client.ObjectKeyFromObject(cq), &kueue.ClusterQueue{}); !apierrors.IsNotFound(err) {
+			inUse[cq.Spec.CohortName] = true
+		}
+	}
+	cohorts := &kueue.CohortList{}
+	if err := r.Client.List(ctx, cohorts, client.MatchingLabels(managedLabels(s.name)), client.HasLabels{AccountLabel}); err != nil {
+		return errors.Join(append(errs, err)...)
+	}
+	for i := range cohorts.Items {
+		c := &cohorts.Items[i]
+		a := c.Labels[AccountLabel]
+		if contains(keep, a) && c.Name == s.projectCohort(a) || !c.DeletionTimestamp.IsZero() || inUse[kueue.CohortReference(c.Name)] {
+			continue
+		}
+		if err := r.Client.Delete(ctx, c, client.Preconditions{UID: &c.UID}); client.IgnoreNotFound(err) != nil {
+			errs = append(errs, fmt.Errorf("Cohort %s: %w", c.Name, err))
 		}
 	}
 	if len(keep) > 0 {

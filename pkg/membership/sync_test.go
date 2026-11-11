@@ -45,9 +45,10 @@ func (e *env) executorConfig(ns string) executorConfig {
 	return c
 }
 
-func gpuQuota(t *testing.T, cq kueue.ClusterQueue) int64 {
+// gpuQuota is the GPU quota of a project's Cohort.
+func gpuQuota(t *testing.T, c kueue.Cohort) int64 {
 	t.Helper()
-	for _, rg := range cq.Spec.ResourceGroups {
+	for _, rg := range c.Spec.ResourceGroups {
 		for _, f := range rg.Flavors {
 			for _, r := range f.Resources {
 				if r.Name == "nvidia.com/gpu" {
@@ -56,7 +57,7 @@ func gpuQuota(t *testing.T, cq kueue.ClusterQueue) int64 {
 			}
 		}
 	}
-	t.Fatalf("ClusterQueue %s has no GPU quota", cq.Name)
+	t.Fatalf("Cohort %s has no GPU quota", c.Name)
 	return 0
 }
 
@@ -76,7 +77,7 @@ func TestSyncCreatesMemberships(t *testing.T) {
 		t.Fatalf("ClusterQueues %v, want hpc-a-proj42 and hpc-a-proj99 only", names)
 	}
 	cq := cqs["hpc-a-proj42"]
-	if cq.Spec.CohortName != "hpc-a" || cq.Spec.QueueingStrategy != kueue.BestEffortFIFO {
+	if cq.Spec.CohortName != "hpc-a-proj42-project" || cq.Spec.QueueingStrategy != kueue.BestEffortFIFO {
 		t.Errorf("cohort %q strategy %q", cq.Spec.CohortName, cq.Spec.QueueingStrategy)
 	}
 	if got := cq.Spec.NamespaceSelector.MatchLabels; !reflect.DeepEqual(got, map[string]string{"hpc.interlink.eu/hpc-a-proj42": "true"}) {
@@ -92,10 +93,11 @@ func TestSyncCreatesMemberships(t *testing.T) {
 	if cq.Labels[ManagedByLabel] != ManagedByValue || cq.Labels[v1alpha1.AccountLabel] != "proj42" {
 		t.Errorf("ClusterQueue labels %v", cq.Labels)
 	}
-	if g := gpuQuota(t, cq); g != 64 {
+	cohorts := e.cohorts()
+	if g := gpuQuota(t, cohorts["hpc-a-proj42-project"]); g != 64 {
 		t.Errorf("proj42 GPU quota %d, want 64 from its ProjectQuota", g)
 	}
-	if g := gpuQuota(t, cqs["hpc-a-proj99"]); g != 8 {
+	if g := gpuQuota(t, cohorts["hpc-a-proj99-project"]); g != 8 {
 		t.Errorf("proj99 GPU quota %d, want 8 from defaultProjectQuota", g)
 	}
 	cohort := &kueue.Cohort{}
@@ -493,8 +495,15 @@ func TestCohortAndCheckFromMembership(t *testing.T) {
 	e := newEnv(t, sc, assocConfigMap("hpc-a|proj42|alice\nhpc-a|Bad_Account|alice\n"))
 	e.sync()
 	cq, ok := e.clusterQueues()["hpc-a-proj42"]
-	if !ok || cq.Spec.CohortName != "pool" || cq.Spec.AdmissionChecksStrategy.AdmissionChecks[0].Name != "offload-a" {
+	if !ok || cq.Spec.CohortName != "hpc-a-proj42-project" || cq.Spec.AdmissionChecksStrategy.AdmissionChecks[0].Name != "offload-a" {
 		t.Fatalf("ClusterQueues %v", e.clusterQueues())
+	}
+	cohorts := e.cohorts()
+	if c, ok := cohorts["hpc-a-proj42-project"]; !ok || c.Spec.ParentName != "pool" {
+		t.Errorf("project Cohort %+v, want parent pool", c)
+	}
+	if _, ok := cohorts["pool"]; !ok || len(cohorts) != 2 {
+		t.Errorf("Cohorts %v, want pool and hpc-a-proj42-project", e.cohortNames())
 	}
 	if len(e.clusterQueues()) != 1 {
 		t.Errorf("an account that is not a DNS label got a ClusterQueue")

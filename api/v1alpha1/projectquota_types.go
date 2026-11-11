@@ -12,7 +12,11 @@ type ProjectQuotaSpec struct {
 	// account is the Slurm account of the project.
 	// +kubebuilder:validation:MinLength=1
 	Account string `json:"account"`
-	// resourceGroups become the resourceGroups of the project's ClusterQueue.
+	// resourceGroups become the resourceGroups of the project's Cohort
+	// <site>-<account>-project, whose ClusterQueues borrow all their quota from
+	// it. The membership controller sets lendingLimit 0 on every resource, so
+	// that a project never lends to another; borrowingLimit is kept, and bounds
+	// what the project borrows from the site's Cohort.
 	// +listType=atomic
 	// +kubebuilder:validation:MaxItems=16
 	// +optional
@@ -28,7 +32,7 @@ type ProjectQuotaSpec struct {
 
 // ProjectQuota overrides the site's default quota for one project. It is
 // named <site>-<account>. Quota is an administrator's number and is never
-// derived from Slurm.
+// derived from Slurm. The queues of the project share it.
 type ProjectQuota struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

@@ -495,6 +495,56 @@ func TestOffboardKeepsTenantLabelOfOtherSite(t *testing.T) {
 	}
 }
 
+// A namespaceLabels key both sites set stays when one of them offboards the
+// namespace while it is still the other's member; the other removes it when it
+// offboards the namespace in turn.
+func TestOffboardKeepsNamespaceLabelOtherSiteSets(t *testing.T) {
+	const key = "kueue.example.org/managed"
+	a := offloadConfig()
+	a.Spec.Membership.NamespaceLabels = map[string]string{key: "true"}
+	b := offloadConfig()
+	b.Name = "hpc-b"
+	b.Spec.Workers = []string{"hpc-b"}
+	b.Spec.Membership.SlurmCluster = "hpc-b"
+	b.Spec.Membership.ExecutorTemplate = nil
+	b.Spec.Membership.NamespaceLabels = map[string]string{key: "true"}
+	e := newEnv(t, a, b)
+	rb := &Reconciler{Client: e.c, APIReader: e.c, Recorder: e.events, Site: "hpc-b", Namespace: ownNS, Now: e.r.Now}
+	syncB := func() {
+		t.Helper()
+		if _, err := rb.Sync(context.Background()); err != nil {
+			t.Fatalf("sync of hpc-b: %v", err)
+		}
+	}
+	e.sync()
+	syncB()
+	if ns := e.namespace("alice"); ns.Labels[key] != "true" || ns.Annotations[LabelsAnnotation(testSite)] != key || hasKey(ns.Annotations, LabelsAnnotation("hpc-b")) {
+		t.Fatalf("alice labels %v annotations %v, want the label added by hpc-a", ns.Labels, ns.Annotations)
+	}
+
+	ids := defaultIdentities().Spec.Entries
+	e.setIdentities(ids[1], ids[2])
+	e.sync()
+	e.sync()
+	ns := e.namespace("alice")
+	if hasKey(ns.Annotations, LeftAnnotation(testSite)) || hasKey(ns.Annotations, LabelsAnnotation(testSite)) {
+		t.Fatalf("alice not offboarded from hpc-a: %v", ns.Annotations)
+	}
+	if ns.Labels[key] != "true" {
+		t.Errorf("%s removed while alice is a member of hpc-b, which sets it", key)
+	}
+	if got := ns.Annotations[LabelsAnnotation("hpc-b")]; got != key {
+		t.Errorf("%s = %q, want the label handed to hpc-b", LabelsAnnotation("hpc-b"), got)
+	}
+
+	e.setIdentities(ids[1])
+	syncB()
+	syncB()
+	if ns := e.namespace("alice"); hasKey(ns.Labels, key) || hasKey(ns.Annotations, LabelsAnnotation("hpc-b")) {
+		t.Errorf("alice labels %v annotations %v after hpc-b offboarded her", ns.Labels, ns.Annotations)
+	}
+}
+
 // Objects the executor template renders per account go too: the template is
 // rendered with the accounts the namespace had.
 func TestOffboardDeletesPerAccountObjects(t *testing.T) {
@@ -605,12 +655,18 @@ func TestLastTenantGoneDeletesQueuesAndCohort(t *testing.T) {
 	if got := e.queueNames(); got != "hpc-a-proj42,hpc-a-proj99" || !e.cohortExists() {
 		t.Fatalf("ClusterQueues %q, Cohort %v while both namespaces leave", got, e.cohortExists())
 	}
+	if got := e.cohortNames(); got != "hpc-a,hpc-a-proj42-project,hpc-a-proj99-project" {
+		t.Errorf("Cohorts %q while both namespaces leave", got)
+	}
 
 	// alice, the only one in proj99, is offboarded; bob's job still runs.
 	e.endJob("alice", "offboard", batchv1.JobComplete)
 	e.sync()
 	if got := e.queueNames(); got != "hpc-a-proj42" {
 		t.Errorf("ClusterQueues %q once alice is offboarded, want hpc-a-proj42 only", got)
+	}
+	if got := e.cohortNames(); got != "hpc-a,hpc-a-proj42-project" {
+		t.Errorf("Cohorts %q once alice is offboarded, want proj99's gone", got)
 	}
 	if got := e.status(); got != "0/1" {
 		t.Errorf("status %s, want bob leaving", got)
@@ -625,14 +681,14 @@ func TestLastTenantGoneDeletesQueuesAndCohort(t *testing.T) {
 	}
 	e.endJob("bob", "offboard", batchv1.JobComplete)
 	e.sync()
-	if got := e.queueNames(); got != "" || e.cohortExists() {
-		t.Errorf("ClusterQueues %q, Cohort %v left with no tenant", got, e.cohortExists())
+	if got := e.queueNames(); got != "" || e.cohortNames() != "" {
+		t.Errorf("ClusterQueues %q, Cohorts %q left with no tenant", got, e.cohortNames())
 	}
 	if got := e.status(); got != "0/0" {
 		t.Errorf("status %s, want 0/0", got)
 	}
 	e.sync()
-	if e.cohortExists() || e.queueNames() != "" {
-		t.Errorf("Cohort or ClusterQueues made again for a site with no tenant")
+	if e.cohortNames() != "" || e.queueNames() != "" {
+		t.Errorf("Cohorts or ClusterQueues made again for a site with no tenant")
 	}
 }

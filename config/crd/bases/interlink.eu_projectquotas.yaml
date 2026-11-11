@@ -30,7 +30,7 @@ spec:
         description: |-
           ProjectQuota overrides the site's default quota for one project. It is
           named <site>-<account>. Quota is an administrator's number and is never
-          derived from Slurm.
+          derived from Slurm. The queues of the project share it.
         properties:
           apiVersion:
             description: |-
@@ -58,8 +58,12 @@ spec:
                 minLength: 1
                 type: string
               resourceGroups:
-                description: resourceGroups become the resourceGroups of the project's
-                  ClusterQueue.
+                description: |-
+                  resourceGroups become the resourceGroups of the project's Cohort
+                  <site>-<account>-project, whose ClusterQueues borrow all their quota from
+                  it. The membership controller sets lendingLimit 0 on every resource, so
+                  that a project never lends to another; borrowingLimit is kept, and bounds
+                  what the project borrows from the site's Cohort.
                 items:
                   properties:
                     coveredResources:

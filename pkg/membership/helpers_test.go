@@ -14,6 +14,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -223,10 +225,35 @@ func newEnv(t *testing.T, objs ...client.Object) *env {
 				e.mu.Lock()
 				fail := e.failDeleteAllOf
 				e.mu.Unlock()
-				if gvk, err := apiutil.GVKForObject(obj, c.Scheme()); err == nil && gvk.Kind == fail {
+				gvk, err := apiutil.GVKForObject(obj, c.Scheme())
+				if err == nil && gvk.Kind == fail {
 					return fmt.Errorf("deleting %s: refused", fail)
 				}
-				return c.DeleteAllOf(ctx, obj, opts...)
+				o := &client.DeleteAllOfOptions{}
+				o.ApplyOptions(opts)
+				if err != nil || o.FieldSelector == nil || o.FieldSelector.Empty() {
+					return c.DeleteAllOf(ctx, obj, opts...)
+				}
+				// The fake client ignores a field selector; the API server
+				// matches metadata.name and metadata.namespace on every kind.
+				l := &unstructured.UnstructuredList{}
+				l.SetGroupVersionKind(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
+				listOpts := []client.ListOption{client.InNamespace(o.Namespace)}
+				if o.LabelSelector != nil {
+					listOpts = append(listOpts, client.MatchingLabelsSelector{Selector: o.LabelSelector})
+				}
+				if err := c.List(ctx, l, listOpts...); err != nil {
+					return err
+				}
+				for i := range l.Items {
+					it := &l.Items[i]
+					if o.FieldSelector.Matches(fields.Set{"metadata.name": it.GetName(), "metadata.namespace": it.GetNamespace()}) {
+						if err := c.Delete(ctx, it); client.IgnoreNotFound(err) != nil {
+							return err
+						}
+					}
+				}
+				return nil
 			},
 		}).Build()
 	e.r = &Reconciler{Client: e.c, APIReader: e.c, Recorder: e.events, Site: testSite, Namespace: ownNS,

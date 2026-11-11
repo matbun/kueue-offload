@@ -127,10 +127,11 @@ spec:
                   flavors maps a ResourceFlavor name to the batch queue its quota stands for,
                   as annotations the backend's plugin reads (for Slurm, the sbatch flags in
                   slurm-job.vk.io/flags). A project with several queues on one machine (say a
-                  debug, a production and an interactive QOS) is one ClusterQueue with one
-                  flavor each, and the flavor Kueue assigns decides where the job is submitted.
-                  A PodSet none of whose admitted flavors is listed is rejected: its job would
-                  carry no account.
+                  debug, a production and an interactive QOS) has one flavor each, and the
+                  flavor Kueue assigns decides where the job is submitted: on the project's
+                  ClusterQueue of every flavor, the first with room; on the ClusterQueue of
+                  one of membership.queues, only that queue's flavors. A PodSet none of whose
+                  admitted flavors is listed is rejected: its job would carry no account.
                 type: object
               maxQueueTime:
                 description: |-
@@ -164,11 +165,23 @@ spec:
                       admissionCheck is the AdmissionCheck every ClusterQueue of the site
                       carries. Unset means the site name.
                     type: string
+                  admissionFairSharing:
+                    description: |-
+                      admissionFairSharing sets admissionScope.admissionMode
+                      UsageBasedAdmissionFairSharing on every ClusterQueue of the site, so that
+                      Kueue admits first, within one ClusterQueue, the Workloads of the
+                      LocalQueue with the least recent usage: the members of a project take
+                      turns on its queues. It takes effect only with admissionFairSharing in
+                      Kueue's configuration.
+                    type: boolean
                   associations:
                     description: |-
                       associations holds the output of
                       sacctmgr --parsable2 --noheader show assoc format=cluster,account,user.
-                      Rows with an empty user are account rows and are skipped.
+                      Rows with an empty user are account rows and are skipped. Every ConfigMap
+                      of the controller's namespace labelled hpc.interlink.eu/associations=<site>
+                      adds the rows of its key associations, in the same format; a row in
+                      several of them counts once.
                     properties:
                       key:
                         minLength: 1
@@ -186,12 +199,13 @@ spec:
                     type: object
                   cohort:
                     description: |-
-                      cohort is the Kueue Cohort of the site's ClusterQueues. Unset means the
-                      site name.
+                      cohort is the site's Kueue Cohort, the parent of the Cohort of each of its
+                      projects, <site>-<account>-project. Unset means the site name.
                     type: string
                   defaultProjectQuota:
-                    description: defaultProjectQuota is the quota of a project that
-                      has no ProjectQuota.
+                    description: |-
+                      defaultProjectQuota is the quota of a project that has no ProjectQuota:
+                      the resourceGroups of its project Cohort.
                     items:
                       properties:
                         coveredResources:
@@ -384,6 +398,54 @@ spec:
                     - name
                     - namespace
                     type: object
+                  queues:
+                    description: |-
+                      queues are the batch queues a member picks by name. Each project gets,
+                      next to its ClusterQueue <site>-<account> of every flavor of its quota,
+                      one ClusterQueue <site>-<account>-<name> per queue with only the queue's
+                      flavors, and each member namespace a LocalQueue of each. All of them
+                      borrow the project's quota from its Cohort, so the queues of a project
+                      share one quota. Each flavor must be listed in flavors. A queue none of
+                      whose flavors has quota on the site (defaultProjectQuota or a
+                      ProjectQuota of the site) is skipped with a Warning event.
+                    items:
+                      description: |-
+                        MembershipQueue is one batch queue of a site, named after the flavors it
+                        admits on.
+                      properties:
+                        flavors:
+                          description: flavors are the ResourceFlavors the queue admits
+                            on.
+                          items:
+                            description: ResourceFlavorReference is the name of the
+                              ResourceFlavor.
+                            maxLength: 253
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                          maxItems: 16
+                          minItems: 1
+                          type: array
+                          x-kubernetes-list-type: set
+                        name:
+                          description: |-
+                            name ends the names of the queue's ClusterQueues and LocalQueues,
+                            <site>-<account>-<name>. "all" and "project" are reserved.
+                          maxLength: 63
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                          type: string
+                          x-kubernetes-validations:
+                          - message: all and project are reserved
+                            rule: self != 'all' && self != 'project'
+                      required:
+                      - flavors
+                      - name
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
                   slurmCluster:
                     description: |-
                       slurmCluster is the value of the cluster column of the associations that
@@ -496,7 +558,7 @@ spec:
                   offboarded yet: a job of theirs at the site has not ended, or their
                   offboard Jobs or the controller's objects in them are still there. With
                   members and leaving at 0 the site has no tenant left, and the controller
-                  has deleted its ClusterQueues and Cohort.
+                  has deleted its ClusterQueues and Cohorts.
                 format: int32
                 type: integer
               members:

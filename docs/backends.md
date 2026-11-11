@@ -129,9 +129,8 @@ as the membership executor template already is, and the controller expands them 
 `.MaxExecSeconds` (the job's wall time: the Workload's `spec.maximumExecutionTimeSeconds`,
 `0.16.9 apis/kueue/v1beta2/workload_types.go:77`, else the longest `interlink.eu/time-limit`
 (`HH:MM:SS`) of its PodSets, a template's value winning over the owner's; 0 when neither) and
-`.MaxExecMinutes` (the same, rounded up, and one minute more when it is Kueue's
-`maximumExecutionTimeSeconds` and the flavor's `maxExecutionTimeSeconds` leaves room, so that
-Kueue's deactivation ends the job first; see [design.md](design.md) for when each ends it). The request's `spec.maximumExecutionTimeSeconds` carries
+`.MaxExecMinutes` (the same in minutes, with the margin for Kueue's own limit that
+[design.md](design.md#offload-controller-behaviour) describes). The request's `spec.maximumExecutionTimeSeconds` carries
 that value, and a flavor's `maxExecutionTimeSeconds` bounds it: a longer job is rejected, since
 Kueue cannot choose a flavor by time.
 

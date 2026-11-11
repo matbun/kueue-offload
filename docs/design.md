@@ -838,6 +838,17 @@ instead.
 At a terminal state the executor renders it once more as logs-only: no `ssh-forward`, no
 `ssh-reverse`, no init containers, no Service, only `job-logs`, which prints the whole log and
 then stays idle, so `kubectl logs <shadow> -c job-logs` still shows the output after the job ended.
+
+`kubectl logs` shows what the kubelet keeps: the container's newest log file, rotated at
+`containerLogMaxSize` (10Mi by default, about 40 bytes of timestamp and stream tags per line
+included), so a large log can leave that file empty once the stream ends. When `job-logs` printed
+more than 10 MiB as stored, it waits 30 s for the kubelet's rotation check (every 10 s by
+default), then prints `--- the end of the log again, ... ---` (`executor.LogsTailBanner`) and the
+log's last lines, at most 256 KiB as stored. A file left between 9.75 and 10 MiB by the stream
+still rotates then, empty. The whole log is always `kubectl exec <shadow pod> -c job-logs --
+/executor logs`: the same client without `--follow`, which reads the executor and the workload
+from the container's environment (`EXECUTOR_URL`, `WORKLOAD_UID`) and copies `GET /getLogs` once.
+Tenants need `pods/exec`, which Kubeflow's `kubeflow-edit` grants.
 The executor deletes the shadow when the job's OffloadRequest is deleted: when the Workload is
 deleted, loses its reservation, or its attempt is retried.
 
@@ -920,9 +931,10 @@ carrying the pod's labels and a pod reported `Running` gave both under the virtu
   and the notebook controller copies its `readyReplicas` to the Notebook.
 - `kubectl logs` of the pod cannot work, since it never runs on a node. While the job has a shadow,
   the status message and the annotation `offload.interlink.eu/logs` (`LogsAnnotation`) hold the
-  command that prints its logs, `kubectl logs -n <ns> -l interlink.eu/shadow-of=<workload uid> -c
-  job-logs --tail=-1` (`shadow.JobLogsContainer`), and a terminal message ends with `; logs:
-  <command>`.
+  command that prints its whole log so far, `kubectl exec -n <ns> deploy/<shadow> -c job-logs --
+  /executor logs` (`shadow.JobLogsContainer`, `shadow.JobLogsCommand`), and a terminal message
+  ends with `; logs: <command>`. `kubectl logs -f` of the shadow follows the log as it comes
+  ([Shadow](#shadow)).
 - When the job stops running without ending (requeued at the site, lost, retried, or the Workload
   lost its reservation), the pod goes back to a gated pod's status: `Pending`, no IP, no container
   statuses, no kubelet conditions. At the end it takes the terminal status of [Owners](#owners).

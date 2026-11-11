@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -118,8 +119,9 @@ func TestWithShadowManager(t *testing.T) {
 	if !strings.Contains(strings.Join(forward.Args, " ")+strings.Join(forward.Command, " "), "alice@login.hpc-a.example.org") {
 		t.Errorf("ssh-forward does not reach the site's login node as its user:\n%v %v", forward.Command, forward.Args)
 	}
-	if logs.Image != "registry.example.org/kueue-offload:test" || strings.Join(logs.Command, " ") != "/executor logs --executor http://kueue-offload-executor:8000 --workload "+executorWorkload+" --follow" {
-		t.Errorf("job-logs: image %s, command %v", logs.Image, logs.Command)
+	if logs.Image != "registry.example.org/kueue-offload:test" || strings.Join(logs.Command, " ") != "/executor logs --follow" ||
+		!slices.Equal(logs.Env, []v1.EnvVar{{Name: "EXECUTOR_URL", Value: "http://kueue-offload-executor:8000"}, {Name: "WORKLOAD_UID", Value: executorWorkload}}) {
+		t.Errorf("job-logs: image %s, command %v, env %v", logs.Image, logs.Command, logs.Env)
 	}
 	if _, err := services.Get(ctx, st.Shadow.Service, metav1.GetOptions{}); err != nil {
 		t.Fatalf("Service of a running job with a port: %v", err)

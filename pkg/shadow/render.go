@@ -64,7 +64,14 @@ type templateData struct {
 // JobLogsContainer is the shadow's container that streams the job's logs.
 const JobLogsContainer = "job-logs"
 
-const jobLogsCommand = "/executor"
+// JobLogsCommand is the logs client in JobLogsContainer. Its environment names
+// the executor and the workload, so "kubectl exec <shadow pod> -c job-logs --
+// /executor logs" prints the whole log.
+const (
+	JobLogsCommand     = "/executor logs"
+	JobLogsExecutorEnv = "EXECUTOR_URL"
+	JobLogsWorkloadEnv = "WORKLOAD_UID"
+)
 
 func (cfg Config) sshTunnel() sshTunnel {
 	return sshTunnel{
@@ -174,7 +181,11 @@ func jobLogs(cfg Config, workloadUID string) corev1.Container {
 	return corev1.Container{
 		Name:    JobLogsContainer,
 		Image:   cfg.ExecutorImage,
-		Command: []string{jobLogsCommand, "logs", "--executor", cfg.ExecutorURL, "--workload", workloadUID, "--follow"},
+		Command: append(strings.Fields(JobLogsCommand), "--follow"),
+		Env: []corev1.EnvVar{
+			{Name: JobLogsExecutorEnv, Value: cfg.ExecutorURL},
+			{Name: JobLogsWorkloadEnv, Value: workloadUID},
+		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("10m"),

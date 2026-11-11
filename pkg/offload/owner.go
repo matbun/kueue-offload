@@ -414,14 +414,15 @@ var kubeletConditions = []corev1.PodConditionType{corev1.PodInitialized, corev1.
 // job-logs container streams them.
 const LogsAnnotation = "offload.interlink.eu/logs"
 
-// logsCommand is the command that prints the logs of q's job, empty when the
-// job has no shadow. --tail=-1: with a selector kubectl prints the last 10
-// lines only.
+// logsCommand is the command that prints the whole log of q's job so far, empty
+// when the job has no shadow: the logs client of the shadow's job-logs
+// container, which copies it from the executor. kubectl logs of that container
+// shows what the kubelet keeps of its output, which can be the end only.
 func logsCommand(q *v1alpha1.OffloadRequest) string {
 	if q.Status.Shadow == nil || q.Status.Shadow.Deployment == "" {
 		return ""
 	}
-	return fmt.Sprintf("kubectl logs -n %s -l %s=%s -c %s --tail=-1", q.Namespace, shadow.LabelShadowOf, q.Spec.Workload.UID, shadow.JobLogsContainer)
+	return fmt.Sprintf("kubectl exec -n %s deploy/%s -c %s -- %s", q.Namespace, q.Status.Shadow.Deployment, shadow.JobLogsContainer, shadow.JobLogsCommand)
 }
 
 // syncSinglePod shows the job of a Workload of one plain pod on that pod, as a

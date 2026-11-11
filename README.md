@@ -62,8 +62,9 @@ spec:
 The Workload's check message follows the job (`job 123 queued`, `running on node07`,
 `completed`), the Job stays suspended (no pod is ever created) until it is `Complete` or `Failed`,
 and the shadow's `job-logs` container streams the output, `[rank N]` per rank, also after the job
-ended: `kubectl logs -l interlink.eu/shadow-of=<workload uid> -c job-logs --tail=-1`, which a plain
-pod also shows in its status message.
+ended: `kubectl logs -l interlink.eu/shadow-of=<workload uid> -c job-logs --tail=-1` (the end of a
+log larger than the kubelet keeps), and the whole log with `kubectl exec deploy/<shadow> -c
+job-logs -- /executor logs`, which a plain pod shows in its status message.
 
 ## Build and deploy
 

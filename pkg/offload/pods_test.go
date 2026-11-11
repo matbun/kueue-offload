@@ -660,10 +660,11 @@ func TestProbedContainerHoldsReady(t *testing.T) {
 }
 
 // TestPodShowsLogsCommand: a single pod whose job has a shadow carries the
-// command that prints the job's logs, in its annotation and its status
-// message, and keeps it in the message of its terminal status.
+// command that prints the job's whole log, the logs client in the shadow's
+// job-logs container, in its annotation and its status message, and keeps it
+// in the message of its terminal status.
 func TestPodShowsLogsCommand(t *testing.T) {
-	const cmd = "kubectl logs -n alice -l interlink.eu/shadow-of=0b6c-wl -c job-logs --tail=-1"
+	const cmd = "kubectl exec -n alice deploy/shadow-train-0-alice -c job-logs -- /executor logs"
 	e := newEnv(t, podOwned(1), notebookPod)
 	e.submitted()
 	start := metav1.NewTime(e.now)

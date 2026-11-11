@@ -170,9 +170,14 @@ func TestEnsureNotebook(t *testing.T) {
 	}
 
 	logs := container(t, d, "job-logs")
-	wantCmd := []string{"/executor", "logs", "--executor", "http://kueue-offload-executor:8000", "--workload", testUID, "--follow"}
+	wantCmd := []string{"/executor", "logs", "--follow"}
 	if !slices.Equal(logs.Command, wantCmd) {
 		t.Errorf("job-logs command %v, want %v", logs.Command, wantCmd)
+	}
+	// "kubectl exec ... -c job-logs -- /executor logs" reads them too.
+	wantEnv := []corev1.EnvVar{{Name: "EXECUTOR_URL", Value: "http://kueue-offload-executor:8000"}, {Name: "WORKLOAD_UID", Value: testUID}}
+	if !slices.Equal(logs.Env, wantEnv) {
+		t.Errorf("job-logs env %v, want %v", logs.Env, wantEnv)
 	}
 	if logs.Image != "registry.example.org/kueue-offload-executor:1.0" {
 		t.Errorf("job-logs image %s", logs.Image)

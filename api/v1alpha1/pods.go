@@ -24,5 +24,5 @@ const RankAnnotation = "offload.interlink.eu/rank"
 // was given up. The virtual node fails the Workload's pods with it.
 const FailedAnnotation = "offload.interlink.eu/failed"
 
-// NodeName is the name of the virtual node of an OffloadConfig.
-func NodeName(offloadConfig string) string { return "kueue-offload-" + offloadConfig }
+// NodeName is the name of the virtual node of an OffloadConfig: the site's name and "-vk".
+func NodeName(offloadConfig string) string { return offloadConfig + "-vk" }

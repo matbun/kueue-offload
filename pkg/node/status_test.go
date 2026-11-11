@@ -17,7 +17,7 @@ import (
 const (
 	testNS     = "alice"
 	testWL     = "job-train-5d565"
-	testNode   = "kueue-offload-hpc-a"
+	testNode   = "hpc-a-vk"
 	testHostIP = "10.100.1.7"
 )
 

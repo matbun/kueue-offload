@@ -56,9 +56,11 @@ type Config struct {
 	User      string `yaml:"User"`
 	Port      int    `yaml:"Port"`
 	// KeySecret is the namespace's Secret holding the tunnel's private key, under
-	// KeySecretKey (default "ssh-privatekey").
+	// KeySecretKey (default "ssh-privatekey"). Not used with Kerberos.
 	KeySecret    string `yaml:"KeySecret"`
 	KeySecretKey string `yaml:"KeySecretKey"`
+	// Kerberos logs in with a ticket from a keytab instead of a key.
+	Kerberos *KerberosConfig `yaml:"Kerberos"`
 	// KnownHostsConfigMap holds a known_hosts file pinning the login node and,
 	// for NodeHostKeys "verify", compute node keys or an @cert-authority line.
 	KnownHostsConfigMap string `yaml:"KnownHostsConfigMap"`
@@ -79,11 +81,22 @@ type Config struct {
 	Reverse ReverseConfig `yaml:"Reverse"`
 }
 
+// KerberosConfig is the keytab the shadow gets its ticket with: the namespace's
+// Secret KeytabSecret under KeytabKey, for Principal.
+type KerberosConfig struct {
+	KeytabSecret string `yaml:"KeytabSecret"`
+	KeytabKey    string `yaml:"KeytabKey"`
+	Principal    string `yaml:"Principal"`
+	// Krb5ConfigMap holds krb5.conf under key krb5.conf. Empty: the image's.
+	Krb5ConfigMap string `yaml:"Krb5ConfigMap"`
+}
+
 // The template puts these values in shell commands unquoted, so they are held to
 // plain characters rather than escaped.
 var (
 	userPattern      = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]*$`)
 	secretKeyPattern = regexp.MustCompile(`^[-._A-Za-z0-9]+$`)
+	principalPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._/-]*@[A-Za-z0-9][A-Za-z0-9.-]*$`)
 )
 
 // NormalizeConfig fills in the defaults and rejects values the shadow cannot use,
@@ -105,8 +118,18 @@ func NormalizeConfig(cfg *Config) error {
 	if cfg.Port < 1 || cfg.Port > 65535 {
 		return fmt.Errorf("Shadow.Port %d is outside 1-65535", cfg.Port)
 	}
-	if tunnels && strings.TrimSpace(cfg.KeySecret) == "" {
-		return fmt.Errorf("Shadow.KeySecret is required with Shadow.LoginHost")
+	if k := cfg.Kerberos; k != nil {
+		if k.KeytabSecret == "" || k.KeytabKey == "" || k.Principal == "" {
+			return fmt.Errorf("Shadow.Kerberos: KeytabSecret, KeytabKey and Principal are required")
+		}
+		if !secretKeyPattern.MatchString(k.KeytabKey) {
+			return fmt.Errorf("Shadow.Kerberos.KeytabKey %q is not a Secret key", k.KeytabKey)
+		}
+		if !principalPattern.MatchString(k.Principal) {
+			return fmt.Errorf("Shadow.Kerberos.Principal %q is not a principal", k.Principal)
+		}
+	} else if tunnels && strings.TrimSpace(cfg.KeySecret) == "" {
+		return fmt.Errorf("Shadow.KeySecret or Shadow.Kerberos is required with Shadow.LoginHost")
 	}
 	if !tunnels && cfg.Reverse.Enabled {
 		return fmt.Errorf("Shadow.Reverse.Enabled needs Shadow.LoginHost: the tunnel goes through the login node")

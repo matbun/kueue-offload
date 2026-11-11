@@ -1,12 +1,16 @@
 package offload
 
 import (
+	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 
@@ -62,18 +66,19 @@ func TestEstimateInCheckMessage(t *testing.T) {
 }
 
 // A start within maxStartDelay keeps the attempt; one further away, or none
-// while a submit limit holds, sets Retry before the submit and releases the
-// quota, never counted as a retry.
+// while a submit limit holds, deactivates the Workload for the backoff before
+// the submit, which releases the quota at once, never counted as a retry. The
+// check stays Pending with the reason.
 func TestEstimateDefers(t *testing.T) {
 	for _, tt := range []struct {
-		name  string
-		in    time.Duration
-		retry bool
-		msg   string
+		name     string
+		in       time.Duration
+		deferred bool
+		msg      string
 	}{
 		{"within", 300 * time.Second, false, "Slurm expects to start 1 node(s) at 2026-10-29T10:05:00Z"},
-		{"beyond", 301 * time.Second, true, "Slurm expects to start 1 node(s) at 2026-10-29T10:05:01Z, in 301 s: quota released until then"},
-		{"submit limit", -1, true, "no start time from Slurm (QOSMaxSubmitJobPerUserLimit): " + limitText + "; quota released until then"},
+		{"beyond", 301 * time.Second, true, "Slurm expects to start 1 node(s) at 2026-10-29T10:05:01Z, in 301 s: Workload deactivated until 2026-10-29T10:01:00Z, quota released"},
+		{"submit limit", -1, true, "no start time from Slurm (QOSMaxSubmitJobPerUserLimit): " + limitText + "; Workload deactivated until 2026-10-29T10:01:00Z, quota released"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			// backoffLimitCount 0 rejects at the first lost attempt, but not here.
@@ -85,20 +90,152 @@ func TestEstimateDefers(t *testing.T) {
 			e.report(1, e.estimated(tt.in))
 			e.reconcile()
 			st := e.check("hpc-a")
+			wl := e.workload()
 			deleted := !e.request(1).DeletionTimestamp.IsZero()
-			if !tt.retry {
-				if st.State != kueue.CheckStatePending || st.Message != tt.msg || deleted {
-					t.Fatalf("check = %s %q, request deleted %v", st.State, st.Message, deleted)
+			if !tt.deferred {
+				if st.State != kueue.CheckStatePending || st.Message != tt.msg || deleted || !ptr.Deref(wl.Spec.Active, true) {
+					t.Fatalf("check = %s %q, request deleted %v, active %v", st.State, st.Message, deleted, wl.Spec.Active)
 				}
 				return
 			}
-			if st.State != kueue.CheckStateRetry || st.Message != tt.msg || ptr.Deref(st.RequeueAfterSeconds, -1) != 60 || !deleted {
+			if st.State != kueue.CheckStatePending || st.Message != tt.msg || st.RequeueAfterSeconds != nil || !deleted {
 				t.Fatalf("check = %s %q after %v, request deleted %v", st.State, st.Message, st.RequeueAfterSeconds, deleted)
+			}
+			if ptr.Deref(wl.Spec.Active, true) || wl.Annotations[DeferredUntilAnnotation] != "2026-10-29T10:01:00Z" {
+				t.Fatalf("Workload active %v, %s %q", wl.Spec.Active, DeferredUntilAnnotation, wl.Annotations[DeferredUntilAnnotation])
 			}
 			if ev := fmt.Sprintf("Normal Deferred %s; requeued in 60s", tt.msg); !hasEvent(e.drainEvents(), ev) {
 				t.Errorf("no event %q", ev)
 			}
+			if res := e.reconcile(); res.RequeueAfter != time.Minute {
+				t.Errorf("requeued after %v, want the backoff's 1m", res.RequeueAfter)
+			}
 		})
+	}
+}
+
+// Kueue evicts the deactivated Workload; the controller reactivates it when the
+// backoff is over and Kueue queues it again. The next reservation is the next
+// attempt, with the deferred one in its deferrals and Kueue's retryCount
+// untouched; neither the check nor the owner, of any kind, fails meanwhile.
+func TestDeferralReactivates(t *testing.T) {
+	rayJob := rayOwned(rayJobKind, 1, func(u *unstructured.Unstructured) {
+		u.Object["spec"] = map[string]any{"suspend": true, "entrypoint": "python x.py"}
+		u.Object["status"] = map[string]any{"jobDeploymentStatus": "Suspended"}
+	})
+	for _, tc := range []struct {
+		name string
+		opts []envOption
+	}{
+		{"Job", nil},
+		{"pod", []envOption{podOwned(1)}},
+		{"pod group", []envOption{podOwned(2)}},
+		{"JobSet", []envOption{customOwned(jobSetKind)}},
+		{"TrainJob", []envOption{customOwned(trainJobKind)}},
+		{"RayJob", []envOption{rayJob, rayStatus}},
+		{"RayCluster", []envOption{rayOwned(rayClusterKind, 1, nil)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t, append(tc.opts, withMaxStartDelay(5*time.Minute), withRetryStrategy(&kueue.ProvisioningRequestRetryStrategy{
+				BackoffLimitCount: ptr.To[int32](0), BackoffBaseSeconds: ptr.To[int32](60), BackoffMaxSeconds: ptr.To[int32](1800),
+			}))...)
+			e.reconcile()
+			owners := e.ownerStatuses()
+			e.takes(1)
+			e.report(1, e.estimated(-1))
+			e.reconcile()
+			e.loseReservation()
+			e.executorLetsGo(1)
+			if res := e.reconcile(); res.RequeueAfter != time.Minute {
+				t.Errorf("requeued after %v, want 1m", res.RequeueAfter)
+			}
+			if q := e.request(1); !reflect.DeepEqual(q.Finalizers, []string{v1alpha1.AttemptFinalizer}) {
+				t.Errorf("finalizers %v during the backoff, want the attempt's", q.Finalizers)
+			}
+			e.now = e.now.Add(59 * time.Second)
+			if res := e.reconcile(); res.RequeueAfter != time.Second || ptr.Deref(e.workload().Spec.Active, true) {
+				t.Fatalf("reactivated %v before the backoff ended, requeued after %v", e.workload().Spec.Active, res.RequeueAfter)
+			}
+			e.now = e.now.Add(time.Second)
+			e.drainEvents()
+			e.reconcile()
+			wl := e.workload()
+			if !ptr.Deref(wl.Spec.Active, true) || wl.Annotations[DeferredUntilAnnotation] != "" {
+				t.Fatalf("Workload active %v, annotations %v after the backoff", wl.Spec.Active, wl.Annotations)
+			}
+			if ev := "Normal Reactivated deferral over"; !hasEvent(e.drainEvents(), ev) {
+				t.Errorf("no event %q", ev)
+			}
+			e.reserveAgain()
+			e.reconcile()
+			if q := e.request(2); q.Spec.Deferrals != 1 {
+				t.Errorf("attempt 2: deferrals %d, want 1", q.Spec.Deferrals)
+			}
+			st := e.check("hpc-a")
+			if st.State != kueue.CheckStatePending || st.RetryCount != nil {
+				t.Errorf("check %s, retryCount %v, want Pending and none", st.State, st.RetryCount)
+			}
+			for _, w := range e.checks.writes {
+				if w.State != kueue.CheckStatePending {
+					t.Errorf("check written %s %q", w.State, w.Message)
+				}
+			}
+			if got := e.ownerStatuses(); !reflect.DeepEqual(got, owners) {
+				t.Errorf("owner status %v, want it untouched: %v", got, owners)
+			}
+		})
+	}
+}
+
+// ownerStatuses reads the status of each of the Workload's owners.
+func (e *env) ownerStatuses() map[string]any {
+	e.t.Helper()
+	out := map[string]any{}
+	for _, ref := range e.workload().OwnerReferences {
+		u := &unstructured.Unstructured{}
+		u.SetAPIVersion(ref.APIVersion)
+		u.SetKind(ref.Kind)
+		if err := e.c.Get(context.Background(), types.NamespacedName{Namespace: testNS, Name: ref.Name}, u); err != nil {
+			e.t.Fatal(err)
+		}
+		out[ref.Kind+"/"+ref.Name] = u.Object["status"]
+	}
+	return out
+}
+
+// A Workload a user reactivates during the backoff only loses the annotation;
+// one deactivated for another reason stays inactive.
+func TestDeferralReactivatesOnlyItsOwn(t *testing.T) {
+	e := newEnv(t, withMaxStartDelay(5*time.Minute))
+	e.reconcile()
+	e.takes(1)
+	e.report(1, e.estimated(time.Hour))
+	e.reconcile()
+	wl := e.workload()
+	if ptr.Deref(wl.Spec.Active, true) || wl.Annotations[DeferredUntilAnnotation] == "" {
+		t.Fatalf("Workload active %v, annotations %v, want deferred", wl.Spec.Active, wl.Annotations)
+	}
+	wl.Spec.Active = ptr.To(true)
+	if err := e.c.Update(context.Background(), wl); err != nil {
+		t.Fatal(err)
+	}
+	e.drainEvents()
+	e.reconcile()
+	if wl := e.workload(); wl.Annotations[DeferredUntilAnnotation] != "" {
+		t.Errorf("annotation %q kept on a Workload active again", wl.Annotations[DeferredUntilAnnotation])
+	}
+	if evs := e.drainEvents(); hasEvent(evs, "Normal Reactivated") {
+		t.Errorf("events %v", evs)
+	}
+	wl = e.workload()
+	wl.Spec.Active = ptr.To(false)
+	if err := e.c.Update(context.Background(), wl); err != nil {
+		t.Fatal(err)
+	}
+	e.now = e.now.Add(24 * time.Hour)
+	e.reconcile()
+	if ptr.Deref(e.workload().Spec.Active, true) {
+		t.Error("a Workload deactivated by a user was reactivated")
 	}
 }
 
@@ -156,10 +293,18 @@ func TestDeferralsCountedAcrossAttempts(t *testing.T) {
 		e.takes(attempt)
 		e.report(attempt, e.estimated(in))
 		e.reconcile()
-		if st := e.check("hpc-a"); st.State != kueue.CheckStateRetry {
-			t.Fatalf("attempt %d: check %s %q, want Retry", attempt, st.State, st.Message)
+		if ptr.Deref(e.workload().Spec.Active, true) {
+			t.Fatalf("attempt %d: Workload active, want deactivated", attempt)
 		}
-		next(attempt)
+		// Kueue evicts the Workload, the backoff passes, the controller
+		// reactivates it and Kueue reserves quota again.
+		e.executorLetsGo(attempt)
+		e.loseReservation()
+		e.reconcile()
+		e.now = e.now.Add(time.Hour)
+		e.reconcile()
+		e.reserveAgain()
+		e.reconcile()
 		if q := e.request(attempt + 1); q.Spec.Deferrals != attempt {
 			t.Fatalf("attempt %d: deferrals %d, want %d", attempt+1, q.Spec.Deferrals, attempt)
 		}

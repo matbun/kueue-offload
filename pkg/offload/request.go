@@ -145,10 +145,11 @@ func (r *WorkloadReconciler) deleteRequest(ctx context.Context, q *v1alpha1.Offl
 
 // releaseAttempts drops the attempt finalizer from the requests no next
 // attempt will count from: every request of a Workload that is gone, replaced,
-// finished or deactivated, and the deleted requests a newer attempt of their
-// check superseded. The newest deleted request of a live Workload keeps it.
+// finished or deactivated other than by a deferral, and the deleted requests a
+// newer attempt of their check superseded. The newest deleted request of a
+// live Workload keeps it.
 func (r *WorkloadReconciler) releaseAttempts(ctx context.Context, wl *kueue.Workload, reqs []v1alpha1.OffloadRequest) error {
-	done := wl == nil || kueueworkload.IsFinished(wl) || !kueueworkload.IsActive(wl)
+	done := wl == nil || kueueworkload.IsFinished(wl) || (!kueueworkload.IsActive(wl) && wl.Annotations[DeferredUntilAnnotation] == "")
 	newest := map[kueue.AdmissionCheckReference]int32{}
 	if !done {
 		for _, q := range ownedBy(wl, reqs) {

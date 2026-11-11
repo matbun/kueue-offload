@@ -32,9 +32,14 @@ const (
 	EventFailed              = "Failed"
 	EventRetry               = "Retry"
 	EventDeferred            = "Deferred"
+	EventReactivated         = "Reactivated"
 	EventRejected            = "Rejected"
 	EventExecutorUnreachable = "ExecutorUnreachable"
 )
+
+// DeferredUntilAnnotation on a Workload the start estimate deferred holds when
+// the offload controller sets spec.active again, in RFC 3339.
+const DeferredUntilAnnotation = "offload.interlink.eu/deferred-until"
 
 // WorkloadReconciler drives the offload checks on Workloads: for each attempt it
 // creates an OffloadRequest, maps the executor's status of it to the check and
@@ -80,6 +85,10 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 	own := ownedBy(wl, reqs)
+	wait, err := r.reactivate(ctx, wl)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	if !kueueworkload.HasQuotaReservation(wl) || kueueworkload.IsEvicted(wl) || !kueueworkload.IsActive(wl) {
 		if newestLive(own) != nil {
 			// The job goes with its request: a pod shown running goes back to Pending.
@@ -88,7 +97,7 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 				return ctrl.Result{}, err
 			}
 		}
-		return ctrl.Result{}, r.deleteLive(ctx, own)
+		return ctrl.Result{RequeueAfter: wait}, r.deleteLive(ctx, own)
 	}
 
 	checks, err := admissioncheck.FilterForController(ctx, r.Client, wl.Status.AdmissionChecks, ControllerName)
@@ -311,24 +320,69 @@ func (r *WorkloadReconciler) retry(ctx context.Context, s site, wl *kueue.Worklo
 }
 
 // deferAttempt gives up on an attempt whose job the site would not start
-// within maxStartDelay, before it is submitted: the check goes to Retry
-// (requeue), so that a job the site would keep waiting does not hold the quota
-// meanwhile, as the virtual kubelet's Slurm admission check does. It never
-// rejects: the next attempt counts this one in its deferrals, not as a retry.
+// within maxStartDelay, before it is submitted, so that a job the site would
+// keep waiting does not hold the quota meanwhile. It deactivates the Workload
+// for Kueue's backoff counted by the attempt, as a user stops one: Kueue evicts
+// it at once, which releases the quota, and queues it again once reactivate
+// sets spec.active back. A Retry with requeueAfterSeconds would keep the
+// quota: Kueue evicts the Workload only when requeueAt has passed. The check
+// stays Pending with the reason, which the eviction keeps. It never rejects:
+// the next attempt counts this one in its deferrals, not as a retry.
 func (r *WorkloadReconciler) deferAttempt(ctx context.Context, s site, wl *kueue.Workload, name kueue.AdmissionCheckReference, owner *workloadOwner, q *v1alpha1.OffloadRequest) error {
-	msg := deferMessage(q.Status.Estimate)
-	after, err := r.requeue(ctx, s, wl, name, owner, q, msg)
-	if err != nil {
+	if err := syncSinglePod(ctx, r.Client, r.APIReader, wl.Namespace, owner, nil, r.now()); err != nil {
 		return err
 	}
-	r.Recorder.Eventf(wl, nil, corev1.EventTypeNormal, EventDeferred, "Retry", "%s; requeued in %ds", msg, after)
+	backoff := kueue.AdmissionCheckState{RetryCount: ptr.To(q.Spec.Attempt - 1)}
+	kueueworkload.UpdateAdmissionCheckRequeueState(&backoff, s.backoffBaseSeconds, s.backoffMaxSeconds, clock.RealClock{})
+	after := *backoff.RequeueAfterSeconds
+	until := r.now().Add(time.Duration(after) * time.Second).UTC().Truncate(time.Second)
+	msg := deferMessage(q.Status.Estimate, until)
+	if err := r.setCheck(ctx, wl, name, kueue.CheckStatePending, msg); err != nil {
+		return err
+	}
+	inactive := wl.DeepCopy()
+	inactive.Spec.Active = ptr.To(false)
+	metav1.SetMetaDataAnnotation(&inactive.ObjectMeta, DeferredUntilAnnotation, until.Format(time.RFC3339))
+	if err := r.Client.Patch(ctx, inactive, client.MergeFrom(wl)); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	r.Recorder.Eventf(wl, nil, corev1.EventTypeNormal, EventDeferred, "Deactivate", "%s; requeued in %ds", msg, after)
 	return r.deleteRequest(ctx, q)
 }
 
+// reactivate sets spec.active again on a Workload deferAttempt deactivated,
+// once the time in its DeferredUntilAnnotation has come, and drops the
+// annotation; Kueue then queues the Workload again. It returns how long the
+// Workload still waits. A Workload reactivated before then, by a user, only
+// loses the annotation.
+func (r *WorkloadReconciler) reactivate(ctx context.Context, wl *kueue.Workload) (time.Duration, error) {
+	v, ok := wl.Annotations[DeferredUntilAnnotation]
+	if !ok {
+		return 0, nil
+	}
+	// A value that does not parse reactivates at once.
+	until, _ := time.Parse(time.RFC3339, v)
+	inactive := !kueueworkload.IsActive(wl)
+	if wait := until.Sub(r.now()); inactive && wait > 0 {
+		return wait, nil
+	}
+	active := wl.DeepCopy()
+	active.Spec.Active = ptr.To(true)
+	delete(active.Annotations, DeferredUntilAnnotation)
+	if err := r.Client.Patch(ctx, active, client.MergeFrom(wl)); err != nil {
+		return 0, client.IgnoreNotFound(err)
+	}
+	if inactive {
+		r.Recorder.Eventf(wl, nil, corev1.EventTypeNormal, EventReactivated, "Reactivate", "deferral over: Kueue queues the Workload again")
+	}
+	return 0, nil
+}
+
 // requeue sets the check to Retry with requeueAfterSeconds from Kueue's backoff,
-// counted by the attempt, and returns that delay: Kueue evicts the Workload,
-// which releases its quota, and requeues it after the delay. A single owner pod
-// shown running goes back to Pending.
+// counted by the attempt, and returns that delay: Kueue keeps the reservation
+// until the delay has passed, then evicts the Workload, which releases its
+// quota, and queues it again. A single owner pod shown running goes back to
+// Pending.
 func (r *WorkloadReconciler) requeue(ctx context.Context, s site, wl *kueue.Workload, name kueue.AdmissionCheckReference, owner *workloadOwner, q *v1alpha1.OffloadRequest, msg string) (int32, error) {
 	if err := syncSinglePod(ctx, r.Client, r.APIReader, wl.Namespace, owner, nil, r.now()); err != nil {
 		return 0, err
@@ -479,12 +533,14 @@ func estimateMessage(e *v1alpha1.StartEstimate) string {
 	return fmt.Sprintf("Slurm expects to start %d node(s) at %s", e.Nodes, e.StartTime.UTC().Format(time.RFC3339))
 }
 
-// deferMessage is the check message of an attempt the start estimate deferred.
-func deferMessage(e *v1alpha1.StartEstimate) string {
+// deferMessage is the check message of an attempt the start estimate deferred
+// until the Workload is reactivated.
+func deferMessage(e *v1alpha1.StartEstimate, until time.Time) string {
+	held := "Workload deactivated until " + until.UTC().Format(time.RFC3339) + ", quota released"
 	if e.StartTime == nil {
-		return estimateMessage(e) + "; quota released until then"
+		return estimateMessage(e) + "; " + held
 	}
-	return fmt.Sprintf("%s, in %d s: quota released until then", estimateMessage(e), int64(e.StartTime.Sub(e.ProbeTime.Time).Seconds()))
+	return fmt.Sprintf("%s, in %d s: %s", estimateMessage(e), int64(e.StartTime.Sub(e.ProbeTime.Time).Seconds()), held)
 }
 
 func waitingMessage(namespace string) string {

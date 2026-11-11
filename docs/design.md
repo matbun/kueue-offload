@@ -83,11 +83,17 @@ failure, unreadable capabilities included, is logged and the job goes without an
 executor stops asking once the attempt's stage-in started or its job was submitted.
 
 While no job is submitted, the controller shows the estimate in the check message: `Slurm expects
-to start N node(s) at <UTC>`. With the OffloadConfig's `maxStartDelay` set, it sets the check to
-`Retry` (event `Deferred`, `requeueAfterSeconds` from the `retryStrategy` backoff) when
-`startTime - probeTime` is above `maxStartDelay` or there is no `startTime`: `..., in <s> s: quota
-released until then`. Kueue releases the quota and requeues the Workload, so that a job the site
-would keep waiting does not hold the project's quota meanwhile. These deferrals never reject the
+to start N node(s) at <UTC>`. With the OffloadConfig's `maxStartDelay` set, when `startTime -
+probeTime` is above `maxStartDelay` or there is no `startTime`, it deletes the attempt's request and
+deactivates the Workload (`spec.active: false`) for the `retryStrategy` backoff counted by the
+attempt, recording when in the annotation `offload.interlink.eu/deferred-until`. Kueue evicts a
+deactivated Workload at once, which releases the quota, so that a job the site would keep waiting
+does not hold the project's quota meanwhile. The check stays `Pending` with `..., in <s> s: Workload
+deactivated until <UTC>, quota released` (event `Deferred`). When that time comes the controller
+sets `spec.active` back and drops the annotation (event `Reactivated`), and Kueue queues the
+Workload again; a Workload deactivated without the annotation stays inactive. A `Retry` with
+`requeueAfterSeconds` would not do: Kueue 0.16.9 keeps the reservation until
+`status.requeueState.requeueAt` and evicts only then. These deferrals never reject the
 Workload: the next attempt's `spec.deferrals` is the previous one's plus one, and [Retries](#retries)
 count `attempt - 1 - deferrals` against `backoffLimitCount`. A submitted job, or an attempt whose
 stage-in started, is never deferred. Without `maxStartDelay` the estimate only shows in the
@@ -105,7 +111,8 @@ provisioning check does:
    `UpdateAdmissionCheckRequeueState` (`sigs.k8s.io/kueue/pkg/workload`): `backoffBaseSeconds`
    doubled per retry, capped at `backoffMaxSeconds`.
 2. It deletes the attempt's OffloadRequest; the executor's finalizer cancels the job first.
-3. Kueue evicts the Workload, which releases the quota, and requeues it after the delay.
+3. Kueue keeps the reservation until the delay has passed (`status.requeueState.requeueAt`), then
+   evicts the Workload, which releases the quota, and queues it again at once.
 4. At the next reservation the controller creates the next attempt's OffloadRequest.
 
 The retries spent are the attempt's number less one less the attempts the start estimate deferred,
@@ -113,10 +120,10 @@ read from the request (`spec.attempt`, `spec.deferrals`; [Start estimate](#start
 from Kueue's `retryCount`: Kueue drops the state of a check that covers only some flavors, its
 `retryCount` included, when it evicts the Workload. The deleted request keeps the controller's
 finalizer `offload.interlink.eu/attempt`, and with it the attempt number, until the next attempt
-exists or the Workload can have none (it went, finished or was deactivated). The next attempt is
-one past the newest request of the check, deleted ones included, and past Kueue's `retryCount`
-while the check state holds one; every new reservation after an eviction is an attempt, whatever
-evicted the Workload.
+exists or the Workload can have none (it went, finished or was deactivated, other than by a
+deferral). The next attempt is one past the newest request of the check, deleted ones included,
+and past Kueue's `retryCount` while the check state holds one; every new reservation after an
+eviction is an attempt, whatever evicted the Workload.
 
 Once `backoffLimitCount` retries were spent the check goes to `Rejected` instead and the owner
 fails; 0 rejects at the first loss. The three limits are OffloadConfig's `retryStrategy`, which has
@@ -185,8 +192,8 @@ pod is never left `Failed` without it if the controller stops halfway. Single po
 succeed are not annotated. The key and value come from Kueue's `pkg/controller/jobs/pod/constants`.
 
 The controller needs `get` and `status` patch on `jobs`, `jobsets`, `trainjobs` and `rayjobs`,
-`get` on `rayclusters`, `patch` on `workloads` (a RayCluster's deactivation), `get` and `patch` on
-`pods` (the annotation) and `patch` on `pods/status` (the terminal phase).
+`get` on `rayclusters`, `patch` on `workloads` (a RayCluster's deactivation, a deferral's), `get`
+and `patch` on `pods` (the annotation) and `patch` on `pods/status` (the terminal phase).
 
 ### Owner annotations
 
@@ -205,12 +212,12 @@ Per Workload, for each of its checks this controller serves:
 | Situation | Action |
 | --- | --- |
 | `Finished=True` | nothing; the request stays until the Workload goes, and with it the job directory and the shadow, so the logs stay readable ([Shadow](#shadow)) |
-| no `QuotaReserved=True`, evicted or deactivated | delete the live requests ([Workload deletion](#workload-deletion)) |
+| no `QuotaReserved=True`, evicted or deactivated | delete the live requests ([Workload deletion](#workload-deletion)); a Workload a deferral deactivated is reactivated when its `offload.interlink.eu/deferred-until` time comes ([Start estimate](#start-estimate)) |
 | check not `Pending` | nothing (`Retry`: Kueue evicts next; `Rejected`: Kueue deactivates) |
 | check `Pending`, no OffloadConfig | nothing, requeue after a minute (the check is inactive) |
 | reserved, owner of an unsupported kind | check `Rejected` |
 | reserved, check `Pending`, no live request | create the next attempt's OffloadRequest ([The OffloadRequest](#the-offloadrequest)); refusals found while building it (account label, flavors, time limit, a RayJob's entrypoint) are `Rejected` |
-| a live request | map its status, newest first in this order: `Accepted=False`: check `Rejected` with the condition's message, owner `Failed` (reason `Rejected`); `Finished=True`: owner's terminal status ([Owners](#owners)), check stays `Pending` with `job N completed` or `job N failed: <message>`; `Evicted=True`: [Retries](#retries) (`job N cancelled: <message>`); no heartbeat for `executorLostTimeout`: [Retries](#retries); `QuotaReserved=True` for `maxQueueTime` without `Admitted`: [Retries](#retries); no job submitted and a `status.estimate` beyond `maxStartDelay`: `Retry` ([Start estimate](#start-estimate)); otherwise `Pending` with the state in the message, and a single owner pod's status follows the job ([Notebooks and Services](#notebooks-and-services)) |
+| a live request | map its status, newest first in this order: `Accepted=False`: check `Rejected` with the condition's message, owner `Failed` (reason `Rejected`); `Finished=True`: owner's terminal status ([Owners](#owners)), check stays `Pending` with `job N completed` or `job N failed: <message>`; `Evicted=True`: [Retries](#retries) (`job N cancelled: <message>`); no heartbeat for `executorLostTimeout`: [Retries](#retries); `QuotaReserved=True` for `maxQueueTime` without `Admitted`: [Retries](#retries); no job submitted and a `status.estimate` beyond `maxStartDelay`: Workload deactivated for the backoff, check `Pending` ([Start estimate](#start-estimate)); otherwise `Pending` with the state in the message, and a single owner pod's status follows the job ([Notebooks and Services](#notebooks-and-services)) |
 
 The `Pending` messages: `StagingOut`: `job N ended, staging out: <message>`; `Admitted`: `job N
 running on <node> since <start>`; `QuotaReserved`: `job N queued (<reason>): <message>`;
@@ -257,8 +264,8 @@ Check state writes are server-side apply patches of `status.admissionChecks` (a 
 happens only when the state or the message changed, and `lastTransitionTime` moves only with the
 state. Owner status patches use `jobs/status`, `jobsets/status`, `trainjobs/status` or
 `pods/status`. Events on the Workload: `Submitted` for each attempt, `Running` when a job runs or
-moves node, `Completed`, `Failed`, `Retry`, `Deferred` ([Start estimate](#start-estimate)),
-`Rejected`, and `ExecutorUnreachable` when the heartbeat stops.
+moves node, `Completed`, `Failed`, `Retry`, `Deferred` and `Reactivated` ([Start
+estimate](#start-estimate)), `Rejected`, and `ExecutorUnreachable` when the heartbeat stops.
 
 Owner Job status on completion: `startTime` and `completionTime` from the request's status, `succeeded` =
 `completions` (`parallelism` when unset), `completedIndexes` `0-(n-1)` for Indexed Jobs, condition

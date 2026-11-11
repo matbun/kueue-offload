@@ -16,7 +16,7 @@ import (
 	"github.com/matbun/kueue-offload/api/v1alpha1"
 )
 
-// +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=workloads,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=workloads,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=workloads/status,verbs=patch
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=admissionchecks,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=admissionchecks/status,verbs=get;patch

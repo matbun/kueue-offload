@@ -125,8 +125,8 @@ type OffloadRequestSpec struct {
 	// some flavors, retryCount included, when it evicts the Workload.
 	// +kubebuilder:validation:Minimum=1
 	Attempt int32 `json:"attempt"`
-	// deferrals counts the check's earlier attempts set to Retry by the site's
-	// start estimate (the OffloadConfig's maxStartDelay), which are not retries:
+	// deferrals counts the check's earlier attempts deferred by the site's start
+	// estimate (the OffloadConfig's maxStartDelay), which are not retries:
 	// the previous attempt's deferrals, plus one when that attempt submitted no
 	// job and its status.estimate has no startTime or one further than
 	// maxStartDelay from its probeTime.

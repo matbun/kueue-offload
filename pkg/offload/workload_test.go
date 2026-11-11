@@ -11,10 +11,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -93,30 +90,27 @@ func TestRequestPerAttemptWithResolvedPodSets(t *testing.T) {
 	}
 }
 
-// Every row of the state table of kueue-native.md 3.2 that keeps the check
-// Pending, and the owner's state with it.
+// Every row of the state table of kueue-native.md 3.2 for a live request: the
+// check stays Pending until the job has started, Ready from then on, also when
+// it ended before the offload controller saw it run, and the owner is never
+// written.
 func TestRequestStatusMapping(t *testing.T) {
 	start := metav1.NewTime(time.Date(2026, 10, 29, 10, 14, 2, 0, time.UTC))
 	end := metav1.NewTime(time.Date(2026, 10, 29, 11, 0, 0, 0, time.UTC))
-	untouched := func(t *testing.T, j *batchv1.Job) {
-		if len(j.Status.Conditions) != 0 {
-			t.Errorf("owner status changed: %+v", j.Status)
-		}
-	}
 	cases := []struct {
-		name      string
-		report    func(e *env) func(st *v1alpha1.OffloadRequestStatus)
-		message   string
-		event     string
-		jobStatus func(t *testing.T, j *batchv1.Job)
-		requeue   bool
+		name    string
+		report  func(e *env) func(st *v1alpha1.OffloadRequestStatus)
+		state   kueue.CheckState
+		message string
+		event   string
+		requeue bool
 	}{
 		{
-			name:      "accepted",
-			report:    func(e *env) func(*v1alpha1.OffloadRequestStatus) { return func(*v1alpha1.OffloadRequestStatus) {} },
-			message:   "accepted by the executor in namespace alice",
-			requeue:   true,
-			jobStatus: untouched,
+			name:    "accepted",
+			report:  func(e *env) func(*v1alpha1.OffloadRequestStatus) { return func(*v1alpha1.OffloadRequestStatus) {} },
+			state:   kueue.CheckStatePending,
+			message: "accepted by the executor in namespace alice",
+			requeue: true,
 		},
 		{
 			name: "staging in",
@@ -126,9 +120,9 @@ func TestRequestStatusMapping(t *testing.T) {
 					e.condition(st, v1alpha1.OffloadRequestStagingIn, metav1.ConditionTrue, "StagingIn", "")
 				}
 			},
-			message:   "staging in: stage-in Job stage-in-0b6c-wl: 1 active",
-			requeue:   true,
-			jobStatus: untouched,
+			state:   kueue.CheckStatePending,
+			message: "staging in: stage-in Job stage-in-0b6c-wl: 1 active",
+			requeue: true,
 		},
 		{
 			name: "submit refused for now",
@@ -137,35 +131,44 @@ func TestRequestStatusMapping(t *testing.T) {
 					st.Reason, st.Message = "SubmitLimit", "QOSMaxSubmitJobPerUserLimit: the user's other jobs fill the QOS"
 				}
 			},
-			message:   "waiting to submit (SubmitLimit): QOSMaxSubmitJobPerUserLimit: the user's other jobs fill the QOS",
-			requeue:   true,
-			jobStatus: untouched,
+			state:   kueue.CheckStatePending,
+			message: "waiting to submit (SubmitLimit): QOSMaxSubmitJobPerUserLimit: the user's other jobs fill the QOS",
+			requeue: true,
 		},
 		{
-			name:      "queued",
-			report:    func(e *env) func(*v1alpha1.OffloadRequestStatus) { return e.queued("123", "Resources", "") },
-			message:   "job 123 queued (Resources)",
-			requeue:   true,
-			jobStatus: untouched,
+			name:    "queued",
+			report:  func(e *env) func(*v1alpha1.OffloadRequestStatus) { return e.queued("123", "Resources", "") },
+			state:   kueue.CheckStatePending,
+			message: "job 123 queued (Resources)",
+			requeue: true,
 		},
 		{
 			name: "independent pods: the executor names every job",
 			report: func(e *env) func(*v1alpha1.OffloadRequestStatus) {
 				return e.queued("123,124", "WaitingForSite", "rank 2 waits for the site: QOSMaxSubmitJobPerUserLimit")
 			},
-			message:   "job 123,124 queued (WaitingForSite): rank 2 waits for the site: QOSMaxSubmitJobPerUserLimit",
-			requeue:   true,
-			jobStatus: untouched,
+			state:   kueue.CheckStatePending,
+			message: "job 123,124 queued (WaitingForSite): rank 2 waits for the site: QOSMaxSubmitJobPerUserLimit",
+			requeue: true,
 		},
 		{
 			name: "running",
 			report: func(e *env) func(*v1alpha1.OffloadRequestStatus) {
 				return func(st *v1alpha1.OffloadRequestStatus) { e.queued("123", "", "")(st); e.running("node07", &start)(st) }
 			},
-			message:   "job 123 running on node07 since 2026-10-29T10:14:02Z",
-			event:     "Normal Running job 123 running on node07",
-			requeue:   true,
-			jobStatus: untouched,
+			state:   kueue.CheckStateReady,
+			message: "job 123 running on node07 since 2026-10-29T10:14:02Z",
+			event:   "Normal Running job 123 running on node07",
+			requeue: true,
+		},
+		{
+			name: "start time without Admitted",
+			report: func(e *env) func(*v1alpha1.OffloadRequestStatus) {
+				return func(st *v1alpha1.OffloadRequestStatus) { e.queued("123", "", "")(st); st.StartTime = &start }
+			},
+			state:   kueue.CheckStateReady,
+			message: "job 123 queued",
+			requeue: true,
 		},
 		{
 			name: "staging out",
@@ -177,12 +180,12 @@ func TestRequestStatusMapping(t *testing.T) {
 					e.condition(st, v1alpha1.OffloadRequestStagingOut, metav1.ConditionTrue, "StagingOut", "")
 				}
 			},
-			message:   "job 123 ended, staging out: stage-out Job stage-out-0b6c-wl: 1 active",
-			requeue:   true,
-			jobStatus: untouched,
+			state:   kueue.CheckStateReady,
+			message: "job 123 ended, staging out: stage-out Job stage-out-0b6c-wl: 1 active",
+			requeue: true,
 		},
 		{
-			name: "completed",
+			name: "completed before it was seen running",
 			report: func(e *env) func(*v1alpha1.OffloadRequestStatus) {
 				return func(st *v1alpha1.OffloadRequestStatus) {
 					e.queued("123", "", "")(st)
@@ -190,23 +193,9 @@ func TestRequestStatusMapping(t *testing.T) {
 					e.finished(true, "")(st)
 				}
 			},
+			state:   kueue.CheckStateReady,
 			message: "job 123 completed",
 			event:   "Normal Completed job 123 completed",
-			jobStatus: func(t *testing.T, j *batchv1.Job) {
-				c := jobCondition(j, batchv1.JobComplete)
-				if c == nil || c.Status != corev1.ConditionTrue || c.Reason != ReasonOffload || !strings.Contains(c.Message, "123") {
-					t.Errorf("Complete condition = %+v", c)
-				}
-				if j.Status.Succeeded != 4 || j.Status.CompletedIndexes != "0-3" {
-					t.Errorf("succeeded %d indexes %q, want 4 and 0-3", j.Status.Succeeded, j.Status.CompletedIndexes)
-				}
-				if !j.Status.StartTime.Equal(&start) || !j.Status.CompletionTime.Equal(&end) {
-					t.Errorf("times %v %v", j.Status.StartTime, j.Status.CompletionTime)
-				}
-				if jobCondition(j, batchv1.JobFailed) != nil {
-					t.Errorf("Failed set on a completed job")
-				}
-			},
 		},
 		{
 			name: "failed, a failed stage-out included",
@@ -216,17 +205,9 @@ func TestRequestStatusMapping(t *testing.T) {
 					e.finished(false, "rank 2 exited 3")(st)
 				}
 			},
+			state:   kueue.CheckStateReady,
 			message: "job 123 failed: rank 2 exited 3",
 			event:   "Warning Failed job 123 failed: rank 2 exited 3",
-			jobStatus: func(t *testing.T, j *batchv1.Job) {
-				c := jobCondition(j, batchv1.JobFailed)
-				if c == nil || c.Status != corev1.ConditionTrue || c.Reason != ReasonOffload || !strings.Contains(c.Message, "rank 2 exited 3") {
-					t.Errorf("Failed condition = %+v", c)
-				}
-				if j.Status.Failed != 1 || jobCondition(j, batchv1.JobComplete) != nil {
-					t.Errorf("failed %d, complete %v", j.Status.Failed, jobCondition(j, batchv1.JobComplete))
-				}
-			},
 		},
 	}
 	for _, tc := range cases {
@@ -238,21 +219,21 @@ func TestRequestStatusMapping(t *testing.T) {
 			e.drainEvents()
 			res := e.reconcile()
 
-			if st := e.check("hpc-a"); st.State != kueue.CheckStatePending || st.Message != tc.message {
-				t.Errorf("check = %s %q, want Pending %q", st.State, st.Message, tc.message)
+			if st := e.check("hpc-a"); st.State != tc.state || st.Message != tc.message {
+				t.Errorf("check = %s %q, want %s %q", st.State, st.Message, tc.state, tc.message)
 			}
 			if (res.RequeueAfter > 0) != tc.requeue {
 				t.Errorf("requeue = %v, want %v", res.RequeueAfter, tc.requeue)
 			}
-			tc.jobStatus(t, e.job())
+			if n := e.readyWrites(); (n > 0) != (tc.state == kueue.CheckStateReady) {
+				t.Errorf("%d Ready writes for a %s check", n, tc.state)
+			}
+			if j := e.job(); len(j.Status.Conditions) != 0 || j.Status.StartTime != nil {
+				t.Errorf("owner status changed: %+v", j.Status)
+			}
 			evs := e.drainEvents()
 			if tc.event != "" && !hasEvent(evs, tc.event) {
 				t.Errorf("events %v, want %q", evs, tc.event)
-			}
-			for _, w := range e.checks.writes {
-				if w.State == kueue.CheckStateReady {
-					t.Errorf("check set Ready; the job must never be unsuspended")
-				}
 			}
 			// Kueue holds the quota: the request stays, also once the job ended.
 			if q := e.request(1); !q.DeletionTimestamp.IsZero() {
@@ -262,6 +243,49 @@ func TestRequestStatusMapping(t *testing.T) {
 				t.Errorf("requests %v, want the one attempt", e.requests())
 			}
 		})
+	}
+}
+
+// The podSetUpdates of a Ready check send every PodSet that runs to the
+// check's node, and stay the same on every later write: Kueue refuses a change
+// while the check is Ready (recordingChecks refuses it too).
+func TestReadyCarriesPodSetUpdates(t *testing.T) {
+	e := newEnv(t)
+	e.submitted()
+	if n := e.readyWrites(); n != 0 {
+		t.Fatalf("%d Ready writes while queued", n)
+	}
+	e.report(1, e.startedAt(e.now))
+	e.reconcile()
+	st := e.check("hpc-a")
+	want := []kueue.PodSetUpdate{{
+		Name:         "main",
+		Labels:       map[string]string{v1alpha1.NodeLabel: "kueue-offload-hpc-a"},
+		Annotations:  map[string]string{v1alpha1.WorkloadAnnotation: wlName},
+		NodeSelector: map[string]string{v1alpha1.NodeLabel: "kueue-offload-hpc-a"},
+		Tolerations: []corev1.Toleration{
+			{Key: "node.kubernetes.io/not-ready", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute},
+			{Key: "node.kubernetes.io/unreachable", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute},
+		},
+	}}
+	if st.State != kueue.CheckStateReady || !reflect.DeepEqual(st.PodSetUpdates, want) {
+		t.Fatalf("check %s with podSetUpdates %+v, want Ready with %+v", st.State, st.PodSetUpdates, want)
+	}
+	// Progress, an unreachable executor and the end change the message only.
+	e.report(1, func(st *v1alpha1.OffloadRequestStatus) {
+		st.Message = "stage-out Job stage-out-0b6c-wl: 1 active"
+		e.condition(st, v1alpha1.OffloadRequestStagingOut, metav1.ConditionTrue, "StagingOut", "")
+	})
+	e.reconcile()
+	e.now = e.now.Add(time.Minute)
+	e.reconcile()
+	e.report(1, e.finished(true, ""))
+	e.reconcile()
+	if st := e.check("hpc-a"); st.State != kueue.CheckStateReady || st.Message != "job 123 completed" {
+		t.Errorf("check = %s %q", st.State, st.Message)
+	}
+	if n := e.readyWrites(); n != 4 {
+		t.Errorf("%d Ready writes, want running, staging out, unreachable and completed", n)
 	}
 }
 
@@ -289,8 +313,9 @@ func TestRunningEventsOnce(t *testing.T) {
 
 // A job cancelled outside the executor goes through Kueue's Retry: the
 // attempt's request is deleted, the executor's finalizer cancels what is left,
-// and the next reservation makes the next attempt, until the retries are spent.
-func TestCancelledRetriesThenRejects(t *testing.T) {
+// and the next reservation makes the next attempt, until the retries are spent
+// and the Workload fails.
+func TestCancelledRetriesThenFails(t *testing.T) {
 	e := newEnv(t) // backoffLimitCount 2, backoffBaseSeconds 60
 	e.reconcile()
 	for i := int32(1); i <= 2; i++ {
@@ -348,19 +373,49 @@ func TestCancelledRetriesThenRejects(t *testing.T) {
 	e.report(3, e.queued("125", "", ""))
 	e.report(3, e.evicted("scancel by an operator"))
 	e.reconcile()
-	st := e.check("hpc-a")
-	if st.State != kueue.CheckStateRejected || !strings.Contains(st.Message, "giving up after 2 retries") {
-		t.Fatalf("check = %s %q, want Rejected", st.State, st.Message)
+	const want = "job 125 cancelled: scancel by an operator; giving up after 2 retries"
+	if st := e.check("hpc-a"); st.State != kueue.CheckStateReady || st.Message != want || e.failed() != want {
+		t.Fatalf("check = %s %q, %s %q, want Ready and the Workload failed with %q", st.State, st.Message, v1alpha1.FailedAnnotation, e.failed(), want)
 	}
-	if c := jobCondition(e.job(), batchv1.JobFailed); c == nil || c.Reason != ReasonRejected {
-		t.Errorf("owner Failed = %+v", c)
+	if e.readyWrites() != 1 {
+		t.Errorf("Ready written %d times", e.readyWrites())
+	}
+	if len(e.job().Status.Conditions) != 0 {
+		t.Errorf("owner status written: %+v", e.job().Status)
 	}
 	if q := e.request(3); q.DeletionTimestamp.IsZero() {
 		t.Errorf("last attempt's request not deleted")
 	}
 	e.reconcile()
 	if len(e.requests()) != 1 {
-		t.Errorf("requests %v after Rejected, want the last one only", e.requests())
+		t.Errorf("requests %v after failing, want the last one only", e.requests())
+	}
+}
+
+// A Job whose job is lost after the admission retries through Kueue as before
+// it: Retry, which evicts the Workload and suspends the Job, whose pods go.
+func TestRetryAfterAdmission(t *testing.T) {
+	e := newEnv(t)
+	e.submitted()
+	e.report(1, e.startedAt(e.now))
+	e.reconcile()
+	if st := e.check("hpc-a"); st.State != kueue.CheckStateReady {
+		t.Fatalf("check %s, want Ready once started", st.State)
+	}
+	e.report(1, e.evicted("node failure"))
+	e.reconcile()
+	st := e.check("hpc-a")
+	if st.State != kueue.CheckStateRetry || st.Message != "job 123 cancelled: node failure" || ptr.Deref(st.RequeueAfterSeconds, -1) != 60 {
+		t.Errorf("check = %s %q after %v, want Retry after 60", st.State, st.Message, st.RequeueAfterSeconds)
+	}
+	if st.PodSetUpdates != nil {
+		t.Errorf("podSetUpdates %+v kept on Retry", st.PodSetUpdates)
+	}
+	if q := e.request(1); q.DeletionTimestamp.IsZero() {
+		t.Errorf("request not deleted")
+	}
+	if _, ok := e.workload().Annotations[NextAttemptAnnotation]; ok {
+		t.Errorf("a Job retried in place")
 	}
 }
 
@@ -405,8 +460,8 @@ func TestAttemptSurvivesPerFlavorCheckReset(t *testing.T) {
 	e.takes(3)
 	e.report(3, e.evicted("lost"))
 	e.reconcile()
-	if st := e.check("hpc-a"); st.State != kueue.CheckStateRejected || !strings.Contains(st.Message, "giving up after 2 retries") {
-		t.Errorf("check = %s %q, want Rejected after the retries the requests counted", st.State, st.Message)
+	if st := e.check("hpc-a"); st.State != kueue.CheckStateReady || !strings.Contains(e.failed(), "giving up after 2 retries") {
+		t.Errorf("check = %s %q, want the Workload failed after the retries the requests counted", st.State, st.Message)
 	}
 }
 
@@ -471,18 +526,15 @@ func TestRetryBackoffFromAttempt(t *testing.T) {
 	}
 }
 
-func TestRetryLimitZeroRejectsAtFirstLoss(t *testing.T) {
+func TestRetryLimitZeroFailsAtFirstLoss(t *testing.T) {
 	e := newEnv(t, withRetryStrategy(&kueue.ProvisioningRequestRetryStrategy{BackoffLimitCount: ptr.To[int32](0)}))
 	e.reconcile()
 	e.takes(1)
 	e.report(1, e.evicted("rank 0 missing from the site's status for 10m0s"))
 	e.reconcile()
-	st := e.check("hpc-a")
-	if st.State != kueue.CheckStateRejected || st.Message != "the job cancelled: rank 0 missing from the site's status for 10m0s; giving up after 0 retries" {
-		t.Errorf("check = %s %q, want Rejected", st.State, st.Message)
-	}
-	if c := jobCondition(e.job(), batchv1.JobFailed); c == nil || c.Reason != ReasonRejected {
-		t.Errorf("owner Failed = %+v", c)
+	const want = "the job cancelled: rank 0 missing from the site's status for 10m0s; giving up after 0 retries"
+	if st := e.check("hpc-a"); st.State != kueue.CheckStateReady || st.Message != want || e.failed() != want {
+		t.Errorf("check = %s %q, failed %q, want Ready and failed", st.State, st.Message, e.failed())
 	}
 }
 
@@ -590,6 +642,39 @@ func TestFinishedWorkloadKeepsTheRequest(t *testing.T) {
 	}
 }
 
+// A Workload that finished while its job runs, a RayJob KubeRay completed or a
+// pod group whose pods a user deleted, cancels the job: its request is deleted.
+// One whose job was cancelled at the site keeps it, as one that finished.
+func TestFinishedWorkloadCancelsItsJob(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		report  func(e *env) func(st *v1alpha1.OffloadRequestStatus)
+		deleted bool
+	}{
+		{"running", func(e *env) func(*v1alpha1.OffloadRequestStatus) { return e.startedAt(e.now) }, true},
+		{"queued", func(e *env) func(*v1alpha1.OffloadRequestStatus) { return e.queued("123", "", "") }, true},
+		{"cancelled at the site", func(e *env) func(*v1alpha1.OffloadRequestStatus) { return e.evicted("scancel") }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.submitted()
+			e.report(1, tc.report(e))
+			e.mutateWorkload(func(wl *kueue.Workload) {
+				wl.Status.Conditions = append(wl.Status.Conditions, metav1.Condition{
+					Type: kueue.WorkloadFinished, Status: metav1.ConditionTrue, Reason: "Succeeded", LastTransitionTime: metav1.Now()})
+			})
+			writes := len(e.checks.writes)
+			e.reconcile()
+			if deleted := !e.request(1).DeletionTimestamp.IsZero(); deleted != tc.deleted {
+				t.Errorf("request deleted %v, want %v", deleted, tc.deleted)
+			}
+			if len(e.checks.writes) != writes {
+				t.Errorf("check written on a finished Workload")
+			}
+		})
+	}
+}
+
 // Garbage collection deletes the requests of a deleted Workload; the attempt
 // finalizer goes with the Workload, also from the requests of an earlier
 // Workload of the same name.
@@ -641,7 +726,7 @@ func TestNonJobOwnerRejected(t *testing.T) {
 	}
 }
 
-func TestClusterQueueWithoutAccountRejects(t *testing.T) {
+func TestClusterQueueWithoutAccountFails(t *testing.T) {
 	e := newEnv(t, func(objs *[]client.Object, _ *interceptor.Funcs) {
 		for _, o := range *objs {
 			if cq, ok := o.(*kueue.ClusterQueue); ok {
@@ -651,8 +736,8 @@ func TestClusterQueueWithoutAccountRejects(t *testing.T) {
 	})
 	e.reconcile()
 	want := "ClusterQueue hpc-a-proj42 has no label hpc.interlink.eu/account naming the account to charge"
-	if st := e.check("hpc-a"); st.State != kueue.CheckStateRejected || st.Message != want {
-		t.Errorf("check = %s %q, want Rejected %q", st.State, st.Message, want)
+	if st := e.check("hpc-a"); st.State != kueue.CheckStateReady || st.Message != want || e.failed() != want {
+		t.Errorf("check = %s %q, failed %q, want Ready and failed with %q", st.State, st.Message, e.failed(), want)
 	}
 	if len(e.requests()) != 0 {
 		t.Errorf("a request without an account")
@@ -719,7 +804,7 @@ func TestChecksWithSeparateParameters(t *testing.T) {
 	if b.Spec.Site != "hpc-b" || b.Spec.AdmissionCheck != "hpc-b" || b.Spec.PodSets[0].Annotations[flagsKey] != "--account=proj42 --clusters=b" {
 		t.Errorf("hpc-b request: site %s check %s flags %q", b.Spec.Site, b.Spec.AdmissionCheck, b.Spec.PodSets[0].Annotations[flagsKey])
 	}
-	// The executor of hpc-b refuses; only that check is Rejected.
+	// The executor of hpc-b refuses: the Workload fails through that check.
 	b.Status.Conditions = []metav1.Condition{{Type: v1alpha1.OffloadRequestAccepted, Status: metav1.ConditionFalse, Reason: "Refused",
 		Message: "account proj42 is not allowed at hpc-b", LastTransitionTime: metav1.NewTime(e.now)}}
 	if err := e.c.Status().Update(context.Background(), b); err != nil {
@@ -728,17 +813,19 @@ func TestChecksWithSeparateParameters(t *testing.T) {
 	e.takes(1)
 	e.report(1, e.queued("123", "", ""))
 	e.reconcile()
-	if st := e.check("hpc-b"); st.State != kueue.CheckStateRejected || st.Message != "account proj42 is not allowed at hpc-b" {
-		t.Errorf("hpc-b check = %s %q", st.State, st.Message)
+	if st := e.check("hpc-b"); st.State != kueue.CheckStateReady || st.Message != "account proj42 is not allowed at hpc-b" ||
+		e.failed() != "account proj42 is not allowed at hpc-b" {
+		t.Errorf("hpc-b check = %s %q, failed %q", st.State, st.Message, e.failed())
 	}
 	if st := e.check("hpc-a"); st.State != kueue.CheckStatePending || st.Message != "job 123 queued" {
 		t.Errorf("hpc-a check = %s %q", st.State, st.Message)
 	}
 }
 
-// The executor refusing a request for good rejects the check and fails the
-// owner, as the site refusing it does.
-func TestRefusalRejects(t *testing.T) {
+// The executor refusing a request for good fails the Workload: annotated, and
+// the check Ready, so that Kueue admits it and the node fails its pods with
+// the message, as a kubelet refusing them. It is never retried.
+func TestRefusalFails(t *testing.T) {
 	const msg = "sbatch: error: Invalid account or account/partition combination specified"
 	e := newEnv(t)
 	e.reconcile()
@@ -748,18 +835,33 @@ func TestRefusalRejects(t *testing.T) {
 	if res := e.reconcile(); res.RequeueAfter != 0 {
 		t.Errorf("requeued after a refusal")
 	}
-	if st := e.check("hpc-a"); st.State != kueue.CheckStateRejected || st.Message != msg {
-		t.Errorf("check = %s %q", st.State, st.Message)
+	if st := e.check("hpc-a"); st.State != kueue.CheckStateReady || st.Message != msg || e.failed() != msg {
+		t.Errorf("check = %s %q, failed %q", st.State, st.Message, e.failed())
 	}
-	if c := jobCondition(e.job(), batchv1.JobFailed); c == nil || c.Status != corev1.ConditionTrue || c.Reason != ReasonRejected {
-		t.Errorf("owner Failed = %+v", c)
+	if e.readyWrites() != 1 || len(e.job().Status.Conditions) != 0 {
+		t.Errorf("%d Ready writes, owner status %+v", e.readyWrites(), e.job().Status)
 	}
 	if !hasEvent(e.drainEvents(), "Warning Rejected sbatch: error") {
 		t.Errorf("no Rejected event")
 	}
+	writes := len(e.checks.writes)
+	e.now = e.now.Add(time.Hour)
 	e.reconcile()
-	if len(e.requests()) != 1 {
-		t.Errorf("a new attempt after Rejected")
+	if len(e.requests()) != 1 || len(e.checks.writes) != writes || len(e.drainEvents()) != 0 {
+		t.Errorf("acted again on a failed Workload: %d requests, %d writes", len(e.requests()), len(e.checks.writes)-writes)
+	}
+}
+
+// A failure is a message as long as a check message may be.
+func TestFailureMessageIsBounded(t *testing.T) {
+	e := newEnv(t)
+	e.reconcile()
+	e.report(1, func(st *v1alpha1.OffloadRequestStatus) {
+		e.condition(st, v1alpha1.OffloadRequestAccepted, metav1.ConditionFalse, "Refused", strings.Repeat("x", 40000))
+	})
+	e.reconcile()
+	if n := len(e.failed()); n != 32768 {
+		t.Errorf("%s of %d bytes, want 32768", v1alpha1.FailedAnnotation, n)
 	}
 }
 
@@ -859,7 +961,7 @@ func TestQueuedPastMaxQueueTimeRetries(t *testing.T) {
 	e.now = e.now.Add(2 * time.Hour)
 	e.report(1, e.running("node07", nil))
 	e.reconcile()
-	if st := e.check("hpc-a"); st.State != kueue.CheckStatePending {
+	if st := e.check("hpc-a"); st.State != kueue.CheckStateReady {
 		t.Errorf("running job retried: %s %q", st.State, st.Message)
 	}
 }
@@ -890,46 +992,6 @@ func TestLastTransitionTimeOnlyOnStateChange(t *testing.T) {
 	e.reconcile()
 	if st := e.check("hpc-a"); !st.LastTransitionTime.Time.Equal(e.now) {
 		t.Errorf("transition time %v after state change, want %v", st.LastTransitionTime, e.now)
-	}
-}
-
-func TestOwnerPatchFallsBackWithoutInterimConditions(t *testing.T) {
-	var refused int
-	e := newEnv(t, func(_ *[]client.Object, f *interceptor.Funcs) {
-		f.SubResourcePatch = func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
-			if _, ok := obj.(*batchv1.Job); ok {
-				data, _ := patch.Data(obj)
-				if strings.Contains(string(data), string(batchv1.JobSuccessCriteriaMet)) {
-					refused++
-					return apierrors.NewInvalid(schema.GroupKind{Group: "batch", Kind: "Job"}, "train",
-						field.ErrorList{field.Invalid(field.NewPath("status", "conditions"), "SuccessCriteriaMet", "not allowed")})
-				}
-			}
-			return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
-		}
-	})
-	e.submitted()
-	e.report(1, e.finished(true, ""))
-	e.reconcile()
-	j := e.job()
-	if refused != 1 {
-		t.Errorf("first patch with SuccessCriteriaMet tried %d times, want 1", refused)
-	}
-	if c := jobCondition(j, batchv1.JobComplete); c == nil || c.Status != corev1.ConditionTrue {
-		t.Errorf("Complete not set after fallback")
-	}
-	if jobCondition(j, batchv1.JobSuccessCriteriaMet) != nil {
-		t.Errorf("SuccessCriteriaMet present after fallback")
-	}
-}
-
-func TestOwnerPatchCarriesInterimConditions(t *testing.T) {
-	e := newEnv(t)
-	e.submitted()
-	e.report(1, e.finished(false, ""))
-	e.reconcile()
-	if ft := jobCondition(e.job(), batchv1.JobFailureTarget); ft == nil || ft.Status != corev1.ConditionTrue {
-		t.Errorf("FailureTarget = %+v", ft)
 	}
 }
 
@@ -976,8 +1038,8 @@ func TestPodSetsShareOneFlavor(t *testing.T) {
 		t.Fatalf("requests %v, want none", e.requests())
 	}
 	want := "podSet launcher was admitted on hpc-a-cpu and podSet worker on hpc-a-gpu: the Workload runs in one allocation, so pin one queue on every PodSet"
-	if st := e.check("hpc-a"); st.State != kueue.CheckStateRejected || st.Message != want {
-		t.Errorf("check = %s %q, want Rejected %q", st.State, st.Message, want)
+	if st := e.check("hpc-a"); st.State != kueue.CheckStateReady || st.Message != want || e.failed() != want {
+		t.Errorf("check = %s %q, failed %q, want Ready and failed with %q", st.State, st.Message, e.failed(), want)
 	}
 }
 
@@ -1005,7 +1067,8 @@ func TestFlavorAnnotationsTakeTheWallTime(t *testing.T) {
 		want    string
 	}{
 		{nil, "--account=proj42 --partition=gpu --qos=debug --time=30"},
-		{ptr.To[int32](3601), "--account=proj42 --partition=gpu --qos=debug --time=61"},
+		// 3601 s is 61 minutes, and a minute more: Kueue deactivates at its own limit first
+		{ptr.To[int32](3601), "--account=proj42 --partition=gpu --qos=debug --time=62"},
 	} {
 		e := newEnv(t, func(objs *[]client.Object, _ *interceptor.Funcs) {
 			for _, o := range *objs {
@@ -1040,8 +1103,8 @@ func TestUnlistedFlavorRejected(t *testing.T) {
 	if len(e.requests()) != 0 {
 		t.Fatalf("requests %v, want none", e.requests())
 	}
-	if st := e.check("hpc-a"); st.State != kueue.CheckStateRejected || !strings.Contains(st.Message, "none of the admitted flavors default is listed") {
-		t.Errorf("check = %s %q", st.State, st.Message)
+	if st := e.check("hpc-a"); st.State != kueue.CheckStateReady || !strings.Contains(e.failed(), "none of the admitted flavors default is listed") {
+		t.Errorf("check = %s %q, failed %q", st.State, st.Message, e.failed())
 	}
 }
 

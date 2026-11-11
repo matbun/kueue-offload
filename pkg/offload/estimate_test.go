@@ -137,7 +137,7 @@ func TestDeferralReactivates(t *testing.T) {
 		{"pod group", []envOption{podOwned(2)}},
 		{"JobSet", []envOption{customOwned(jobSetKind)}},
 		{"TrainJob", []envOption{customOwned(trainJobKind)}},
-		{"RayJob", []envOption{rayJob, rayStatus}},
+		{"RayJob", []envOption{rayJob}},
 		{"RayCluster", []envOption{rayOwned(rayClusterKind, 1, nil)}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -359,7 +359,7 @@ func TestDeferralsCountedAcrossAttempts(t *testing.T) {
 	e.report(4, e.queued("126", "", ""))
 	e.report(4, e.evicted("scancel by an operator"))
 	e.reconcile()
-	if st := e.check("hpc-a"); st.State != kueue.CheckStateRejected || !strings.Contains(st.Message, "giving up after 1 retries") {
-		t.Fatalf("attempt 4: check %s %q, want Rejected after 1 retry", st.State, st.Message)
+	if st := e.check("hpc-a"); st.State != kueue.CheckStateReady || !strings.Contains(e.failed(), "giving up after 1 retries") {
+		t.Fatalf("attempt 4: check %s %q, failed %q, want the Workload failed after 1 retry", st.State, st.Message, e.failed())
 	}
 }

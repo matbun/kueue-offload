@@ -89,7 +89,7 @@ func TestReverseTunnel(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if names := containerNames(dep); names != "ssh-reverse,job-logs" {
+	if names := containerNames(dep); names != "ssh-reverse" {
 		t.Fatalf("shadow containers %s", names)
 	}
 	env := envOf(dep.Spec.Template.Spec.Containers[0])
@@ -156,7 +156,6 @@ func TestReverseRefusals(t *testing.T) {
 }
 
 func TestValidateConfigChecksReverse(t *testing.T) {
-	t.Setenv(shadow.ExecutorImageEnv, "")
 	base := func() Config {
 		c := testConfig("http://localhost:3000")
 		c.Shadow = shadowBlock()

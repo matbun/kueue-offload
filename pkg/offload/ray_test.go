@@ -1,16 +1,9 @@
 package offload
 
 import (
-	"context"
-	"encoding/json"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"reflect"
 	"slices"
-	"strings"
 	"testing"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -68,17 +61,6 @@ func rayOwned(k ownerKind, workers int32, owner func(u *unstructured.Unstructure
 	}
 }
 
-// rayStatus sends the RayJob status patches to the object: KubeRay's CRD has a
-// status subresource, which the fake client knows only for registered types.
-func rayStatus(_ *[]client.Object, funcs *interceptor.Funcs) {
-	funcs.SubResourcePatch = func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
-		if u, ok := obj.(*unstructured.Unstructured); ok && sub == "status" && u.GetKind() == rayJobKind.gvk.Kind {
-			return c.Patch(ctx, obj, patch)
-		}
-		return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
-	}
-}
-
 func rayWorkload(k ownerKind, workers int32, submitter bool) *kueue.Workload {
 	wl := workload()
 	wl.OwnerReferences = []metav1.OwnerReference{{APIVersion: k.gvk.GroupVersion().String(), Kind: k.gvk.Kind,
@@ -104,8 +86,9 @@ func portNumbers(c corev1.Container) []int32 {
 }
 
 // TestRayJobPodSets: the submitter, admitted on another flavor, does not run;
-// head and workers name the ray-job launcher, and the head keeps its own ports
-// and labels.
+// head and workers name the ray launcher, and the head declares the dashboard
+// and client ports once, as a RayCluster's: KubeRay reaches it through the
+// shadow.
 func TestRayJobPodSets(t *testing.T) {
 	wl := rayWorkload(rayJobKind, 2, true)
 	wl.Spec.PodSets[0].Template.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "dash", ContainerPort: 8265}}
@@ -117,49 +100,40 @@ func TestRayJobPodSets(t *testing.T) {
 		t.Fatalf("podSets %v, want head and gpu", got)
 	}
 	for _, ps := range podSets {
-		if got := ps.Template.Annotations[launcherAnnotation]; got != RayJobLauncher {
+		if got := ps.Template.Annotations[launcherAnnotation]; got != RayClusterLauncher {
 			t.Errorf("podSet %s launcher %q", ps.Name, got)
 		}
 		if got := ps.Annotations[flagsKey]; got != "--account=proj42 --partition=gpu" {
 			t.Errorf("podSet %s flags %q", ps.Name, got)
 		}
+		if ps.Template.Labels != nil {
+			t.Errorf("podSet %s labels %v", ps.Name, ps.Template.Labels)
+		}
 	}
-	if got := portNumbers(podSets[0].Template.Spec.Containers[0]); !slices.Equal(got, []int32{8265}) {
-		t.Errorf("head ports %v, want the template's", got)
+	if got := portNumbers(podSets[0].Template.Spec.Containers[0]); !slices.Equal(got, []int32{8265, 10001}) {
+		t.Errorf("head ports %v", got)
 	}
 	if len(podSets[1].Template.Spec.Containers[0].Ports) != 0 {
 		t.Errorf("worker ports %v", podSets[1].Template.Spec.Containers[0].Ports)
-	}
-	if _, ok := podSets[0].Template.Labels["ray.io/cluster"]; ok {
-		t.Errorf("a RayJob's head got cluster labels: %v", podSets[0].Template.Labels)
 	}
 	if len(wl.Spec.PodSets) != 3 || wl.Spec.PodSets[0].Template.Annotations[launcherAnnotation] != "" {
 		t.Errorf("the Workload was changed")
 	}
 }
 
-// TestRayClusterPodSets: the head carries KubeRay's head pod labels, the
-// template's own winning except on the cluster, node type and group, and
-// declares the dashboard and client ports once; every PodSet names the ray
+// TestRayClusterPodSets: the head keeps its labels, KubeRay's pod has its own,
+// and declares the dashboard and client ports once; every PodSet names the ray
 // launcher, unless its template names another.
 func TestRayClusterPodSets(t *testing.T) {
 	wl := rayWorkload(rayClusterKind, 1, false)
-	wl.Spec.PodSets[0].Template.Spec.Containers[0].Ports = []corev1.ContainerPort{{Name: "dash", ContainerPort: 8265}}
-	wl.Spec.PodSets[0].Template.Labels = map[string]string{"app.kubernetes.io/name": "mine", "ray.io/node-type": "worker", "team": "ml"}
+	wl.Spec.PodSets[0].Template.Labels = map[string]string{"team": "ml"}
 	wl.Spec.PodSets[1].Template.Annotations[launcherAnnotation] = "ray-ib"
 	podSets, err := buildPodSets(wl, resolveSite(offloadConfig()), "proj42", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]string{
-		"ray.io/is-ray-node": "yes", "ray.io/cluster": "train", "ray.io/node-type": "head", "ray.io/group": "headgroup",
-		"ray.io/identifier": "train-head", "app.kubernetes.io/name": "mine", "app.kubernetes.io/created-by": "kuberay-operator", "team": "ml",
-	}
-	if got := podSets[0].Template.Labels; !reflect.DeepEqual(got, want) {
-		t.Errorf("head labels %v, want %v", got, want)
-	}
-	if podSets[1].Template.Labels != nil {
-		t.Errorf("worker labels %v", podSets[1].Template.Labels)
+	if got := podSets[0].Template.Labels; !reflect.DeepEqual(got, map[string]string{"team": "ml"}) {
+		t.Errorf("head labels %v, want the template's", got)
 	}
 	if got := podSets[0].Template.Annotations[launcherAnnotation]; got != RayClusterLauncher {
 		t.Errorf("head launcher %q", got)
@@ -169,20 +143,6 @@ func TestRayClusterPodSets(t *testing.T) {
 	}
 	if got := portNumbers(podSets[0].Template.Spec.Containers[0]); !slices.Equal(got, []int32{8265, 10001}) {
 		t.Errorf("head ports %v", got)
-	}
-}
-
-func TestKubeRayLabelValue(t *testing.T) {
-	long := strings.Repeat("a", 60) + "-head"
-	if got := kubeRayLabelValue(long); got != long[2:] {
-		t.Errorf("%q, want the last 63 characters", got)
-	}
-	cut := "abc-" + strings.Repeat("c", 57) + "-head"
-	if got := kubeRayLabelValue(cut); got != "r"+cut[4:] {
-		t.Errorf("%q, want the leading hyphen replaced", got)
-	}
-	if got := kubeRayLabelValue("train-head"); got != "train-head" {
-		t.Errorf("%q", got)
 	}
 }
 
@@ -209,12 +169,7 @@ func TestRayHeadAlone(t *testing.T) {
 				if got := podSets[0].Template.Annotations[launcherAnnotation]; got == "" {
 					t.Errorf("the head names no launcher")
 				}
-				got, admitted, err := RequestPodSets(wl, func(*metav1.OwnerReference) (metav1.Object, error) {
-					return rayJobObject(map[string]any{"entrypoint": "python train.py"}), nil
-				})
-				if err != nil {
-					t.Fatal(err)
-				}
+				got, admitted := RequestPodSets(wl)
 				if len(got) != 1 || len(admitted) != 1 || got[0].Name != rayHeadPodSet || admitted[0].Name != rayHeadPodSet {
 					t.Errorf("the executor checks against %d PodSets and %d assignments, want the head's", len(got), len(admitted))
 				}
@@ -223,277 +178,80 @@ func TestRayHeadAlone(t *testing.T) {
 	}
 }
 
-func rayJobObject(spec map[string]any) *unstructured.Unstructured {
-	u := newUnstructured(rayJobKind)
-	u.SetName("train")
-	u.Object["spec"] = spec
-	return u
-}
-
-// TestOwnerPodSets: every PodSet's first container submits a RayJob's
-// entrypoint to the head's job server, with what the RayJob asks of it.
-func TestOwnerPodSets(t *testing.T) {
-	wl := rayWorkload(rayJobKind, 1, true)
-	wl.Spec.PodSets[1].Template.Spec.Containers[0].Args = []string{"--old"}
-	podSets, err := buildPodSets(wl, resolveSite(offloadConfig()), "proj42", nil)
-	if err != nil {
-		t.Fatal(err)
+// The podSetUpdates of a RayJob leave out the submitter, which runs in the
+// cluster with the default scheduler.
+func TestRayJobPodSetUpdates(t *testing.T) {
+	var got []string
+	for _, u := range podSetUpdates(rayWorkload(rayJobKind, 2, true), testNode) {
+		got = append(got, string(u.Name))
 	}
-	podSets[0].Template.Spec.Containers = append(podSets[0].Template.Spec.Containers, corev1.Container{Name: "sidecar"})
-	owner := rayJobObject(map[string]any{
-		"entrypoint":          "python /data/train.py --epochs 2 && echo $(hostname) $$",
-		"runtimeEnvYAML":      "env_vars:\n  RAY_DEDUP_LOGS: \"0\"\nconda: torch\nconfig: {setup_timeout_seconds: 600}\n",
-		"metadata":            map[string]any{"team": "ml"},
-		"jobId":               "train-1",
-		"entrypointNumCpus":   int64(2),
-		"entrypointNumGpus":   0.5,
-		"entrypointResources": `{"head": 1}`,
-	})
-	if err := ownerPodSets(owner, podSets); err != nil {
-		t.Fatal(err)
-	}
-	want := map[string]any{
-		"entrypoint":           "python /data/train.py --epochs 2 && echo $(hostname) $$",
-		"runtime_env":          map[string]any{"env_vars": map[string]any{"RAY_DEDUP_LOGS": "0"}, "conda": "torch", "config": map[string]any{"setup_timeout_seconds": 600.0}},
-		"metadata":             map[string]any{"team": "ml"},
-		"submission_id":        "train-1",
-		"entrypoint_num_cpus":  2.0,
-		"entrypoint_num_gpus":  0.5,
-		"entrypoint_resources": map[string]any{"head": 1.0},
-	}
-	for _, ps := range podSets {
-		c := ps.Template.Spec.Containers[0]
-		// The $(VAR) expansion of a container's command.
-		command := slices.Clone(c.Command)
-		for i := range command {
-			command[i] = strings.ReplaceAll(command[i], "$$", "$")
-		}
-		if len(command) != 6 || !slices.Equal(command[:5], []string{"bash", "-lc", `exec python -c "$1" "$2"`, "ray-job-submitter", rayJobSubmitter}) || c.Args != nil {
-			t.Fatalf("podSet %s command %q args %v", ps.Name, c.Command, c.Args)
-		}
-		var got map[string]any
-		if err := json.Unmarshal([]byte(command[5]), &got); err != nil || !reflect.DeepEqual(got, want) {
-			t.Errorf("podSet %s submits %v (%v), want %v", ps.Name, got, err, want)
-		}
-	}
-	if side := podSets[0].Template.Spec.Containers[1]; side.Command != nil {
-		t.Errorf("sidecar command %v", side.Command)
-	}
-
-	if err := ownerPodSets(ownerJob(), podSets); err != nil {
-		t.Errorf("a Job: %v", err)
-	}
-	cluster := newUnstructured(rayClusterKind)
-	if err := ownerPodSets(cluster, podSets); err != nil {
-		t.Errorf("a RayCluster: %v", err)
+	if !slices.Equal(got, []string{"head", "gpu"}) {
+		t.Errorf("podSetUpdates for %v, want head and gpu", got)
 	}
 }
 
-// TestRayJobSubmitter runs a RayJob's command against a Ray job client that
-// prints what it is asked: the job is submitted as it is, its logs are
-// printed, and the command fails when the job did.
-func TestRayJobSubmitter(t *testing.T) {
-	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("no python3")
-	}
-	dir := t.TempDir()
-	files := map[string]string{
-		"bin/python":      "#!/bin/sh\nexec python3 \"$@\"\n",
-		"ray/__init__.py": "",
-		"ray/job_submission.py": `import enum, json, os, time
-
-# The job is RUNNING once: no wait between two polls.
-time.sleep = lambda seconds: None
-
-
-class JobStatus(str, enum.Enum):
-    RUNNING = "RUNNING"
-    SUCCEEDED = "SUCCEEDED"
-    FAILED = "FAILED"
-
-    def is_terminal(self):
-        return self != JobStatus.RUNNING
-
-
-class JobSubmissionClient:
-    statuses = ["RUNNING"] + [os.environ["FAKE_STATUS"]]
-
-    def submit_job(self, **kwargs):
-        print(json.dumps(kwargs, sort_keys=True))
-        return "raysubmit_1"
-
-    async def tail_job_logs(self, job):
-        yield "driver output\n"
-
-    def get_job_status(self, job):
-        return JobStatus(self.statuses.pop(0))
-`,
-	}
-	for name, body := range files {
-		path := filepath.Join(dir, name)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	podSets := []v1alpha1.PodSet{{Name: "head", Count: 1, Template: podTemplate()}}
-	owner := rayJobObject(map[string]any{"entrypoint": `python -c "print('it''s $HOME')" && echo $$`})
-	if err := ownerPodSets(owner, podSets); err != nil {
-		t.Fatal(err)
-	}
-	command := slices.Clone(podSets[0].Template.Spec.Containers[0].Command)
-	for i := range command {
-		command[i] = strings.ReplaceAll(command[i], "$$", "$")
-	}
-	// -c: the test host's login profile is not the image's.
-	command[1] = "-c"
-	for _, tc := range []struct {
-		status string
-		fails  bool
-	}{{"SUCCEEDED", false}, {"FAILED", true}} {
-		cmd := exec.Command(command[0], command[1:]...)
-		cmd.Env = []string{"PATH=" + filepath.Join(dir, "bin") + ":/usr/bin:/bin", "PYTHONPATH=" + dir, "FAKE_STATUS=" + tc.status}
-		var stderr strings.Builder
-		cmd.Stderr = &stderr
-		out, err := cmd.Output()
-		if (err != nil) != tc.fails {
-			t.Logf("stderr %s", stderr.String())
-			t.Errorf("%s: err %v, out %s", tc.status, err, out)
-		}
-		want := `{"entrypoint": "python -c \"print('it''s $HOME')\" && echo $$"}` + "\ndriver output\nRay job raysubmit_1 " + tc.status + "\n"
-		if string(out) != want {
-			t.Errorf("%s: out\n%s\nwant\n%s", tc.status, out, want)
-		}
-	}
-}
-
-func TestOwnerPodSetsRefused(t *testing.T) {
-	cases := []struct {
-		name string
-		spec map[string]any
-		want string
-	}{
-		{"no entrypoint", map[string]any{"submissionMode": "InteractiveMode"}, "no spec.entrypoint"},
-		{"not yaml", map[string]any{"entrypoint": "python x.py", "runtimeEnvYAML": "env_vars: ["}, "spec.runtimeEnvYAML"},
-		{"not a map", map[string]any{"entrypoint": "python x.py", "runtimeEnvYAML": "- pip"}, "spec.runtimeEnvYAML"},
-		{"resources", map[string]any{"entrypoint": "python x.py", "entrypointResources": "head"}, "spec.entrypointResources"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			podSets := []v1alpha1.PodSet{{Name: "head", Count: 1, Template: podTemplate()}}
-			err := ownerPodSets(rayJobObject(tc.spec), podSets)
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Errorf("err %v, want %q", err, tc.want)
-			}
+// TestRayOwnerRunEnds: a Ray owner's Workload is deactivated when its job ends
+// at the site: KubeRay would run on an allocation that is gone. One admitted
+// keeps its check Ready, one never admitted Pending. A refused one is
+// Rejected and left to Kueue, which deactivates it: KubeRay would make a failed
+// head again.
+func TestRayOwnerRunEnds(t *testing.T) {
+	for _, k := range []ownerKind{rayJobKind, rayClusterKind} {
+		owner := rayOwned(k, 1, func(u *unstructured.Unstructured) {
+			u.Object["spec"] = map[string]any{"suspend": true, "entrypoint": "python x.py"}
 		})
-	}
-}
-
-// TestRayJobFinished: the RayJob gets the status KubeRay gives a job that
-// ended, which Kueue's integration finishes the Workload on; it stays
-// suspended and is not patched again.
-func TestRayJobFinished(t *testing.T) {
-	cases := []struct {
-		name                    string
-		finish                  func(e *env)
-		deployment, job, reason string
-		message                 string
-	}{
-		{"completed", func(e *env) { e.report(1, e.finished(true, "")) }, "Complete", "SUCCEEDED", "", "job 123 completed"},
-		{"failed", func(e *env) { e.report(1, e.finished(false, "rank 1 exited 3")) }, "Failed", "FAILED", "AppFailed", "job 123 failed: rank 1 exited 3"},
-		{"rejected", func(e *env) {
+		for _, admitted := range []bool{true, false} {
+			t.Run(k.gvk.Kind, func(t *testing.T) {
+				e := newEnv(t, owner)
+				e.submitted()
+				if got := podSetNames(e.request(1).Spec.PodSets); !slices.Equal(got, []string{"head", "gpu"}) {
+					t.Errorf("request podSets %v", got)
+				}
+				want := kueue.CheckStatePending
+				if admitted {
+					e.report(1, e.startedAt(e.now))
+					e.reconcile()
+					want = kueue.CheckStateReady
+				}
+				e.report(1, e.finished(false, "DUE TO TIME LIMIT"))
+				e.reconcile()
+				if st := e.check("hpc-a"); st.State != want || st.Message != "job 123 failed: DUE TO TIME LIMIT" {
+					t.Errorf("check %s %q, want %s", st.State, st.Message, want)
+				}
+				if wl := e.workload(); ptr.Deref(wl.Spec.Active, true) {
+					t.Errorf("Workload still active after its job ended")
+				}
+				if _, ok := e.custom(k).Object["status"]; ok {
+					t.Errorf("owner status written")
+				}
+			})
+		}
+		t.Run(k.gvk.Kind+" refused", func(t *testing.T) {
+			e := newEnv(t, owner)
+			e.reconcile()
 			e.report(1, func(st *v1alpha1.OffloadRequestStatus) {
 				e.condition(st, v1alpha1.OffloadRequestAccepted, metav1.ConditionFalse, "Refused", "invalid account")
 			})
-		}, "Failed", "FAILED", "SubmissionFailed", "invalid account"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			e := newEnv(t, rayOwned(rayJobKind, 1, func(u *unstructured.Unstructured) {
-				u.Object["spec"] = map[string]any{"suspend": true, "entrypoint": "python x.py"}
-				u.Object["status"] = map[string]any{"jobDeploymentStatus": "Suspended"}
-			}), rayStatus)
-			e.submitted()
-			if got := podSetNames(e.request(1).Spec.PodSets); !slices.Equal(got, []string{"head", "gpu"}) {
-				t.Errorf("request podSets %v", got)
-			}
-			tc.finish(e)
 			e.reconcile()
-			u := e.custom(rayJobKind)
-			st, _, _ := unstructured.NestedStringMap(u.Object, "status")
-			if st["jobDeploymentStatus"] != tc.deployment || st["jobStatus"] != tc.job || st["reason"] != tc.reason || st["message"] != tc.message ||
-				st["endTime"] != "2026-10-29T10:00:00Z" {
-				t.Errorf("status %v, want %s %s %q %q", st, tc.deployment, tc.job, tc.reason, tc.message)
+			if st := e.check("hpc-a"); st.State != kueue.CheckStateRejected || st.Message != "invalid account" {
+				t.Errorf("check %s %q, want Rejected", st.State, st.Message)
 			}
-			if suspend, _, _ := unstructured.NestedBool(u.Object, "spec", "suspend"); !suspend {
-				t.Errorf("the RayJob was resumed")
-			}
-			rv := u.GetResourceVersion()
-			e.now = e.now.Add(time.Minute)
-			e.reconcile()
-			if u := e.custom(rayJobKind); u.GetResourceVersion() != rv {
-				t.Errorf("a terminal RayJob was patched again")
+			if wl := e.workload(); !ptr.Deref(wl.Spec.Active, true) || e.failed() != "" {
+				t.Errorf("a rejected Ray owner's Workload deactivated %v or failed %q by the offload controller", !ptr.Deref(wl.Spec.Active, true), e.failed())
 			}
 		})
-	}
-}
-
-// TestRayClusterRunEnds: a RayCluster's Workload is deactivated when its job
-// ends; a rejected one is left to Kueue, which deactivates it on the check.
-func TestRayClusterRunEnds(t *testing.T) {
-	e := newEnv(t, rayOwned(rayClusterKind, 1, nil))
-	e.submitted()
-	e.report(1, e.finished(false, "DUE TO TIME LIMIT"))
-	e.reconcile()
-	if wl := e.workload(); ptr.Deref(wl.Spec.Active, true) {
-		t.Errorf("Workload still active after its job ended")
-	}
-	if conds, _, _ := unstructured.NestedSlice(e.custom(rayClusterKind).Object, "status", "conditions"); len(conds) != 0 {
-		t.Errorf("RayCluster patched: %v", conds)
-	}
-
-	e = newEnv(t, rayOwned(rayClusterKind, 1, nil))
-	e.reconcile()
-	e.report(1, func(st *v1alpha1.OffloadRequestStatus) {
-		e.condition(st, v1alpha1.OffloadRequestAccepted, metav1.ConditionFalse, "Refused", "invalid account")
-	})
-	e.reconcile()
-	if st := e.check("hpc-a"); st.State != kueue.CheckStateRejected {
-		t.Errorf("check %s", st.State)
-	}
-	if wl := e.workload(); !ptr.Deref(wl.Spec.Active, true) {
-		t.Errorf("a rejected RayCluster's Workload deactivated by the offload controller")
 	}
 }
 
 // TestRequestPodSets: what the executor checks a request against is what the
 // controller sends, for every owner kind: names, counts and templates.
 func TestRequestPodSets(t *testing.T) {
-	rayJob := rayJobObject(map[string]any{"entrypoint": "python train.py"})
 	for _, wl := range []*kueue.Workload{workload(), rayWorkload(rayClusterKind, 2, false), rayWorkload(rayJobKind, 1, true)} {
-		// the owner the controller reads: the RayJob, or the Workload's other owner
-		var owner metav1.Object = ownerJob()
-		if c := metav1.GetControllerOf(wl); c != nil && c.Kind == rayJobKind.gvk.Kind {
-			owner = rayJob
-		}
 		sent, err := buildPodSets(wl, resolveSite(offloadConfig()), "proj42", nil)
-		if err == nil {
-			err = ownerPodSets(owner, sent)
-		}
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, admitted, err := RequestPodSets(wl, func(c *metav1.OwnerReference) (metav1.Object, error) {
-			if c.Kind != rayJobKind.gvk.Kind {
-				t.Fatalf("%s read", c.Kind)
-			}
-			return rayJob, nil
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		got, admitted := RequestPodSets(wl)
 		if len(got) != len(sent) || len(admitted) != len(sent) {
 			t.Fatalf("%d PodSets and %d assignments, the controller sends %d", len(got), len(admitted), len(sent))
 		}

@@ -278,6 +278,13 @@ func (in *OffloadConfigSpec) DeepCopyInto(out *OffloadConfigSpec) {
 		*out = new(v1.Duration)
 		**out = **in
 	}
+	if in.NodeLabels != nil {
+		in, out := &in.NodeLabels, &out.NodeLabels
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
 	if in.DeferInterval != nil {
 		in, out := &in.DeferInterval, &out.DeferInterval
 		*out = new(v1.Duration)
@@ -403,13 +410,6 @@ func (in *OffloadRequestSpec) DeepCopyInto(out *OffloadRequestSpec) {
 	out.Owner = in.Owner
 	if in.OwnerAnnotations != nil {
 		in, out := &in.OwnerAnnotations, &out.OwnerAnnotations
-		*out = make(map[string]string, len(*in))
-		for key, val := range *in {
-			(*out)[key] = val
-		}
-	}
-	if in.OwnerLabels != nil {
-		in, out := &in.OwnerLabels, &out.OwnerLabels
 		*out = make(map[string]string, len(*in))
 		for key, val := range *in {
 			(*out)[key] = val
@@ -736,6 +736,13 @@ func (in *RankStatus) DeepCopyInto(out *RankStatus) {
 	*out = *in
 	if in.Containers != nil {
 		in, out := &in.Containers, &out.Containers
+		*out = make([]corev1.ContainerStatus, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
+	if in.InitContainers != nil {
+		in, out := &in.InitContainers, &out.InitContainers
 		*out = make([]corev1.ContainerStatus, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])

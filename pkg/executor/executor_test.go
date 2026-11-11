@@ -442,7 +442,10 @@ func TestOwnerAnnotations(t *testing.T) {
 
 func TestSubmitGangIsOnePodGroup(t *testing.T) {
 	e := newExecutorEnv(t)
-	if q := e.submit(testRequest(3)); q.Status.JobID != executorJobID {
+	req := testRequest(3)
+	// The head serves a dashboard, which the shadow forwards.
+	req.Spec.PodSets[0].Template.Spec.Containers[0].Ports = []v1.ContainerPort{{ContainerPort: 8265}}
+	if q := e.submit(req); q.Status.JobID != executorJobID {
 		t.Fatalf("jobID = %q", q.Status.JobID)
 	}
 	pods := e.plugin.createdPods()
@@ -684,7 +687,7 @@ func TestWorkloadCheck(t *testing.T) {
 		{"evicted", func(wl *kueue.Workload) {
 			wl.Status.Conditions = append(wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadEvicted, Status: metav1.ConditionTrue, Reason: "Preempted", LastTransitionTime: metav1.Now()})
 		}, "holds no quota reservation"},
-		{"check in Retry", func(wl *kueue.Workload) { wl.Status.AdmissionChecks[0].State = kueue.CheckStateRetry }, "admission check hpc-a of Workload " + workloadName + " is Retry, not Pending"},
+		{"check in Retry", func(wl *kueue.Workload) { wl.Status.AdmissionChecks[0].State = kueue.CheckStateRetry }, "admission check hpc-a of Workload " + workloadName + " is Retry, not Pending or Ready"},
 	}
 	for _, tt := range waits {
 		t.Run(tt.name, func(t *testing.T) {
@@ -739,6 +742,35 @@ func TestNextAttemptWaitsForTheCancel(t *testing.T) {
 	}
 	if q := e.poll(); q.Status.JobID != executorJobID || len(e.plugin.createdPods()) != 2 {
 		t.Fatalf("second attempt: %s %+v", state(q), q.Status)
+	}
+}
+
+// An attempt the offload controller makes in place, for a pod whose job was
+// lost after its start, finds the check still Ready and the Workload admitted:
+// it is taken as an attempt made with the check Pending.
+func TestInPlaceAttemptIsTaken(t *testing.T) {
+	e := newExecutorEnv(t)
+	first := testRequest(1)
+	e.submit(first)
+	if err := e.remove(); err != nil {
+		t.Fatal(err)
+	}
+	second := attempt(first, 2)
+	wl := workloadOf(second)
+	wl.Status.AdmissionChecks[0].State = kueue.CheckStateReady
+	wl.Status.Conditions = append(wl.Status.Conditions, metav1.Condition{Type: kueue.WorkloadAdmitted, Status: metav1.ConditionTrue, Reason: "Admitted", LastTransitionTime: metav1.Now()})
+	cur := &kueue.Workload{}
+	if err := e.c.Get(context.Background(), client.ObjectKeyFromObject(wl), cur); err != nil {
+		t.Fatal(err)
+	}
+	cur.Status = wl.Status
+	if err := e.c.Status().Update(context.Background(), cur); err != nil {
+		t.Fatal(err)
+	}
+	e.addRequest(second)
+	e.reconcile()
+	if q := e.request(); q.Status.JobID != executorJobID || len(e.plugin.createdPods()) != 2 {
+		t.Fatalf("attempt with the check Ready: %s %+v", state(q), q.Status)
 	}
 }
 
@@ -1051,7 +1083,16 @@ func TestGetLogs(t *testing.T) {
 		e.setLog(i, executorCtn, text)
 	}
 
+	// One rank's log, as the virtual node reads it, once the job runs.
 	rec := e.do(http.MethodGet, "/getLogs?workloadUID="+executorWorkload+"&rank=2")
+	if rec.Code != http.StatusBadRequest || rec.Body.String() != "container main of rank 2 is waiting to start\n" {
+		t.Fatalf("rank 2 before the start = %d %q", rec.Code, rec.Body.String())
+	}
+	for i := range 3 {
+		e.setStatus(i, "node07", runningContainer(executorCtn, time.Now()))
+	}
+	e.poll()
+	rec = e.do(http.MethodGet, "/getLogs?workloadUID="+executorWorkload+"&rank=2")
 	if rec.Code != http.StatusOK || rec.Body.String() != "two a\ntwo b" {
 		t.Fatalf("rank 2 = %d %q", rec.Code, rec.Body.String())
 	}
@@ -1108,7 +1149,8 @@ func TestGetLogsSinglePodHasNoPrefix(t *testing.T) {
 	}
 }
 
-// followLogs reads a followed log through a real server, as the shadow does.
+// followLogs reads a followed log through a real server, as the virtual node
+// does.
 func (e *executorEnv) followLogs(query string) <-chan string {
 	srv := httptest.NewServer(e.mux)
 	e.t.Cleanup(srv.Close)
@@ -1238,18 +1280,31 @@ func TestGetLogsFollowReopensEndedStream(t *testing.T) {
 	}
 }
 
-// With a tail the lines of a new stream cannot be matched to the old one, so a
-// stream that ends while the job runs is broken: the client sees the connection
-// fail and asks again.
+// With a tail or a byte limit the lines of a new stream cannot be matched to
+// the old one, so a stream that ends while the job runs is broken: the client
+// sees the connection fail and asks again.
 func TestGetLogsFollowTailBrokenStream(t *testing.T) {
+	oldReopen := logsReopenDelay
+	logsReopenDelay = 10 * time.Millisecond
+	t.Cleanup(func() { logsReopenDelay = oldReopen })
+
 	e := newExecutorEnv(t)
 	e.submit(testRequest(1))
 	e.setStatus(0, "node07", runningContainer(executorCtn, time.Now()))
 	e.poll()
 	e.setLog(0, executorCtn, "first\n")
 	e.plugin.with(func(p *fakePlugin) { p.ended[memberUID(executorWorkload, 0)] = true })
-	if got := <-e.followLogs("&follow=true&tail=1"); !strings.HasPrefix(got, "error: ") {
-		t.Fatalf("a stream that ended before its container read as complete: %q", got)
+	for _, query := range []string{"&follow=true&tail=1", "&follow=true&limitBytes=64"} {
+		select {
+		case got := <-e.followLogs(query):
+			if !strings.HasPrefix(got, "error: ") {
+				t.Errorf("%s: a stream that ended before its container read as complete: %q", query, got)
+			}
+		case <-time.After(5 * time.Second):
+			end := time.Now()
+			e.setStatus(0, "", terminatedContainer(executorCtn, 0, "Completed", end, end))
+			t.Fatalf("%s: the stream was opened again", query)
+		}
 	}
 }
 
@@ -1310,7 +1365,9 @@ func TestValidateConfig(t *testing.T) {
 		"no accounts":         func(c *Config) { c.Sites[executorSite] = SiteConfig{} },
 		"bad lost timeout":    func(c *Config) { c.Executor.LostTimeout = "soon" },
 		"bad poll interval":   func(c *Config) { c.Executor.PollInterval = "-1s" },
-		"shadow without key":  func(c *Config) { c.Shadow.Enabled = true },
+		"shadow without key": func(c *Config) {
+			c.Shadow.Enabled, c.Shadow.LoginHost, c.Shadow.User = true, "login.hpc-a.example.org", "alice"
+		},
 	}
 	for name, mutate := range bad {
 		c := base()

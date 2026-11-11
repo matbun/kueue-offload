@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,6 +131,24 @@ func startAPIServer(t *testing.T, pluginURL string) string {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// syncBuffer is a bytes.Buffer safe to read while the command writes it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // hasCreatePodGroup reports whether the API server at api has /createPodGroup,

@@ -140,6 +140,17 @@ func TestEstimateShapeSized(t *testing.T) {
 	if got != want {
 		t.Errorf("shape %+v, want %+v", got, want)
 	}
+	// The flavor's own --time is what the job gets, and what it is tested with.
+	withFlags := func(flags string) jobRequest {
+		p := *ps.DeepCopy()
+		p.Annotations = map[string]string{SlurmFlagsAnnotation: flags}
+		return jobRequest{WorkloadUID: executorWorkload, Owner: v1alpha1.OwnerReference{Name: "train"}, PodSets: []v1alpha1.PodSet{p}}
+	}
+	for flags, wantTime := range map[string]string{"--qos=debug --time=2": "", "-t 2 --qos=debug": "", "--qos=debug": "00:01:00", "--qos=debug --time-min=1": "00:01:00"} {
+		if got := estimateShape(withFlags(flags), res, ptr.To[int32](60)); got.Time != wantTime || got.Flags != flags {
+			t.Errorf("flags %q: shape %+v, want time %q", flags, got, wantTime)
+		}
+	}
 	// Without Resources, only <vendor>/gpu resources are GPUs.
 	ps.Template.Spec.Containers[0].Resources = v1.ResourceRequirements{Requests: v1.ResourceList{"amd.com/gpu": resource.MustParse("1"), "example.org/hpc-gpu": resource.MustParse("3")}}
 	req.PodSets = []v1alpha1.PodSet{ps}
@@ -256,7 +267,7 @@ func TestEstimateDeferredIsNotSubmitted(t *testing.T) {
 		t.Fatal(err)
 	}
 	q = e.poll()
-	waitingWith(t, q, "is Retry, not Pending", true)
+	waitingWith(t, q, "is Retry, not Pending or Ready", true)
 	if len(e.plugin.createdPods()) != 0 || len(e.plugin.estimateCalls()) != 1 {
 		t.Fatalf("%d /create and %d /estimate calls after the Retry", len(e.plugin.createdPods()), len(e.plugin.estimateCalls()))
 	}

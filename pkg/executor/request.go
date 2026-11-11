@@ -13,7 +13,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -179,14 +178,14 @@ func (d *Executor) poll(ctx context.Context, q *v1alpha1.OffloadRequest) (ctrl.R
 	return ctrl.Result{RequeueAfter: d.Config.Executor.pollInterval}, nil
 }
 
-// endShadow renders the shadow of an ended job for its end, unless that was
-// done since the executor started.
+// endShadow deletes the shadow of an ended job, unless that was done since the
+// executor started.
 func (d *Executor) endShadow(ctx context.Context, q *v1alpha1.OffloadRequest) {
 	if q.Status.JobID == "" || d.shadowEnded(q.UID) {
 		return
 	}
 	orig := q.DeepCopy()
-	d.syncShadow(ctx, q, jobRequestOf(q), jobState{State: jobCompleted, NodeName: q.Status.NodeName, SocketDir: q.Status.SocketDir})
+	d.syncShadow(ctx, q, jobRequestOf(q), jobState{State: jobCompleted})
 	if err := d.writeStatus(ctx, orig, q, false); err != nil {
 		log.L.Warningf("executor: request %s/%s: recording the shadow: %v", q.Namespace, q.Name, err)
 	}
@@ -228,8 +227,9 @@ func (d *Executor) wasCancelled(uid types.UID) bool {
 // checkWorkload refuses a request the offload controller did not make for the
 // Workload it names, as read from the API server: its controller owner is that
 // Workload by name and UID, and the Workload's PodSets and admission are the
-// request's. A Workload that no longer holds its quota with the request's check
-// Pending makes the request wait: the offload controller deletes it.
+// request's. A Workload that no longer holds its quota, or whose check is
+// neither Pending nor Ready (an attempt made in place keeps it Ready), makes the
+// request wait: the offload controller deletes it.
 func (d *Executor) checkWorkload(ctx context.Context, q *v1alpha1.OffloadRequest) *refusal {
 	ref := q.Spec.Workload
 	owner := metav1.GetControllerOf(q)
@@ -253,26 +253,11 @@ func (d *Executor) checkWorkload(ctx context.Context, q *v1alpha1.OffloadRequest
 	if st == nil {
 		return permanentError("Workload %s has no admission check %s", ref.Name, q.Spec.AdmissionCheck)
 	}
-	if st.State != kueue.CheckStatePending {
-		return transientError("admission check %s of Workload %s is %s, not %s", st.Name, ref.Name, st.State, kueue.CheckStatePending)
+	if st.State != kueue.CheckStatePending && st.State != kueue.CheckStateReady {
+		return transientError("admission check %s of Workload %s is %s, not %s or %s", st.Name, ref.Name, st.State, kueue.CheckStatePending, kueue.CheckStateReady)
 	}
-	// The PodSets as the offload controller prepares them from the Workload, and
-	// from a RayJob owner, read here as well
-	want, admitted, err := offload.RequestPodSets(wl, func(c *metav1.OwnerReference) (metav1.Object, error) {
-		u := &unstructured.Unstructured{}
-		u.SetAPIVersion(c.APIVersion)
-		u.SetKind(c.Kind)
-		if err := d.Reader.Get(ctx, types.NamespacedName{Namespace: wl.Namespace, Name: c.Name}, u); err != nil {
-			return nil, err
-		}
-		if u.GetUID() != c.UID {
-			return nil, fmt.Errorf("%s %s has UID %s, not %s", c.Kind, c.Name, u.GetUID(), c.UID)
-		}
-		return u, nil
-	})
-	if err != nil {
-		return transientError("preparing the PodSets of Workload %s: %v", ref.Name, err)
-	}
+	// The PodSets as the offload controller prepares them from the Workload
+	want, admitted := offload.RequestPodSets(wl)
 	if why := podSetsDiffer(want, admitted, q.Spec.PodSets); why != "" {
 		return permanentError("OffloadRequest %s does not match Workload %s: %s", q.Name, ref.Name, why)
 	}

@@ -62,17 +62,14 @@ workload_of() {
 }
 workload_uid() { kubectl -n "$NS" get workload "$1" -o jsonpath='{.metadata.uid}'; }
 check_field() { kubectl -n "$NS" get workload "$1" -o jsonpath="{.status.admissionChecks[?(@.name==\"hpc-a\")].$2}"; }
-check_is() { [ "$(check_field "$1" state)" = "$2" ]; }
 # request_of names the newest OffloadRequest of a Workload UID.
 request_of() { kubectl -n "$NS" get offloadrequests -o jsonpath="{range .items[?(@.spec.workload.uid==\"$1\")]}{.spec.attempt} {.metadata.name}{\"\\n\"}{end}" | sort -n | tail -1 | cut -d' ' -f2; }
 request_field() { kubectl -n "$NS" get offloadrequest "$(request_of "$1")" -o jsonpath="{.status.$2}"; }
 request_running() { [ "$(request_field "$1" 'conditions[?(@.type=="Admitted")].status')" = True ]; }
-shadow_logs() {
-	local dep
-	dep=$(kubectl -n "$NS" get deploy -l "interlink.eu/shadow-of=$1" -o jsonpath='{.items[0].metadata.name}')
-	[ -n "$dep" ] && kubectl -n "$NS" logs "deploy/$dep" -c job-logs
-}
-shadow_shows() { shadow_logs "$1" | grep -q "$2"; }
+job_logs() { kubectl -n "$NS" logs "job/$1"; }
+job_log_shows() { job_logs "$1" | grep -q "$2"; }
+job_pod() { kubectl -n "$NS" get pods -l "batch.kubernetes.io/job-name=$1" -o jsonpath="{.items[0].$2}"; }
+job_pod_node() { job_pod "$1" spec.nodeName; }
 
 diagnostics() {
 	local d=$WORK/diag
@@ -135,8 +132,8 @@ setup() {
 	log "pool slots: $(pool condor_status -af Name | tr '\n' ' ')"
 }
 
-# single: a single-pod Job succeeds and its output is read with kubectl logs on
-# the shadow.
+# single: a single-pod Job succeeds on the site's virtual node, and its output is
+# read with kubectl logs of the Job.
 case_single() {
 	if ! until_ok "$TIMEOUT" job_ended single; then
 		fail single "Job single did not end in ${TIMEOUT}s"
@@ -146,14 +143,18 @@ case_single() {
 		fail single "Job single failed: $(job_cond single Failed message)"
 		return
 	fi
-	local uid line
-	uid=$(workload_uid "$(workload_of single)")
-	if ! until_ok 120 shadow_shows "$uid" 'hello from rank 0 of 1'; then
-		fail single "Job Complete, but the shadow's job-logs never showed the output: $(shadow_logs "$uid" | tail -3 | tr '\n' '|')"
+	local node line
+	node=$(job_pod_node single)
+	if [ "$node" != kueue-offload-hpc-a ]; then
+		fail single "Job Complete, but its pod ran on node \"$node\", not kueue-offload-hpc-a"
 		return
 	fi
-	line=$(shadow_logs "$uid" | grep -m1 'hello from rank')
-	pass single "Job Complete ($(job_cond single Complete message)); kubectl logs on the shadow, container job-logs: \"$line\""
+	if ! until_ok 120 job_log_shows single 'hello from rank 0 of 1'; then
+		fail single "Job Complete, but kubectl logs never showed the output: $(job_logs single 2>&1 | tail -3 | tr '\n' '|')"
+		return
+	fi
+	line=$(job_logs single | grep -m1 'hello from rank')
+	pass single "Job Complete ($(job_cond single Complete message)) on $node; kubectl logs job/single: \"$line\""
 }
 
 # submit-lines: the flavor's account and wall time reach the submit file and the
@@ -190,35 +191,36 @@ case_indep() {
 }
 
 # gang: two pods that must share one allocation are refused, naming the missing
-# capability, and nothing reaches the plugin.
+# capability: the Job fails through its pods, as from a kubelet's refusal, and
+# nothing reaches the plugin.
 case_gang() {
-	local wl msg dirs
-	if ! until_ok 60 workload_of gang || ! until_ok "$TIMEOUT" check_is "$(workload_of gang)" Rejected; then
-		fail gang "check state \"$(check_field "$(workload_of gang)" state)\": $(check_field "$(workload_of gang)" message)"
+	local msg reason dirs
+	if ! until_ok "$TIMEOUT" job_ended gang; then
+		fail gang "Job gang did not end in ${TIMEOUT}s: check state \"$(check_field "$(workload_of gang)" state)\": $(check_field "$(workload_of gang)" message)"
 		return
 	fi
-	wl=$(workload_of gang)
-	msg=$(check_field "$wl" message)
+	msg=$(job_pod gang status.message)
+	reason=$(job_pod gang status.reason)
 	dirs=$(pool sh -c 'ls -d /utils/.interlink/gang-* 2>/dev/null | wc -l')
-	if [[ "$msg" == *'"pod-group"'* && "$msg" == *offload.interlink.eu/independent-pods* ]] && [ "$dirs" = 0 ]; then
-		pass gang "check Rejected: \"$msg\"; job directories of gang members in the plugin: $dirs"
+	if [ "$(job_cond gang Failed status)" = True ] && [ "$reason" = Rejected ] && [[ "$msg" == *'"pod-group"'* && "$msg" == *offload.interlink.eu/independent-pods* ]] && [ "$dirs" = 0 ]; then
+		pass gang "Job Failed; its pod $reason: \"$msg\"; job directories of gang members in the plugin: $dirs"
 	else
-		fail gang "check Rejected: \"$msg\"; job directories of gang members in the plugin: $dirs"
+		fail gang "Job conditions $(kubectl -n "$NS" get job gang -o jsonpath='{.status.conditions[*].type}'); pod $reason: \"$msg\"; job directories of gang members in the plugin: $dirs"
 	fi
 }
 
-# exit3: a job that exits 3 fails the Job, with the code in the message.
+# exit3: a job that exits 3 fails the Job, with the code in its pod's status.
 case_exit3() {
 	if ! until_ok "$TIMEOUT" job_ended exit3; then
 		fail exit3 "Job exit3 did not end in ${TIMEOUT}s"
 		return
 	fi
-	local msg
-	msg=$(job_cond exit3 Failed message)
-	if [ "$(job_cond exit3 Failed status)" = True ] && [[ "$msg" == *"code 3"* ]]; then
-		pass exit3 "Job Failed: \"$msg\""
+	local code
+	code=$(job_pod exit3 'status.containerStatuses[0].state.terminated.exitCode')
+	if [ "$(job_cond exit3 Failed status)" = True ] && [ "$code" = 3 ]; then
+		pass exit3 "Job Failed ($(job_cond exit3 Failed reason)); container main terminated with exit code $code"
 	else
-		fail exit3 "Job conditions $(kubectl -n "$NS" get job exit3 -o jsonpath='{.status.conditions[*].type}'): \"$msg\""
+		fail exit3 "Job conditions $(kubectl -n "$NS" get job exit3 -o jsonpath='{.status.conditions[*].type}'); exit code \"$code\""
 	fi
 }
 

@@ -20,7 +20,7 @@ generate:
 
 manifests:
 	$(CONTROLLER_GEN) crd:generateEmbeddedObjectMeta=true paths=./api/... output:crd:artifacts:config=config/crd/bases
-	$(CONTROLLER_GEN) rbac:roleName=kueue-offload paths=./pkg/offload/... output:rbac:artifacts:config=config/rbac
+	$(CONTROLLER_GEN) rbac:roleName=kueue-offload paths="./pkg/offload/...;./pkg/node/..." output:rbac:artifacts:config=config/rbac
 	$(CONTROLLER_GEN) rbac:roleName=kueue-offload-membership paths=./pkg/membership/... output:rbac:artifacts:config=config/rbac/membership
 
 docker-build:

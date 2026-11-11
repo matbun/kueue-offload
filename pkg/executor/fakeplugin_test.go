@@ -45,8 +45,9 @@ type fakePlugin struct {
 	phases   map[string]v1.PodPhase
 	statuses int
 	// logs is each container's log, by "<pod UID>/<container>". A followed log
-	// ends once its pod is in ended.
+	// ends once its pod is in ended. logOpts holds the options of every /getLogs.
 	logs    map[string]string
+	logOpts []commonIL.ContainerLogOpts
 	ended   map[string]bool
 	deleted []string
 	pings   int
@@ -213,6 +214,7 @@ func (p *fakePlugin) getLogs(w http.ResponseWriter, r *http.Request) {
 		p.t.Errorf("fake plugin: decoding /getLogs: %v", err)
 	}
 	key := req.PodUID + "/" + req.ContainerName
+	p.with(func(p *fakePlugin) { p.logOpts = append(p.logOpts, req.Opts) })
 	sent := 0
 	next := func() (string, bool) {
 		p.mu.Lock()

@@ -2,8 +2,6 @@ package shadow
 
 import (
 	"fmt"
-	"net/url"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -46,24 +44,17 @@ const (
 	DefaultNodeWaitTimeout = "2h"
 	// DefaultExecConnectCommand relays a connection on stdin/stdout in exec mode.
 	DefaultExecConnectCommand = "nc"
-	// ExecutorImageEnv names the environment variable ExecutorImage falls back to.
-	ExecutorImageEnv = "EXECUTOR_IMAGE"
 )
 
 // Config is the executor's Shadow block. LoginHost and User have no default. Without
-// LoginHost the shadows only stream logs: a site whose nodes the cluster cannot
-// reach, or a backend that reports no node.
+// LoginHost no shadow tunnels: a site whose nodes the cluster cannot reach, or a
+// backend that reports no node.
 type Config struct {
 	// Image runs the shadow's ssh containers (default DefaultImage).
-	Image string `yaml:"Image"`
-	// ExecutorImage runs the job-logs container: the executor's own image. Empty: the
-	// EXECUTOR_IMAGE environment variable.
-	ExecutorImage string `yaml:"ExecutorImage"`
-	// ExecutorURL is where job-logs reaches the executor, e.g. http://kueue-offload-executor:8000.
-	ExecutorURL string `yaml:"ExecutorURL"`
-	LoginHost   string `yaml:"LoginHost"`
-	User        string `yaml:"User"`
-	Port        int    `yaml:"Port"`
+	Image     string `yaml:"Image"`
+	LoginHost string `yaml:"LoginHost"`
+	User      string `yaml:"User"`
+	Port      int    `yaml:"Port"`
 	// KeySecret is the namespace's Secret holding the tunnel's private key, under
 	// KeySecretKey (default "ssh-privatekey").
 	KeySecret    string `yaml:"KeySecret"`
@@ -83,8 +74,6 @@ type Config struct {
 	// NodeWaitTimeout bounds how long the shadow waits for the compute node
 	// (default "2h").
 	NodeWaitTimeout string `yaml:"NodeWaitTimeout"`
-	// AlwaysShadow gives a job without exposed ports a logs-only shadow. nil means true.
-	AlwaysShadow *bool `yaml:"AlwaysShadow"`
 	// Reverse lets jobs open connections back into the cluster, see the
 	// interlink.eu/reverse-* annotations.
 	Reverse ReverseConfig `yaml:"Reverse"`
@@ -102,16 +91,6 @@ var (
 func NormalizeConfig(cfg *Config) error {
 	if cfg.Image == "" {
 		cfg.Image = DefaultImage
-	}
-	if cfg.ExecutorImage == "" {
-		cfg.ExecutorImage = os.Getenv(ExecutorImageEnv)
-	}
-	if cfg.ExecutorImage == "" {
-		return fmt.Errorf("Shadow.ExecutorImage is empty and %s is not set", ExecutorImageEnv)
-	}
-	u, err := url.Parse(cfg.ExecutorURL)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return fmt.Errorf("Shadow.ExecutorURL %q is not an http(s) URL", cfg.ExecutorURL)
 	}
 	tunnels := cfg.LoginHost != ""
 	if tunnels && !isValidComputeNodeName(cfg.LoginHost) {
@@ -186,11 +165,6 @@ func NormalizeConfig(cfg *Config) error {
 		return fmt.Errorf("invalid Shadow.NodeWaitTimeout %q: a positive duration is required", cfg.NodeWaitTimeout)
 	}
 	return nil
-}
-
-// alwaysShadow reports whether a job without exposed ports gets a shadow.
-func (cfg Config) alwaysShadow() bool {
-	return cfg.AlwaysShadow == nil || *cfg.AlwaysShadow
 }
 
 // nodeWaitSeconds is NodeWaitTimeout in whole seconds, for the template's shell loop.

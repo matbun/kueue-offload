@@ -29,6 +29,10 @@ const TimeLimitAnnotation = "interlink.eu/time-limit"
 
 var timeLimitFormat = regexp.MustCompile(`^([0-9]{1,3}):([0-5][0-9]):([0-5][0-9])$`)
 
+// kueueWallTime is wallTime.from for the Workload's maximumExecutionTimeSeconds,
+// which Kueue enforces itself.
+const kueueWallTime = "maximumExecutionTimeSeconds"
+
 // wallTime is the job's wall time and what asked for it, for refusals.
 type wallTime struct {
 	seconds int32
@@ -40,7 +44,7 @@ type wallTime struct {
 // owner's; nil when neither is set. A value that is not HH:MM:SS is an error.
 func jobWallTime(wl *kueue.Workload, ownerAnnotations map[string]string) (*wallTime, error) {
 	if s := wl.Spec.MaximumExecutionTimeSeconds; s != nil {
-		return &wallTime{seconds: *s, from: "maximumExecutionTimeSeconds"}, nil
+		return &wallTime{seconds: *s, from: kueueWallTime}, nil
 	}
 	var longest *wallTime
 	for _, ps := range wl.Spec.PodSets {
@@ -116,11 +120,7 @@ func buildPodSets(wl *kueue.Workload, s site, account string, wt *wallTime) ([]v
 		}
 		assignments[a.Name] = a
 	}
-	var seconds int32
-	if wt != nil {
-		seconds = wt.seconds
-	}
-	data := newFlavorData(account, seconds)
+	data := newFlavorData(account, wt, flavorLimit(admitted, s))
 	out := make([]v1alpha1.PodSet, 0, len(podSets))
 	for _, ps := range podSets {
 		p := v1alpha1.PodSet{Name: ps.Name, Count: ps.Count, Template: *ps.Template.DeepCopy()}
@@ -137,8 +137,8 @@ func buildPodSets(wl *kueue.Workload, s site, account string, wt *wallTime) ([]v
 		p.SecretRefs, p.ConfigMapRefs = references(&p.Template.Spec)
 		out = append(out, p)
 	}
-	if c := rayOwnerOf(wl); c != nil {
-		rayPodSets(c, out)
+	if rayOwnerOf(wl) != nil {
+		rayPodSets(out)
 	}
 	return out, nil
 }
@@ -151,12 +151,40 @@ type FlavorData struct {
 	// maximumExecutionTimeSeconds, else TimeLimitAnnotation, 0 when neither is
 	// set.
 	MaxExecSeconds int32
-	// MaxExecMinutes is MaxExecSeconds in minutes, rounded up.
+	// MaxExecMinutes is the site's wall time in minutes: MaxExecSeconds rounded
+	// up, and one more when Kueue enforces it (maximumExecutionTimeSeconds)
+	// and the admitted flavor's maxExecutionTimeSeconds leaves room. Kueue
+	// counts from admission, the job's start as the executor sees it, so its
+	// deactivation ends the job first whenever the start is seen within that
+	// minute, and the site's limit is the backstop; at the flavor's limit
+	// whichever comes first ends it.
 	MaxExecMinutes int32
 }
 
-func newFlavorData(account string, maxExecSeconds int32) FlavorData {
-	return FlavorData{Account: account, MaxExecSeconds: maxExecSeconds, MaxExecMinutes: (maxExecSeconds + 59) / 60}
+func newFlavorData(account string, wt *wallTime, limit *int32) FlavorData {
+	d := FlavorData{Account: account}
+	if wt == nil {
+		return d
+	}
+	d.MaxExecSeconds, d.MaxExecMinutes = wt.seconds, (wt.seconds+59)/60
+	if wt.from == kueueWallTime && (limit == nil || (d.MaxExecMinutes+1)*60 <= *limit) {
+		d.MaxExecMinutes++
+	}
+	return d
+}
+
+// flavorLimit is the smallest maxExecutionTimeSeconds of the admitted flavors,
+// nil when none has one.
+func flavorLimit(admitted []kueue.PodSetAssignment, s site) *int32 {
+	var limit *int32
+	for i := range admitted {
+		for f := range flavorSet(&admitted[i]) {
+			if l := s.flavors[f].MaxExecutionTimeSeconds; l != nil && (limit == nil || *l < *limit) {
+				limit = l
+			}
+		}
+	}
+	return limit
 }
 
 // ExpandAnnotations executes the annotation templates of a flavor with data.

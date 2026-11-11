@@ -61,9 +61,7 @@ data:
             AllowedAccounts: {{ toJson .Accounts }}
         Shadow:
           Enabled: true
-          AlwaysShadow: true
           Image: ghcr.io/interlink-hq/interlink/ssh-tunnel:0.6.3-pre2
-          ExecutorURL: http://{{ .ExecutorService }}:{{ .ExecutorPort }}
           LoginHost: login.hpc-a.example.org
           User: {{ .HPCUser }}
           Port: 22
@@ -109,8 +107,6 @@ data:
           - name: executor
             image: {{ .Image }}
             command: [/executor, --config, /etc/kueue-offload/executor.yaml]
-            env:
-            - {name: EXECUTOR_IMAGE, value: {{ quote .Image }}}
             ports:
             - {containerPort: {{ .ExecutorPort }}}
             readinessProbe:
@@ -160,8 +156,10 @@ data:
     spec:
       podSelector: {matchLabels: {app: {{ .ExecutorService }}}}
       policyTypes: [Ingress]
-      # Only the shadows call the executor, for the job's logs.
+      # Only the offload controller calls the executor, for the logs its virtual
+      # node serves (kubectl logs of a pod of the namespace).
       ingress:
       - from:
-        - podSelector: {matchLabels: {interlink.eu/shadow: "true"}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kueue-offload}}
+          podSelector: {matchLabels: {app: kueue-offload}}
         ports: [{port: {{ .ExecutorPort }}}]

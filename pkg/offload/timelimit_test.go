@@ -60,6 +60,7 @@ func TestTimeLimitAnnotationSetsTheWallTime(t *testing.T) {
 		{name: "rounded up to minutes", template: "00:00:30", want: 30},
 		{name: "the queue's limit", template: "02:00:00", want: 7200},
 		{name: "kueue over annotation", template: "01:00:00", kueue: ptr.To[int32](600), want: 600},
+		{name: "kueue at the queue's limit", kueue: ptr.To[int32](7200), want: 7200},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			e := newEnv(t, onDebugFlavor(func(o client.Object) {
@@ -81,6 +82,11 @@ func TestTimeLimitAnnotationSetsTheWallTime(t *testing.T) {
 				t.Errorf("maximumExecutionTimeSeconds %d, want %d", got, tt.want)
 			}
 			minutes := (tt.want + 59) / 60
+			if tt.kueue != nil && *tt.kueue < 7200 {
+				// Kueue ends the job at its limit; the site's is a minute later,
+				// within the queue's 7200 s
+				minutes++
+			}
 			if got, want := sp.PodSets[0].Annotations[flagsKey], "--account=proj42 --partition=gpu --qos=debug --time="+strconv.Itoa(int(minutes)); got != want {
 				t.Errorf("flags %q, want %q", got, want)
 			}
@@ -135,11 +141,11 @@ func TestTimeLimitRefusals(t *testing.T) {
 			if len(e.requests()) != 0 {
 				t.Fatalf("requests %v, want none", e.requests())
 			}
-			if st := e.check("hpc-a"); st.State != kueue.CheckStateRejected || !strings.Contains(st.Message, tt.want) {
-				t.Errorf("check = %s %q, want Rejected with %q", st.State, st.Message, tt.want)
+			if st := e.check("hpc-a"); st.State != kueue.CheckStateReady || !strings.Contains(st.Message, tt.want) || e.failed() != st.Message {
+				t.Errorf("check = %s %q, failed %q, want Ready and failed with %q", st.State, st.Message, e.failed(), tt.want)
 			}
-			if c := jobCondition(e.job(), batchv1.JobFailed); c == nil || !strings.Contains(c.Message, tt.want) {
-				t.Errorf("owner Job failed condition %+v, want one with %q", c, tt.want)
+			if len(e.job().Status.Conditions) != 0 {
+				t.Errorf("owner status written: %+v", e.job().Status)
 			}
 		})
 	}

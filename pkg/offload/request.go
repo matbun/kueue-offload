@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -134,6 +135,21 @@ func (r *WorkloadReconciler) deleteLive(ctx context.Context, reqs []v1alpha1.Off
 	for i := range reqs {
 		if reqs[i].DeletionTimestamp.IsZero() {
 			errs = append(errs, r.deleteRequest(ctx, &reqs[i]))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// cancelUnended deletes the live requests of a finished Workload whose job
+// neither finished nor was evicted; the executor's finalizer cancels the job.
+func (r *WorkloadReconciler) cancelUnended(ctx context.Context, reqs []v1alpha1.OffloadRequest) error {
+	var errs []error
+	for i := range reqs {
+		q := &reqs[i]
+		conds := q.Status.Conditions
+		ended := meta.IsStatusConditionTrue(conds, v1alpha1.OffloadRequestFinished) || meta.IsStatusConditionTrue(conds, v1alpha1.OffloadRequestEvicted)
+		if q.DeletionTimestamp.IsZero() && !ended {
+			errs = append(errs, r.deleteRequest(ctx, q))
 		}
 	}
 	return errors.Join(errs...)

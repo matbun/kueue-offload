@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -92,6 +93,29 @@ func TestSSACheckWriterPatch(t *testing.T) {
 	}
 	if s := string(body); !strings.Contains(s, `"state":"Retry"`) || !strings.Contains(s, `"requeueAfterSeconds":120`) || strings.Contains(s, "retryCount") {
 		t.Errorf("Retry apply body %s, want requeueAfterSeconds and no retryCount", s)
+	}
+
+	// podSetUpdates go with Ready only: a later state drops the controller's.
+	updates := podSetUpdates(workload(), testNode)
+	for _, state := range []kueue.CheckState{kueue.CheckStateReady, kueue.CheckStatePending, kueue.CheckStateRetry} {
+		body, err = checkApplyBody(workload(), kueue.AdmissionCheckState{
+			Name: "hpc-a", State: state, Message: "job 1 running", LastTransitionTime: ltt, PodSetUpdates: updates,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var entry struct {
+			Status struct {
+				AdmissionChecks []kueue.AdmissionCheckState `json:"admissionChecks"`
+			} `json:"status"`
+		}
+		if err := json.Unmarshal(body, &entry); err != nil || len(entry.Status.AdmissionChecks) != 1 {
+			t.Fatalf("%s apply body %s: %v", state, body, err)
+		}
+		got := entry.Status.AdmissionChecks[0].PodSetUpdates
+		if want := map[bool][]kueue.PodSetUpdate{true: updates}[state == kueue.CheckStateReady]; !reflect.DeepEqual(got, want) {
+			t.Errorf("%s apply body podSetUpdates %+v, want %+v", state, got, want)
+		}
 	}
 }
 
@@ -217,7 +241,7 @@ func TestWorkerActiveFromEndpoint(t *testing.T) {
 
 func TestFlavorConflictRejected(t *testing.T) {
 	s := resolveSite(offloadConfig())
-	data := newFlavorData("proj42", 0)
+	data := newFlavorData("proj42", nil, nil)
 	asg := &kueue.PodSetAssignment{}
 	asg.Flavors = map[corev1.ResourceName]kueue.ResourceFlavorReference{"cpu": "hpc-a-cpu", "nvidia.com/gpu": "hpc-a-gpu"}
 	if _, err := annotationsFor(asg, s, data); err == nil || !strings.Contains(err.Error(), "hpc-a-cpu and hpc-a-gpu map to different queues") {
@@ -243,8 +267,9 @@ func TestFlavorConflictRejected(t *testing.T) {
 }
 
 // TestRBACGrantsNoSecrets fails when the offload controller's RBAC reaches what the
-// design forbids: Secrets, ConfigMaps, or pods beyond reading them, annotating a
-// failed pod group and patching their status for the terminal phase.
+// design forbids: Secrets, ConfigMaps other than the API server's client CA, or
+// pods beyond what its virtual node does to them: binding, annotating, writing
+// their status and deleting them.
 func TestRBACGrantsNoSecrets(t *testing.T) {
 	files, err := filepath.Glob("../../config/rbac/*.yaml")
 	if err != nil || len(files) == 0 {
@@ -258,11 +283,24 @@ func TestRBACGrantsNoSecrets(t *testing.T) {
 		}
 		for _, doc := range strings.Split(string(data), "\n---") {
 			var obj struct {
-				Kind  string              `json:"kind"`
+				Kind     string `json:"kind"`
+				Metadata struct {
+					Namespace string `json:"namespace"`
+				} `json:"metadata"`
 				Rules []rbacv1.PolicyRule `json:"rules"`
 			}
 			if err := yaml.Unmarshal([]byte(doc), &obj); err != nil {
 				t.Fatalf("%s: %v", f, err)
+			}
+			if obj.Kind == "Role" && obj.Metadata.Namespace == "kube-system" {
+				// The client CA the kubelet API authenticates the API server with.
+				for _, r := range obj.Rules {
+					if !slices.Equal(r.Resources, []string{"configmaps"}) || !slices.Equal(r.ResourceNames, []string{"extension-apiserver-authentication"}) ||
+						!slices.Equal(r.Verbs, []string{"get"}) {
+						t.Errorf("RBAC grants %v on %v %v in kube-system", r.Verbs, r.Resources, r.ResourceNames)
+					}
+				}
+				continue
 			}
 			if obj.Kind == "ClusterRole" || obj.Kind == "Role" {
 				rules = append(rules, obj.Rules...)
@@ -289,8 +327,10 @@ func TestRBACGrantsNoSecrets(t *testing.T) {
 				t.Errorf("RBAC grants %v on %s", r.Verbs, res)
 			}
 			if core && (name == "pods" || res == "*") {
-				// pods patch sets the retriable-in-group annotation on a failed pod group.
-				allowed := map[string][]string{"pods": {"get", "list", "watch", "patch"}, "pods/status": {"get", "patch"}}[res]
+				// pods patch sets the rank and the retriable-in-group annotation;
+				// delete ends a deleted pod, as a kubelet does.
+				allowed := map[string][]string{"pods": {"get", "list", "watch", "patch", "delete"}, "pods/status": {"get", "update", "patch"},
+					"pods/binding": {"create"}}[res]
 				for _, v := range r.Verbs {
 					if !slices.Contains(allowed, v) {
 						t.Errorf("RBAC grants %s on %s", v, res)

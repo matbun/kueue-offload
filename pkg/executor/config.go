@@ -113,18 +113,11 @@ type AllowedFlags struct {
 
 // ShadowConfig is what the shadow manager renders a workload's shadow with.
 type ShadowConfig struct {
-	Enabled bool `yaml:"Enabled"`
-	// AlwaysShadow gives a shadow, for its logs, to jobs that expose no port.
-	// Unset: true.
-	AlwaysShadow *bool  `yaml:"AlwaysShadow"`
-	Image        string `yaml:"Image"`
-	// ExecutorImage runs the job-logs container. Empty: env EXECUTOR_IMAGE.
-	ExecutorImage string `yaml:"ExecutorImage"`
-	// ExecutorURL is where job-logs reaches the executor.
-	ExecutorURL string `yaml:"ExecutorURL"`
+	Enabled bool   `yaml:"Enabled"`
+	Image   string `yaml:"Image"`
 	// LoginHost, User and Port are the site's login node, which the tunnel
-	// reaches with the key of KeySecret. Empty LoginHost: the shadows only stream
-	// logs, and requests with exposed ports or reverse forwards are refused.
+	// reaches with the key of KeySecret. Empty LoginHost: no shadows, and
+	// requests with exposed ports or reverse forwards are refused.
 	LoginHost           string `yaml:"LoginHost"`
 	User                string `yaml:"User"`
 	Port                int    `yaml:"Port"`
@@ -217,11 +210,6 @@ const (
 
 // serviceAccountNamespaceFile is where a pod reads its own namespace.
 var serviceAccountNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
-
-// AlwaysShadowEnabled reports Shadow.AlwaysShadow, true when unset.
-func (s ShadowConfig) AlwaysShadowEnabled() bool {
-	return s.AlwaysShadow == nil || *s.AlwaysShadow
-}
 
 // Site returns the executor's only site.
 func (c Config) Site() (string, SiteConfig) {

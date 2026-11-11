@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/matbun/kueue-offload/api/v1alpha1"
+	"github.com/matbun/kueue-offload/pkg/executorapi"
 	"github.com/matbun/kueue-offload/pkg/shadow"
 )
 
@@ -52,7 +53,6 @@ type jobRequest struct {
 	WorkloadName string
 	Namespace    string
 	Owner        v1alpha1.OwnerReference
-	OwnerLabels  map[string]string
 	Site         string
 	Account      string
 	Attempt      int32
@@ -65,7 +65,6 @@ func jobRequestOf(q *v1alpha1.OffloadRequest) jobRequest {
 		WorkloadName: q.Spec.Workload.Name,
 		Namespace:    q.Namespace,
 		Owner:        q.Spec.Owner,
-		OwnerLabels:  q.Spec.OwnerLabels,
 		Site:         q.Spec.Site,
 		Account:      q.Spec.Account,
 		Attempt:      q.Spec.Attempt,
@@ -103,8 +102,8 @@ type Executor struct {
 	// Shadow renders the shadows. Nil: no shadows.
 	Shadow ShadowManager
 
-	// shadowsEnded holds the requests whose shadow was rendered for the job's
-	// end, cancelled the deleted requests whose job, shadow and stage-in Job are
+	// shadowsEnded holds the requests whose shadow was deleted at the job's end,
+	// cancelled the deleted requests whose job, shadow and stage-in Job are
 	// gone while their copy back runs. They are not kept across restarts: doing
 	// either once more is idempotent.
 	mu           sync.Mutex
@@ -127,9 +126,10 @@ func New(cfg Config, il *InterLink, kube kubernetes.Interface, c client.Client, 
 		shadowsEnded: map[types.UID]bool{}, cancelled: map[types.UID]bool{}}
 }
 
-// RegisterRoutes adds the executor's HTTP API, for the shadows, to mux.
+// RegisterRoutes adds the executor's HTTP API, for the offload controller, to
+// mux.
 func (d *Executor) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /getLogs", d.GetLogsHandler)
+	mux.HandleFunc("GET "+executorapi.GetLogsPath, d.GetLogsHandler)
 	mux.HandleFunc("GET /healthz", d.HealthzHandler)
 }
 
@@ -307,7 +307,7 @@ func onlyOrNone(list []string, none string) string {
 }
 
 // validateTunnels refuses the tunnels of a site whose Shadow block names no login
-// node: its shadows only stream logs (backends.md section 6). The shadow serves
+// node, through which they would go (backends.md section 6). The shadow serves
 // the head's template.
 func (d *Executor) validateTunnels(req jobRequest) *refusal {
 	cfg := d.Config.Shadow
@@ -527,10 +527,14 @@ func (d *Executor) estimate(ctx context.Context, q *v1alpha1.OffloadRequest, req
 	return true
 }
 
+// timeFlag finds sbatch's own time option in scheduler flags.
+var timeFlag = regexp.MustCompile(`(^|\s)(--time[= ]|-t ?[0-9])`)
+
 // estimateShape is the job of req as /estimate takes it: one node per member of
 // a pod group, else the one node of its first job; the most GPUs and CPUs a
 // PodSet's member asks for; the head member's scheduler flags, its flavor's
-// included; and the wall time in whole minutes, as the flavors round it.
+// included; and, when those flags carry no --time of their own (the one the job
+// gets), the wall time in whole minutes.
 func estimateShape(req jobRequest, res *SiteResources, wallSeconds *int32) EstimateRequest {
 	shape := EstimateRequest{Nodes: 1}
 	if podGroup(req) {
@@ -543,7 +547,7 @@ func estimateShape(req jobRequest, res *SiteResources, wallSeconds *int32) Estim
 		}
 	}
 	shape.Flags = buildMember(req, 0).Annotations[SlurmFlagsAnnotation]
-	if wallSeconds != nil && *wallSeconds > 0 {
+	if wallSeconds != nil && *wallSeconds > 0 && !timeFlag.MatchString(shape.Flags) {
 		minutes := (*wallSeconds + 59) / 60
 		shape.Time = fmt.Sprintf("%02d:%02d:00", minutes/60, minutes%60)
 	}
@@ -848,7 +852,8 @@ func (d *Executor) observe(ctx context.Context, q *v1alpha1.OffloadRequest, req 
 		if !found && missingRank < 0 {
 			missingRank = i
 		}
-		rank := v1alpha1.RankStatus{Rank: int32(i), PodUID: uid, JobID: ps.JobID, Containers: ps.Containers}
+		rank := v1alpha1.RankStatus{Rank: int32(i), PodUID: uid, JobID: ps.JobID, NodeName: ps.NodeName,
+			Containers: ps.Containers, InitContainers: ps.InitContainers}
 		if rank.JobID == "" && i < len(q.Status.Ranks) {
 			// The job /create named, while the plugin's status does not.
 			rank.JobID = q.Status.Ranks[i].JobID
@@ -1019,37 +1024,37 @@ func jobTimes(statuses []commonIL.PodStatus) (start, end *metav1.Time) {
 	return start, end
 }
 
-// templateExposesPorts reports whether a container of the template declares a port.
-func templateExposesPorts(t v1.PodTemplateSpec) bool {
-	for _, c := range t.Spec.Containers {
-		if len(c.Ports) > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// syncShadow keeps the workload's shadow in step with the job: one Ensure per
-// poll while it runs on a known node, one more with Terminal set once it ended.
-// It records the shadow's names, and its pod's IP and readiness, in q's status.
+// syncShadow keeps the shadow of a workload that forwards ports or tunnels back
+// in step with the job: one Ensure per poll while it runs on a known node. Once
+// the job ended it deletes the shadow, once per request since the executor
+// started. It records the shadow's names, and its pod's IP and readiness, in q's
+// status.
 func (d *Executor) syncShadow(ctx context.Context, q *v1alpha1.OffloadRequest, req jobRequest, st jobState) {
-	cfg := d.Config
 	terminal := isTerminalJobState(st.State)
-	if !cfg.Shadow.Enabled || d.Shadow == nil || (terminal && d.shadowEnded(q.UID)) {
+	ps := req.PodSets[0]
+	tunnels := shadow.ForwardsPorts(ps.Template) || shadow.HasReverseAnnotations(ps.Template.Annotations)
+	if !d.Config.Shadow.Enabled || d.Shadow == nil || !tunnels || (terminal && d.shadowEnded(q.UID)) {
 		return
 	}
-	ps := req.PodSets[0]
+	if terminal {
+		if err := d.Shadow.Delete(ctx, req.WorkloadUID); err != nil {
+			log.L.Warning("executor: deleting the shadow of workload ", req.WorkloadUID, ": ", err)
+			return
+		}
+		q.Status.Shadow = nil
+		d.mu.Lock()
+		d.shadowsEnded[q.UID] = true
+		d.mu.Unlock()
+		return
+	}
+	if st.State != jobRunning || st.NodeName == "" {
+		return
+	}
 	reverse, aerr := d.reverseTunnel(req)
 	if aerr != nil {
 		log.L.Warning("executor: shadow of workload ", req.WorkloadUID, " without its reverse tunnel: ", aerr.msg)
 	}
-	if !templateExposesPorts(ps.Template) && reverse == nil && !cfg.Shadow.AlwaysShadowEnabled() {
-		return
-	}
-	// A tunnel needs the node. A shadow that only streams logs starts as soon as
-	// the job runs, also on a backend that reports no node.
-	tunnels := reverse != nil || shadow.ForwardsPorts(ps.Template)
-	if !terminal && (st.State != jobRunning || (st.NodeName == "" && tunnels)) {
+	if reverse == nil && !shadow.ForwardsPorts(ps.Template) {
 		return
 	}
 	spec := ShadowSpec{
@@ -1059,9 +1064,7 @@ func (d *Executor) syncShadow(ctx context.Context, q *v1alpha1.OffloadRequest, r
 		Template:     ps.Template,
 		NodeName:     st.NodeName,
 		SocketDir:    st.SocketDir,
-		Terminal:     terminal,
 		Reverse:      reverse,
-		Labels:       req.OwnerLabels,
 	}
 	ref, err := d.Shadow.Ensure(ctx, spec)
 	if err != nil {
@@ -1069,11 +1072,6 @@ func (d *Executor) syncShadow(ctx context.Context, q *v1alpha1.OffloadRequest, r
 		return
 	}
 	q.Status.Shadow = &v1alpha1.ShadowReference{Deployment: ref.Deployment, Service: ref.Service, PodIP: ref.PodIP, Ready: ref.Ready}
-	if terminal {
-		d.mu.Lock()
-		d.shadowsEnded[q.UID] = true
-		d.mu.Unlock()
-	}
 }
 
 func (d *Executor) shadowEnded(uid types.UID) bool {

@@ -38,7 +38,7 @@ OffloadRequest in the tenant namespace (kueue-native.md 3.2)
    |
 executor, tenant namespace, namespaced Role                       this repo, pkg/executor
    |  PodSets -> member pods in memory; Secrets, ConfigMaps, tokens, downward API;
-   |  stage Jobs; shadow Deployment; log relay; state
+   |  stage Jobs; shadow Deployment; log relay to the virtual node; state
    v  interLink API: /create (PodCreateRequests), /status, /getLogs, /delete, /pinglink
 interLink API server, stock image                     in the tenant pod, or at the site (edge)
    v  interLink plugin contract
@@ -50,8 +50,9 @@ routes to the plugin's mux (slurm `cmd/main.go:224-243`), and it called the plug
 process, `createPod` (slurm `pkg/slurm/executor.go:422`) and `podStatuses` (`:649`). It also ran
 `squeue` and `scancel` itself (`:516`, `:579`) and read the plugin's job directories (`:824-840`,
 `executor_logs.go:228-243`). Another backend would have had to reimplement all of this. The
-executor now runs on its own in the tenant pod, takes OffloadRequests and keeps only `/getLogs`
-and `/healthz` for the shadows (`design.md`, "Executor HTTP API").
+executor now runs on its own in the tenant pod, takes OffloadRequests and keeps only `/getLogs`,
+which the offload controller's virtual node reads for `kubectl logs`, and `/healthz` (`design.md`,
+"Executor HTTP API").
 
 ### 1.2 What moves into pkg/executor
 
@@ -64,7 +65,7 @@ and `/healthz` for the shadows (`design.md`, "Executor HTTP API").
 | `executor_state.go` | gone | the OffloadRequest status holds the job ID, the ranks and the shadow names (`kueue-native.md` section 6, step 6) |
 | `executor_auth.go` | gone | with the HTTP API it guarded (step 6) |
 | `executor_shadow.go`, `executor_reverse.go` | `pkg/executor/shadow.go`, `reverse.go` | none. The srun carrier finds the allocation by a job name that follows the Slurm plugin's naming (`executor_reverse.go:18-24`), so it stays a Slurm-only option; other backends use the ssh carrier |
-| `executor_logs.go`, `executor_logs_client.go` | `pkg/executor/logs.go`, `executor logs` | each rank is read through `/getLogs` with `Follow` instead of from the plugin's files (`executor_logs.go:228-243`), so no shared filesystem is needed. The followed stream ends when every rank's stream ended and `/status` shows their containers terminated: the API server ends a stream it lost from the plugin as if it were complete (il `api/handler.go:242-245`). The 10 s quiet wait goes with the file reads; the plugin's `Follow` ends after the container's last write |
+| `executor_logs.go`, `executor_logs_client.go` | `pkg/executor/logs.go`, read by the virtual node (`pkg/node/logs.go`) | each rank is read through `/getLogs` with `Follow` instead of from the plugin's files (`executor_logs.go:228-243`), so no shared filesystem is needed. The followed stream ends when every rank's stream ended and `/status` shows their containers terminated: the API server ends a stream it lost from the plugin as if it were complete (il `api/handler.go:242-245`). The 10 s quiet wait goes with the file reads; the plugin's `Follow` ends after the container's last write |
 | `executor_config.go`: Executor, Shadow and Staging blocks (`:14-160`) | `pkg/executor/config.go` | `SiteConfig` (`:55-61`) keeps `AllowedAccounts`. `LoginHost`, `User`, `Port`, `KeyFile` and `exportSiteEnv` (`:309`) stay in the plugin for its ssh shims, as an optional `Sites` block of at most one entry (slurm `pkg/slurm/site.go`), so the Shadow block names its login node and user itself and Staging gains `User` (default `Shadow.User`). The plugin's configuration sets `GangSchedulingEnabled` itself: the executor no longer turns it on (`:224-228`) |
 | `pkg/shadow` | `pkg/shadow` | none: it is the virtual kubelet's SSH shadow (slurm `pkg/shadow/render.go:17`) |
 
@@ -128,7 +129,9 @@ as the membership executor template already is, and the controller expands them 
 `.MaxExecSeconds` (the job's wall time: the Workload's `spec.maximumExecutionTimeSeconds`,
 `0.16.9 apis/kueue/v1beta2/workload_types.go:77`, else the longest `interlink.eu/time-limit`
 (`HH:MM:SS`) of its PodSets, a template's value winning over the owner's; 0 when neither) and
-`.MaxExecMinutes` (the same, rounded up). The request's `spec.maximumExecutionTimeSeconds` carries
+`.MaxExecMinutes` (the same, rounded up, and one minute more when it is Kueue's
+`maximumExecutionTimeSeconds` and the flavor's `maxExecutionTimeSeconds` leaves room, so that
+Kueue's deactivation ends the job first; see [design.md](design.md) for when each ends it). The request's `spec.maximumExecutionTimeSeconds` carries
 that value, and a flavor's `maxExecutionTimeSeconds` bounds it: a longer job is rejected, since
 Kueue cannot choose a flavor by time.
 
@@ -367,14 +370,14 @@ OffloadRequest exists, the account reaches the plugin in the flavor annotation (
 the site checks that the user may charge it. The plugin knows nothing about quotas.
 
 Logs work. The executor relays `/getLogs` with Follow through the API server, which streams it
-(`api/logs.go:152`), and the shadow's job-logs container reads from the executor (slurm
-`pkg/shadow/render.go:165-171`). No shared filesystem is involved.
+(`api/logs.go:152`), and the offload controller's virtual node reads it from the executor for
+`kubectl logs` (`design.md`, "Virtual node"). No shared filesystem is involved.
 
 Tunnels work only where the tenant has an SSH key for the site. The shadow reaches the node over
 SSH with a key in the tenant namespace (`executor-template.yaml:60-70`); with such a key, forward
 and reverse tunnels work as they do in-cluster. Often, though, the edge exists because the cluster
 holds no SSH identity for the user. Tunnels then need a stream into the job from the API server,
-keyed by pod, which interLink does not have. Logs-only shadows still work.
+keyed by pod, which interLink does not have. Logs still work: they need no shadow.
 
 ## 5. The API server: always in front
 
@@ -420,9 +423,9 @@ How each shape runs through the HTCondor plugin:
 What is refused or limited:
 - Tunnels. The plugin reports no `nodeName`, and execute nodes are generally not reachable over
   SSH. Where the site's shadow configuration has no login host, the executor refuses
-  `interlink.eu/reverse-forwards` and exposed ports and runs a logs-only shadow
-  (`pkg/executor/server.go:220`). A shadow that tunnels waits for `nodeName`; one that only streams
-  logs is created as soon as the job runs, whatever the backend (`pkg/executor/server.go:801`).
+  `interlink.eu/reverse-forwards` and exposed ports, and no job has a shadow
+  (`validateTunnels` in `pkg/executor/server.go`). A shadow waits for `nodeName`; logs need none:
+  the virtual node reads them from the executor whatever the backend.
 - Staging. `Staging.Command` is the site's configuration; HTCondor's own `transfer_input_files`
   (htc `handles.py:1234`) belongs to the plugin.
 - Logs. Without Follow, each `/getLogs` answers the log so far. While the job runs the executor
@@ -452,7 +455,7 @@ The tests need no HTCondor pool:
 3. The HTCondor plugin's own container, a one-node `htcondor/mini` pool with the plugin (htc
    `docker/Dockerfile:1`), which the plugin's CI already runs. `test/htcondor/run.sh` runs Kueue,
    the offload controller, the executor, a stock API server and that container in kind through
-   these cases: a single pod and its log on the shadow, the account and the wall time in the
+   these cases: a single pod and its log through `kubectl logs`, the account and the wall time in the
    submit file, a Job of 3 with `independent-pods`, a refused Job of 2 pods (a pod group of any
    kind is refused by the same check), an exit code 3, and a `condor_rm` from inside the pool.
 4. Multi-node runs, accounting enforcement and a site's authentication need a real pool.
@@ -510,8 +513,8 @@ project. "Slurm e2e" below means that set of tests.
    OffloadRequests (`pkg/executor/request.go`), the controller creates them (`pkg/offload`), and
    `config/admission` limits who writes them. Test: the unit tests of both sides and of the
    policy (`pkg/offload/policy_test.go`); Slurm e2e.
-8. **HTCondor.** The plugin changes of section 6 go upstream, and the executor gets the logs-only
-   shadow without a node and the tunnel refusal. Test: e2e with the `htcondor/mini` container in
+8. **HTCondor.** The plugin changes of section 6 go upstream, and the executor gets the tunnel
+   refusal without a login node. Test: e2e with the `htcondor/mini` container in
    kind.
 9. **Edge, per user.** The executor is configured with a remote API server URL and a token, which
    the membership controller renders. One API server and plugin run per user on a test login host

@@ -15,7 +15,7 @@ type ShadowSpec = shadow.Spec
 type ShadowRef = shadow.Ref
 
 // ShadowManager creates and removes the shadow of a workload: the pod that
-// carries its tunnel and streams its logs.
+// carries its tunnels.
 type ShadowManager interface {
 	// Ensure creates or updates the shadow for spec. Idempotent; called on every
 	// poll once the job runs.
@@ -40,8 +40,6 @@ func (c Config) shadowConfig() shadow.Config {
 	s := c.Shadow
 	return shadow.Config{
 		Image:               s.Image,
-		ExecutorImage:       s.ExecutorImage,
-		ExecutorURL:         s.ExecutorURL,
 		LoginHost:           s.LoginHost,
 		User:                s.User,
 		Port:                s.Port,
@@ -53,7 +51,6 @@ func (c Config) shadowConfig() shadow.Config {
 		ForwardMode:         s.ForwardMode,
 		ExecConnectCommand:  s.ExecConnectCommand,
 		NodeWaitTimeout:     s.NodeWaitTimeout,
-		AlwaysShadow:        s.AlwaysShadow,
 		Reverse:             s.Reverse,
 	}
 }

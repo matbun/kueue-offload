@@ -1,6 +1,5 @@
 // Command executor runs the OffloadRequests of its namespace and site through an
-// interLink API server, in the tenant's namespace. "executor logs" is the
-// shadow's job-logs container.
+// interLink API server, in the tenant's namespace.
 package main
 
 import (
@@ -31,17 +30,6 @@ import (
 )
 
 func main() {
-	// The shadow's job-logs container copies the workload's log from the executor.
-	// It reads no configuration.
-	if len(os.Args) > 1 && os.Args[1] == "logs" {
-		ctx := ctrl.SetupSignalHandler()
-		if err := executor.RunLogsCommand(ctx, os.Args[2:], os.Stdout, os.Stderr); err != nil && ctx.Err() == nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
-
 	configPath := flag.String("config", "/etc/kueue-offload/executor.yaml", "the executor's configuration file")
 	level := flag.String("log-level", "info", "log level: debug, info, warn or error")
 	flag.Parse()

@@ -20,7 +20,7 @@ func TestDeferralsAreNotRetries(t *testing.T) {
 		message   string
 	}{
 		{name: "every earlier attempt deferred", deferrals: 3, want: kueue.CheckStateRetry},
-		{name: "one earlier loss", deferrals: 2, want: kueue.CheckStateRejected, message: "giving up after 1 retries"},
+		{name: "one earlier loss", deferrals: 2, want: kueue.CheckStateReady, message: "giving up after 1 retries"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			e := newEnv(t, withRetryStrategy(&kueue.ProvisioningRequestRetryStrategy{BackoffLimitCount: ptr.To[int32](1)}))
@@ -40,6 +40,9 @@ func TestDeferralsAreNotRetries(t *testing.T) {
 			}
 			if tt.want == kueue.CheckStateRetry && ptr.Deref(st.RetryCount, -1) != 3 {
 				t.Errorf("retryCount %v, want Kueue's 3", st.RetryCount)
+			}
+			if failed := e.failed() != ""; failed != (tt.want == kueue.CheckStateReady) {
+				t.Errorf("Workload failed %v (%q)", failed, e.failed())
 			}
 		})
 	}

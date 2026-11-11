@@ -22,13 +22,14 @@ type OffloadConfigSpec struct {
 	Workers []string `json:"workers"`
 
 	// executorService is the name of the executor Service in every tenant
-	// namespace, which the shadows read job logs from. The membership controller
-	// passes it to the executor template.
+	// namespace, which the offload controller's virtual node reads job logs
+	// from. The membership controller passes it to the executor template.
 	// +kubebuilder:default=kueue-offload-executor
 	// +optional
 	ExecutorService string `json:"executorService,omitempty"`
 
-	// executorPort is the port of the executor Service.
+	// executorPort is the port of the executor Service, on which the offload
+	// controller's virtual node reads job logs.
 	// +kubebuilder:default=8000
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=65535
@@ -73,6 +74,12 @@ type OffloadConfigSpec struct {
 	// retries. Unset: no limit, and the estimate only shows in the check message.
 	// +optional
 	MaxStartDelay *metav1.Duration `json:"maxStartDelay,omitempty"`
+
+	// nodeLabels are more labels of the site's virtual node, for the cluster's
+	// own conventions, such as the label its DaemonSets keep off virtual nodes by.
+	// They never replace a label the controller sets on the node.
+	// +optional
+	NodeLabels map[string]string `json:"nodeLabels,omitempty"`
 
 	// deferInterval is how long a Workload that maxStartDelay deferred stays
 	// deactivated before the site is asked again, the same after every deferral:
@@ -120,7 +127,9 @@ type FlavorTarget struct {
 	// ClusterQueue's account label), .MaxExecSeconds (the job's wall time: the
 	// Workload's maximumExecutionTimeSeconds, else the annotation
 	// interlink.eu/time-limit, 0 when neither is set) and .MaxExecMinutes (the
-	// same in minutes, rounded up). The executor appends each value to the
+	// same in minutes, rounded up, and one more when it is Kueue's and the
+	// flavor's maxExecutionTimeSeconds leaves room, so that Kueue's own
+	// deactivation ends the job first). The executor appends each value to the
 	// template's own value for that key, after a space, and never parses it, for
 	// example
 	// slurm-job.vk.io/flags: "--account={{.Account}} --qos=prod{{with .MaxExecMinutes}} --time={{.}}{{end}}".

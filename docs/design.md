@@ -10,6 +10,7 @@ a site `hpc-a` and a project `proj42`.
 | Component | Code | Image |
 | --- | --- | --- |
 | offload controller (Kueue admission check) | this repo, `cmd/offload-controller`, `pkg/offload` | `kueue-offload` (`/offload-controller`) |
+| virtual node of each site, inside the offload controller | this repo, `pkg/node` | same image (`/offload-controller`) |
 | membership controller | this repo, `cmd/membership`, `pkg/membership` | same image (`/membership`) |
 | CRDs `OffloadConfig`, `OffloadWorker`, `OffloadRequest`, `IdentityMap`, `ProjectQuota` | this repo, `api/v1alpha1`, `config/crd` | |
 | names the executor shares with the controller and the API server | this repo, `pkg/executorapi` | |
@@ -17,9 +18,10 @@ a site `hpc-a` and a project `proj42`.
 | interLink API server, next to the executor | interLink `cmd/interlink`, with `PodStatus.SocketDir` | the stock API server image |
 | plugin, next to the API server | an interLink plugin; for Slurm, `interlink-slurm-plugin` | the plugin image |
 
-API group of the CRDs: `interlink.eu`, version `v1alpha1`. One offload controller serves every
-site; one membership controller runs per site, with `--site=<OffloadConfig name>`. The offload
-controller reads no Secret; the membership controller reads Secrets' metadata only, never their
+API group of the CRDs: `interlink.eu`, version `v1alpha1`. One offload controller serves every site;
+one membership controller runs per site, with `--site=<OffloadConfig name>`. The offload controller
+reads no Secret and runs one virtual node per site, on which the Workloads' pods show their jobs
+([Virtual node](#virtual-node)); the membership controller reads Secrets' metadata only, never their
 data ([Executor health](#executor-health)). The executor speaks only the interLink API, the one a
 virtual kubelet speaks, so the plugin behind the API server is any interLink plugin
 ([backends.md](backends.md)).
@@ -38,24 +40,39 @@ MultiKueue's checks follow their MultiKueueClusters: `True` (`Active`) while one
 `False` with `NoUsableWorkers` and the missing or inactive ones in the message otherwise, and
 `False` with `BadConfig` when the OffloadConfig cannot be read ([The OffloadWorker](#the-offloadworker)).
 
-### The check stays Pending
+### The check goes Ready when the job starts
 
-The offload controller never sets the check `Ready`. Kueue therefore never admits the Workload,
-never unsuspends the owner and never ungates plain pods, so no pod of the user's ever exists in the
-cluster. Kueue keeps the quota reserved (`QuotaReserved=True`) for the job's whole life, queued and
-running. The check `message` carries the batch system's state (`job 123 queued (Priority)`,
-`job 123 running on node07 since ...`). When the job ends the controller writes the owner's
-terminal status ([Owners](#owners)); the owner's own controller stops syncing a finished object,
-and Kueue marks the Workload `Finished` and releases the quota. Verified on the reference cluster:
-a suspended Indexed Job with `parallelism: 2` held at `Pending`, zero pods, then a status patch with
-`Complete=True`, `succeeded: 2` gave `Finished=True(Succeeded)` on the Workload and a reservation
-of 0.
+While the job waits the check stays `Pending`: Kueue keeps the quota reserved (`QuotaReserved=True`)
+and the owner suspended (a plain pod gated), and the check `message` carries the batch system's
+state (`job 123 queued (Priority)`). Once the job started at the site (the request's
+`status.startTime`, `Admitted=True` or `Finished=True`), the controller sets the check `Ready`
+with `podSetUpdates`, Kueue admits the Workload, and the owner unsuspends (a plain pod is ungated)
+and makes its pods as on any cluster. For each PodSet sent to the site the updates carry:
 
-`Ready` would make the Workload `Admitted`: Kueue would unsuspend the Job (or ungate the pods), and
-the Job controller would create real pods that the default scheduler runs on cluster nodes. Only
-`Job.spec.managedBy` (MultiKueue's way) stops that, and it is alpha and off by default before
-Kubernetes 1.32. The API server of the reference cluster (1.30.2) drops it silently: a server
-dry-run of a Job with `managedBy` returns it without the field.
+- label `offload.interlink.eu/node: <node>` and annotation `offload.interlink.eu/workload:
+  <Workload>`;
+- node selector `offload.interlink.eu/node: <node>`: the default scheduler cannot place the pod on
+  a real node, so a pod that kept the default `schedulerName` stays unschedulable until the
+  controller binds it;
+- tolerations of `node.kubernetes.io/unreachable` and `node.kubernetes.io/not-ready`, `NoExecute`,
+  with no `tolerationSeconds`: a restart of the controller does not evict the pods. A plain pod got
+  the API server's 300 s ones of the same keys at create, and the shortest counts; the
+  deployment's admission rules drop those limits at create (below), and the binder warns (event
+  `TimedNodeTolerations` on the pod) when it binds a pod that still has one.
+
+Kueue holds `podSetUpdates` immutable while the check stays `Ready` (its Workload webhook), so every
+`Ready` write carries the same ones, built from the Workload alone (`podSetUpdates` in
+`pkg/offload/admit.go`). `<node>` is `kueue-offload-<OffloadConfig name>`, the site's virtual
+node: the controller binds the pods to it, the node shows on each the state of its member, and
+owners end from their pods ([Owners](#owners), [Virtual node](#virtual-node)).
+
+Admitting at submit instead would make every retry and start-estimate deferral before the start
+evict an admitted Workload, and Kueue deletes the pods of an evicted plain-pod Workload (`Stop` of
+its pod integration): a notebook or a pipeline step would be killed instead of requeued. Admitting
+at the start keeps every path before it as it is, for every kind; the cost is that the pods appear
+only when the job starts. Kueue counts a Workload's `maximumExecutionTimeSeconds` from admission,
+so from the job's start, and deactivates it once that time passed; the site's wall time comes from
+the same value ([Offload controller behaviour](#offload-controller-behaviour)).
 
 ### Transient submit failures
 
@@ -77,10 +94,11 @@ before it creates anything of an attempt, when the site would start a job of the
 ([backends.md](backends.md) 3.1). It records the answer in the request's `status.estimate`
 (`probeTime`, `nodes`, and `startTime`, or `reason` and `message` when the site gave none) and
 submits nothing on that pass; on the next pass, a `pollInterval` later, it submits if the check is
-still `Pending`. A 502 whose text names a submit limit (`QOSMaxSubmitJob...`, `AssocMaxSubmitJob...`,
-`MaxSubmitJobLimit`) is recorded without `startTime`, with the limit's name as `reason`. Any other
-failure, unreadable capabilities included, is logged and the job goes without an estimate. The
-executor stops asking once the attempt's stage-in started or its job was submitted.
+still `Pending` (or `Ready`, for an attempt retried in place). A 502 whose text names a submit limit
+(`QOSMaxSubmitJob...`, `AssocMaxSubmitJob...`, `MaxSubmitJobLimit`) is recorded without `startTime`,
+with the limit's name as `reason`. Any other failure, unreadable capabilities included, is logged
+and the job goes without an estimate. The executor stops asking once the attempt's stage-in started
+or its job was submitted.
 
 While no job is submitted, the controller shows the estimate in the check message: `Slurm expects
 to start N node(s) at <UTC>`. With the OffloadConfig's `maxStartDelay` set, when `startTime -
@@ -127,8 +145,18 @@ deferral). The next attempt is one past the newest request of the check, deleted
 and past Kueue's `retryCount` while the check state holds one; every new reservation after an
 eviction is an attempt, whatever evicted the Workload.
 
-Once `backoffLimitCount` retries were spent the check goes to `Rejected` instead and the owner
-fails; 0 rejects at the first loss. The three limits are OffloadConfig's `retryStrategy`, which has
+After the start the Workload is admitted. An owner with a controller of its own (Job, JobSet,
+TrainJob, RayJob, RayCluster) is retried the same way: Kueue evicts the admitted Workload, suspends
+the owner, whose pods go, and queues it again. Kueue would delete an evicted plain pod instead, so
+a plain pod, a pod group or a notebook's pod is retried in place: the check stays `Ready` and the
+quota held, the controller deletes the request (the executor cancels the job), computes the delay
+as `UpdateAdmissionCheckRequeueState` does for that retry, records when in the Workload annotation
+`offload.interlink.eu/next-attempt-at`, and creates the next attempt once that time passed. The
+pods stay, `Pending` meanwhile. A start estimate defers such an attempt by `deferInterval` the same
+way, without deactivating the Workload.
+
+Once `backoffLimitCount` retries were spent the owner fails ([Owners](#owners)); 0 fails it at the
+first loss. The three limits are OffloadConfig's `retryStrategy`, which has
 ProvisioningRequestConfig's type and defaults (3 retries, 60 s base, 1800 s cap): with them the
 retries wait about 1, 2 and 4 minutes. `retryCount` is Kueue's; the controller never writes it. A
 job that ran and failed is not retried.
@@ -158,44 +186,47 @@ The controller handles Workloads owned by:
 
 Any other owner kind is `Rejected` with a message saying so.
 
+Owners end from their pods, as on any cluster: a Job by its succeeded or failed pods, a JobSet by
+its Jobs, a TrainJob by its JobSet, a plain pod or a pod group by their phases; a notebook's
+StatefulSet counts its pod ready as any. The node shows each pod the state of the member it stands
+for ([Virtual node](#virtual-node)); the controller writes no owner status.
+
 A RayJob or RayCluster runs as one batch job through a site launcher (`interlink.eu/launcher`;
-default `ray-job` for a RayJob and `ray` for a RayCluster, `RayJobLauncher` and `RayClusterLauncher`
-in `pkg/offload/ray.go`), which builds the Ray cluster from the allocation, head on the first node;
-a template's own launcher wins. KubeRay runs nothing, since Kueue keeps the owner suspended. A
-RayJob's submitter PodSet is not sent: every PodSet's first container runs a short Python submitter
-that hands the entrypoint, the whole `runtimeEnvYAML`, `metadata`, `jobId` and the entrypoint
-resources to the head's Ray job server (found through `RAY_ADDRESS`, which the launcher sets), as
-KubeRay's HTTP submission does, prints the job's logs and exits non-zero unless the job succeeded.
-A RayJob without an entrypoint is refused. A Ray owner of its head alone (no worker group, or
-worker groups of 0 replicas, which are not sent) runs on one node, as a pod group of one
-([Workload shapes](#workload-shapes)). A RayJob finishes through
-`status.jobDeploymentStatus` (`Complete` or `Failed`) and `jobStatus` (`SUCCEEDED` or `FAILED`),
-which Kueue's integration reads. A RayCluster has no terminal state that Kueue reads: when its job
-ends the controller deactivates its Workload (`spec.active: false`), which releases the quota, and
-Kueue deactivates it on a `Rejected` check.
+default `ray`, `RayClusterLauncher` in `pkg/offload/ray.go`), which builds the Ray cluster from the
+allocation, head on the first node, and blocks on the head; a template's own launcher wins. Both
+heads declare the dashboard (8265) and client (10001) ports, so the head's shadow forwards them and
+KubeRay's `<cluster>-head-svc` selects the head pod, which carries the shadow's IP. Once Kueue
+admitted the Workload, KubeRay drives it as on any cluster: it makes the head and worker pods,
+submits a RayJob's entrypoint (`HTTPMode` from the operator, `K8sJobMode` from its submitter Job,
+which runs in the cluster with the default scheduler and is not sent to the site), follows the
+Ray job through the dashboard and ends the RayJob `Complete`. Kueue then finishes the Workload, and
+the controller deletes the live request, which cancels the allocation. When the batch job ends
+first (its time limit, a crash), the controller deactivates the Workload (`spec.active: false`):
+Kueue suspends the owner, which releases the quota, and KubeRay deletes its pods; setting
+`spec.active` again starts a new cluster. A RayCluster has no terminal state that Kueue reads, so
+this is also how its quota is released. A Ray owner of its head alone (no worker group, or groups
+of 0 replicas, which are not sent) runs on one node, as a pod group of one
+([Workload shapes](#workload-shapes)). A RayJob's head forwards ports, so a site without
+`Shadow.LoginHost` refuses RayJobs.
 
-A Job, JobSet or TrainJob stays suspended for the job's whole life and finishes through its status:
-the controller patches the `status` subresource with the condition Kueue's integration for that
-kind reads ([Offload controller behaviour](#offload-controller-behaviour) lists the fields). JobSet
-and TrainJob are read and patched as unstructured objects, with no Go module of either project.
+A refused Workload (the executor's or the batch system's refusal, a shape, account, flavor or time
+limit the controller refuses, or `backoffLimitCount` retries spent) fails its owner as a kubelet
+refusing its pods would: the controller writes the message into the Workload annotation
+`offload.interlink.eu/failed` (at most 32 KiB) and sets the check `Ready`; Kueue admits, the owner
+makes or ungates its pods, and the node reports each `Failed` with reason `Rejected` and that
+message. A Job then fails by its `backoffLimit`, a TrainJob through its JobSet, a pipeline step or
+a Katib trial as any failed pod. An owner of an unsupported kind and a Ray owner get the check
+`Rejected` instead, and Kueue deactivates the Workload: KubeRay would make failed head pods again
+for ever. Event `Rejected` either way.
 
-Plain pods stay `SchedulingGated`. A single pod shows its job while it runs
-([Notebooks and Services](#notebooks-and-services)). At a terminal state the controller patches
-each owner pod's `status.phase` to `Succeeded` or `Failed`, with a terminated state for each
-container, so a workflow engine that reads the main container (Argo) sees how the step ended;
-`spec.nodeName` is never set. Kueue then removes its finalizers and marks the Workload
-`Finished`. Verified on the reference cluster: a 2-pod group held at `Pending`, both pods patched
-`Succeeded`, gave `Finished=True(Succeeded)` and a reservation of 0.
+For a pod group the node sets `kueue.x-k8s.io/retriable-in-group: "false"` on each member before
+it reports it `Failed`, and before it deletes a member whose job has not finished: without it Kueue
+waits for a replacement pod no allocation can take. The key and value come from Kueue's
+`pkg/controller/jobs/pod/constants`.
 
-When a pod group fails or is rejected, the controller first sets
-`kueue.x-k8s.io/retriable-in-group: "false"` on each group pod, then marks it `Failed`: without the
-annotation Kueue waits for replacement pods and never finishes the group. Annotating first means a
-pod is never left `Failed` without it if the controller stops halfway. Single pods and groups that
-succeed are not annotated. The key and value come from Kueue's `pkg/controller/jobs/pod/constants`.
-
-The controller needs `get` and `status` patch on `jobs`, `jobsets`, `trainjobs` and `rayjobs`,
-`get` on `rayclusters`, `patch` on `workloads` (a RayCluster's deactivation, a deferral's), `get`
-and `patch` on `pods` (the annotation) and `patch` on `pods/status` (the terminal phase).
+The controller needs `get` on `jobs`, `jobsets`, `trainjobs`, `rayjobs` and `rayclusters`,
+`patch` on `workloads` (its annotations, a deactivation), and for its node the rules of
+[Virtual node](#virtual-node).
 
 ### Owner annotations
 
@@ -213,15 +244,15 @@ Per Workload, for each of its checks this controller serves:
 
 | Situation | Action |
 | --- | --- |
-| `Finished=True` | nothing; the request stays until the Workload goes, and with it the job directory and the shadow, so the logs stay readable ([Shadow](#shadow)) |
+| `Finished=True` | delete a live request whose job did not end (a RayJob that KubeRay completed, a pod group whose pods a user deleted), which cancels the job; an ended request stays until the Workload goes, and with it the job directory, so the logs stay readable |
 | no `QuotaReserved=True`, evicted or deactivated | delete the live requests ([Workload deletion](#workload-deletion)); a Workload a deferral deactivated is reactivated when its `offload.interlink.eu/deferred-until` time comes ([Start estimate](#start-estimate)) |
-| check not `Pending` | nothing (`Retry`: Kueue evicts next; `Rejected`: Kueue deactivates) |
+| check `Retry` or `Rejected` | nothing (`Retry`: Kueue evicts next; `Rejected`: Kueue deactivates) |
 | check `Pending`, no OffloadConfig | nothing, requeue after a minute (the check is inactive) |
 | reserved, owner of an unsupported kind | check `Rejected` |
-| reserved, check `Pending`, no live request | create the next attempt's OffloadRequest ([The OffloadRequest](#the-offloadrequest)); refusals found while building it (account label, flavors, time limit, a RayJob's entrypoint) are `Rejected` |
-| a live request | map its status, newest first in this order: `Accepted=False`: check `Rejected` with the condition's message, owner `Failed` (reason `Rejected`); `Finished=True`: owner's terminal status ([Owners](#owners)), check stays `Pending` with `job N completed` or `job N failed: <message>`; `Evicted=True`: [Retries](#retries) (`job N cancelled: <message>`); no heartbeat for `executorLostTimeout`: [Retries](#retries); `QuotaReserved=True` for `maxQueueTime` without `Admitted`: [Retries](#retries); no job submitted and a `status.estimate` beyond `maxStartDelay`: Workload deactivated for `deferInterval`, check `Pending` ([Start estimate](#start-estimate)); otherwise `Pending` with the state in the message, and a single owner pod's status follows the job ([Notebooks and Services](#notebooks-and-services)) |
+| reserved, no live request | create the next attempt's OffloadRequest ([The OffloadRequest](#the-offloadrequest)); with the check `Ready`, an attempt retried in place, once its `offload.interlink.eu/next-attempt-at` passed ([Retries](#retries)). Refusals found while building it (account label, flavors, time limit) fail the owner ([Owners](#owners)) |
+| a live request | map its status, newest first in this order: `Accepted=False`: the owner fails with the condition's message ([Owners](#owners)); the job started or `Finished=True`: check `Ready` with `podSetUpdates` and the state in the message (`job N running on <node> since <start>`, `job N completed`, `job N failed: <message>`), and a Ray owner whose job ended is deactivated (its check stays `Pending` if it was, so that KubeRay makes no pods the deactivation would remove); `Evicted=True`: [Retries](#retries) (`job N cancelled: <message>`); no heartbeat for `executorLostTimeout`: [Retries](#retries); `QuotaReserved=True` for `maxQueueTime` without `Admitted`: [Retries](#retries); no job submitted and a `status.estimate` beyond `maxStartDelay`: Workload deactivated for `deferInterval`, check `Pending` ([Start estimate](#start-estimate)); otherwise `Pending` with the state in the message |
 
-The `Pending` messages: `StagingOut`: `job N ended, staging out: <message>`; `Admitted`: `job N
+The check messages: `StagingOut`: `job N ended, staging out: <message>`; `Admitted`: `job N
 running on <node> since <start>`; `QuotaReserved`: `job N queued (<reason>): <message>`;
 `StagingIn`: `staging in: <message>`; a reason or message and no condition: `waiting to submit
 (<reason>): <message>`; a `status.estimate` and no job yet: `Slurm expects to start N node(s) at
@@ -231,12 +262,22 @@ running on <node> since <start>`; `QuotaReserved`: `job N queued (<reason>): <me
 `pollInterval`, and on every change of it.
 
 The account is the ClusterQueue's label `hpc.interlink.eu/account`, which the membership controller
-sets on the ClusterQueues it makes; a ClusterQueue without it is `Rejected`. Each PodSet's
+sets on the ClusterQueues it makes; without it the owner fails ([Owners](#owners)). Each PodSet's
 annotations come from the OffloadConfig's `flavors` entry of its admitted flavors. Each value is a
 Go text/template, executed with `.Account`, `.MaxExecSeconds` (the job's wall time: the Workload's
 `spec.maximumExecutionTimeSeconds`, else the longest `interlink.eu/time-limit` (`HH:MM:SS`) of its
 PodSets, a template's value winning over the owner's and an empty one counting as none; 0 when
-neither) and `.MaxExecMinutes` (the same, rounded up). The request's
+neither) and `.MaxExecMinutes` (the same, rounded up, and one minute more when it is Kueue's
+`maximumExecutionTimeSeconds` and the flavor's `maxExecutionTimeSeconds` leaves room). Kueue
+deactivates the Workload at its limit, counted from admission, which is the job's start as the
+executor sees it (the plugin's status cache and the executor's poll take up to 25 s by default), so
+a job past Kueue's limit is deactivated and its owner suspended, as on any Kueue cluster, and the
+site's limit is the backstop. At the flavor's limit, or when the start is seen more than a minute
+late (an executor down when the job starts), whichever comes first ends the job. A job past
+`interlink.eu/time-limit` alone ends `Failed` by the site's limit, as on the virtual kubelet: an
+owner whose controller waits for a final state (a Katib trial, a TrainJob) sets that annotation,
+not Kueue's label. The `/estimate` probe takes the flavor's `--time` when its flags carry one, the
+one the job gets. The request's
 `spec.maximumExecutionTimeSeconds` carries that wall time:
 
 ```yaml
@@ -252,10 +293,10 @@ flavors:
 PodSets admitted on different flavors (the Workload runs in one allocation, which takes one queue;
 the message asks to pin one queue on every PodSet), a PodSet whose flavors render different
 annotations, a PodSet none of whose flavors is listed (its job would carry no account) and a
-template that does not execute are `Rejected`.
+template that does not execute are refused, and the owner fails.
 
 A flavor's `maxExecutionTimeSeconds` is the longest wall time of the batch queue it stands for. A
-Workload asking for more is `Rejected` (`a job runs at most 02:00:00 on queue <flavor>;
+Workload asking for more is refused (`a job runs at most 02:00:00 on queue <flavor>;
 interlink.eu/time-limit asks for 02:01:00`), and so is an `interlink.eu/time-limit` that is not
 `HH:MM:SS` or asks for no time: Kueue cannot choose a flavor by time, and the queue would hold or
 refuse the job.
@@ -264,37 +305,11 @@ Check state writes are server-side apply patches of `status.admissionChecks` (a 
 `name`) on `workloads/status` with field manager `kueue-offload`. They carry `name`, `state`,
 `message`, `lastTransitionTime` and, on `Retry`, `requeueAfterSeconds`, never `retryCount`. A write
 happens only when the state or the message changed, and `lastTransitionTime` moves only with the
-state. Owner status patches use `jobs/status`, `jobsets/status`, `trainjobs/status` or
-`pods/status`. Events on the Workload: `Submitted` for each attempt, `Running` when a job runs or
-moves node, `Completed`, `Failed`, `Retry`, `Deferred` and `Reactivated` ([Start
-estimate](#start-estimate)), `Rejected`, and `ExecutorUnreachable` when the heartbeat stops.
-
-Owner Job status on completion: `startTime` and `completionTime` from the request's status, `succeeded` =
-`completions` (`parallelism` when unset), `completedIndexes` `0-(n-1)` for Indexed Jobs, condition
-`Complete=True` (reason `KueueOffload`, message with the job ID). On failure: `failed: 1`,
-condition `Failed=True` (reason `KueueOffload` or `Rejected`, message from the executor). Clusters
-that require `SuccessCriteriaMet`/`FailureTarget` before a terminal condition get those first: the
-patch is tried with them and sent again without them on a 422.
-
-Owner JobSet: condition `Completed=True` or `Failed=True` and `status.terminalState` `Completed`
-or `Failed`. Owner TrainJob: condition `Complete=True` or `Failed=True`. Both with reason and
-message as on the Job's condition; an owner that already has one of those conditions is skipped.
-Owner RayJob: `status.jobDeploymentStatus` `Complete` with `jobStatus` `SUCCEEDED`, or `Failed` with
-`jobStatus` `FAILED` and reason `AppFailed` (`SubmissionFailed` for a rejection), with the message,
-`startTime` and `endTime`; KubeRay keeps that status on a suspended RayJob. Owner RayCluster: its
-Workload deactivated ([Owners](#owners)).
-
-Owner pods at a terminal state: `status.phase` `Succeeded` or `Failed`, `reason` `KueueOffload`
-(`Rejected` for a rejection), `message` as on the Job's condition, conditions `Ready` and
-`ContainersReady` `False`. `status.containerStatuses` has one entry per spec container (`name`,
-`image`, `ready: false`, `restartCount: 0`, `state.terminated` with `exitCode`, reason
-`Completed` for 0 and `Error` otherwise, `startedAt` and `finishedAt` from the executor's
-`startTime` and `completionTime`, the controller's clock when unset). The exit code is the one the request's `status.ranks[0].containers` reports for that container name, else 0
-for a completed job and 1 for a failed or rejected one. `status.initContainerStatuses` has every
-init container terminated with exit code 0. Pods already `Succeeded` or `Failed`, and pods that
-no longer exist, are skipped.
-
-The executor's `Shadow.AlwaysShadow` decides which jobs get a shadow.
+state; a `Ready` write also carries the `podSetUpdates` ([The check goes Ready when the job
+starts](#the-check-goes-ready-when-the-job-starts)). Events on the Workload: `Submitted` for each
+attempt, `Running` when a job runs or moves node, `Completed`, `Failed`, `Retry`, `Deferred` and
+`Reactivated` ([Start estimate](#start-estimate)), `Rejected`, and `ExecutorUnreachable` when the
+heartbeat stops.
 
 ## The OffloadWorker
 
@@ -361,9 +376,6 @@ spec:
   UID.
 - `ownerAnnotations` ([Owner annotations](#owner-annotations)) apply to every template; the
   template's own value wins.
-- `ownerLabels`: for a Workload of one plain pod, that pod's labels as they are, since Kueue's
-  PodSet template of a pod holds its spec only; empty for every other owner. Only the shadow
-  uses them ([Notebooks and Services](#notebooks-and-services)).
 - Per PodSet, `flavors` and `count` are Kueue's admission, `annotations` the flavor's, expanded;
   empty when the flavor has none. The executor appends each value to the template's own value for
   that key, after a space, and never parses it. `template` is the Workload's PodSet template as it
@@ -395,8 +407,8 @@ The executor of the namespace whose site is `spec.site` takes a request by addin
 | condition `Evicted` | `True` when the job was lost: a container terminated with reason `Cancelled` (cancelled outside the executor), or a rank missing from the plugin's status for `Executor.LostTimeout` (reason `Vanished`); `False` with reason `RankMissing` while a rank is missing, since its `lastTransitionTime` |
 | `reason`, `message` | what it is doing or waiting for: the first waiting container's reason and message of a queued job; for a submit refused for now (staging in, the plugin's 503, a cluster read that failed) why |
 | `jobID`, `nodeName`, `nodes`, `socketDir`, `startTime`, `completionTime` | as the plugin's `/status` reports them; for independent pods `jobID` lists every rank's job, comma-separated, or the first and the last past eight; `nodeName` is the head rank's node, the one the shadow tunnels to |
-| `ranks[]` | `rank`, `podUID` (empty for a rank of independent pods that waits for the site), `jobID` (for independent pods the one `/create` named), `state` (`queued`, `running`, `completed`, `failed`), `exitCode`, `containers` (`corev1.ContainerStatus` as the plugin reports them; the head rank's exit codes reach the owner pods) |
-| `shadow` | `deployment`, `service` of the shadow; `podIP` and `ready` (its `Ready` condition) of its pod, a ready one if there is one, pods being deleted left out |
+| `ranks[]` | `rank`, `podUID` (empty for a rank of independent pods that waits for the site), `jobID` (for independent pods the one `/create` named), `nodeName` (the member's compute node), `state` (`queued`, `running`, `completed`, `failed`), `exitCode`, `containers` and `initContainers` (`corev1.ContainerStatus` as the plugin reports them); what the rank's pod on the virtual node shows ([Virtual node](#virtual-node)) |
+| `shadow` | while the job tunnels: `deployment`, `service` of the shadow; `podIP` and `ready` (its `Ready` condition) of its pod, a ready one if there is one, pods being deleted left out; rank 0's pod on the virtual node takes that IP |
 | `estimate` | the site's start estimate asked before the attempt was submitted: `probeTime`, `nodes`, `startTime`, or `reason` and `message` when the site gave none ([Start estimate](#start-estimate)) |
 
 When a request is deleted, the executor cancels its job unless it ended (`/delete` for every
@@ -409,10 +421,9 @@ the API server (`get` on workloads): the request's controller owner is that Work
 UID, the Workload has the check, and its PodSets (name, template) and their admission (count,
 flavors) are the request's; otherwise it refuses the request. The PodSets it compares are those
 the controller prepares (`offload.RequestPodSets`): for a Ray owner without a RayJob's submitter,
-with the launcher, a RayCluster head's ports and labels, and a RayJob's entrypoint, which the
-executor reads from the RayJob (`get` on rayjobs). A Workload without its reservation
-(`QuotaReserved` not `True`, evicted, inactive or finished) or with the check not `Pending` makes
-the request wait, since the controller deletes it. A request also waits while an earlier attempt
+with the launcher and the head's ports. A Workload without its reservation (`QuotaReserved` not
+`True`, evicted, inactive or finished) or with the check `Retry` or `Rejected` makes the request
+wait, since the controller deletes it. A request also waits while an earlier attempt
 of its Workload still carries the executor's finalizer: both attempts' members, shadow and stage
 Jobs carry the Workload UID, and both stage to the same directory at the site. The wait covers the
 earlier attempt's copy back, at most `Staging.StageOutTimeout`, during which the Workload keeps its
@@ -462,36 +473,43 @@ reach the interLink API server or the plugin writes no heartbeat, so such a fail
 
 ## Executor HTTP API
 
-The offload controller calls no executor endpoint: submitting a job, reading its state and
-cancelling it go through the OffloadRequest, so the executor authenticates no caller and needs no
-ingress from the controller's namespace, and the controller resolves no executor address. What
-remains is for the shadows: plain text answers, no wire types. `pkg/executorapi` holds the names
-the executor shares with the controller and the API server.
+Submitting a job, reading its state and cancelling it go through the OffloadRequest. What remains
+over HTTP is the job's log, which the offload controller's virtual node reads for `kubectl logs`
+([Virtual node](#virtual-node)), at the OffloadConfig's `executorService` and `executorPort` in
+the request's namespace: plain text answers, no wire types. `pkg/executorapi` holds the names the
+executor shares with the controller and the API server (`GetLogsPath` and the query parameters).
 
 ### GET /getLogs
 
 Query: `workloadUID` (required), `container` (default: each member's first container), `rank`
-(optional), `follow` (`true`/`false`), `tail` (lines), `sinceSeconds`. Every member is read through
-the API server's `/getLogs`, as the plugin returns it (for Slurm, the job's `job.out` and the
-container's output).
+(optional), `follow` (`true`/`false`), `tail` (lines), `sinceSeconds`, `sinceTime` (RFC 3339),
+`limitBytes`, `timestamps`, `previous`. Every member is read through the API server's `/getLogs`,
+as the plugin returns it (for Slurm, the job's `job.out` and the container's output).
 
-- With `rank`: that rank's log.
+- With `rank`: that rank's log, which is what the node asks for the rank's pod.
 - Without `rank` and one member: rank 0, no prefix.
 - Without `rank` and several members: every member that has the container, each line prefixed
   `[rank N] `. Without `follow`: rank 0's lines, then rank 1's, and so on, `tail` over the whole.
   With `follow`: the lines of every rank's followed stream as they arrive, `tail` per rank.
 
+400 for what a kubelet would refuse too: `previous=true` (an offloaded container has no previous
+instance), `tail` with `limitBytes` and `sinceSeconds` with `sinceTime` (the interLink API server
+refuses both pairs), a `sinceTime` that does not parse, and, without `follow`, a rank whose job
+has not started or that waits for the site (`container <c> of rank <n> is waiting to start`).
+
 The logs are those of the Workload's newest submitted request that still carries the executor's
 finalizer; with none, 404. A followed log starts once the job ran (the request's `startTime`,
-`Admitted=True` or an end), so the plugin is not asked to follow a log that does not exist yet. It ends when every rank's stream ended and the plugin's `/status` shows those containers
-terminated. A rank's stream that ends before that (a plugin without Follow, or the API server
-ending a stream it lost from the plugin as if it were complete) is opened again after 5 s with the
-lines already sent skipped, so each line reaches the caller once; a last line without a newline is
-held back until the container ended. With `tail` or `sinceSeconds` the lines of a new stream
-cannot be matched to the old one, so such a stream is broken: the executor aborts the answer, and
-the shadow's `executor logs` reconnects.
+`Admitted=True` or an end), so the plugin is not asked to follow a log that does not exist yet. It
+ends when every rank's stream ended and the plugin's `/status` shows those containers terminated.
+A rank's stream that ends before that (a plugin without Follow, or the API server ending a stream
+it lost from the plugin as if it were complete) is opened again after 5 s with the lines already
+sent skipped, so each line reaches the caller once; a last line without a newline is held back
+until the container ended. With `tail`, `sinceSeconds` or `limitBytes` the lines of a new stream
+cannot be matched to the old one, so such a stream is not opened again: the executor aborts the
+answer, and `kubectl logs -f` ends.
 
-No authentication: the sample's NetworkPolicy lets only the namespace's shadow pods reach it.
+No authentication: the sample's NetworkPolicy lets only the offload controller's pods (namespace
+`kueue-offload`, label `app: kueue-offload`) reach the port.
 
 ### GET /healthz
 
@@ -517,15 +535,15 @@ shows unsubmitted is read again from the API server before a submit, since the c
 behind the executor's last status write and a second submit would start a second job. It needs,
 in its namespace: `get`, `list`, `watch` and `patch` on `offloadrequests`, `patch` on
 `offloadrequests/status`, `get` on `kueue.x-k8s.io` `workloads`, and the rules of
-`config/rbac/executor/role.yaml` for Secrets, ConfigMaps, tokens, shadows and their EndpointSlices,
-stage Jobs, Events on the owner and the staging volumes' claims.
+`config/rbac/executor/role.yaml` for Secrets, ConfigMaps, tokens, shadows, stage Jobs, Events on
+the owner and the staging volumes' claims.
 
 What it keeps about a request lives in the request's status, so a restarted executor follows
 every job from its request alone: the job ID, the ranks (each member's `podUID`, and for
 independent pods the job `/create` named; a rank without a `podUID` waits for the site), the
 shadow's names, and since when a rank is missing (`Evicted=False`, `RankMissing`). Only one fact
-is in memory: that an ended job's shadow was rendered for the end. A restarted executor renders it
-once more, which changes nothing.
+is in memory: that an ended job's shadow was deleted. A restarted executor deletes it once more,
+which changes nothing.
 
 ### Reconciling a request
 
@@ -535,7 +553,7 @@ once more, which changes nothing.
    job's outputs, remove the finalizer ([Status](#status), [Staging](#staging)).
 2. Add the finalizer `offload.interlink.eu/executor` if missing.
 3. A refused request (`Accepted=False`) or one whose job finished or was lost: nothing more,
-   except rendering an ended job's logs-only shadow once.
+   except deleting an ended job's shadow once.
 4. No job yet: read the request again from the API server, check its shape, its sizing and
    flags, its Workload and the earlier attempts (refuse, or wait with the reason in the status),
    set `Accepted=True`, ask the start estimate once ([Start estimate](#start-estimate)), then on a
@@ -560,7 +578,7 @@ membership controller gives a namespace mapped to two users of one site no execu
 `info`). Unknown keys are refused.
 
 ```yaml
-Listen: ":8000"            # /getLogs and /healthz; the default
+Listen: ":8000"            # /getLogs (the offload controller) and /healthz; the default
 InterLink:
   URL: http://127.0.0.1:3000   # the interLink API server
 Executor:
@@ -583,12 +601,9 @@ Sites:
       Flags: [--constraint]
       Flavors: [default]
 Shadow:
-  Enabled: true
-  AlwaysShadow: true       # unset: true
+  Enabled: true            # shadows for jobs that expose ports or tunnel back
   Image: ghcr.io/interlink-hq/interlink/ssh-tunnel:0.6.3-pre2
-  ExecutorImage: ""        # image of the job-logs container; empty: env EXECUTOR_IMAGE
-  ExecutorURL: http://kueue-offload-executor:8000
-  LoginHost: login.hpc-a.example.org   # empty: logs-only shadows, no tunnels
+  LoginHost: login.hpc-a.example.org   # empty: no shadows; ports and reverse forwards refused
   User: alice
   Port: 22                 # 0: 22
   KeySecret: hpc-a-tunnel-key
@@ -671,7 +686,8 @@ each to `/create`, in rank order. Each template first gets the request's `ownerA
 does not set itself, and then loses the init containers that its
 `interlink.eu/disable-offload-init-containers` names (comma separated, as the virtual kubelet reads
 it) and the volumes that only they mount. The virtual kubelet runs them on the cluster, in the
-shadow; here the pod stays gated and they run nowhere. A site sets it by admission policy for an
+shadow; here they run nowhere (the pod on the virtual node shows them terminated). A site sets it
+by admission policy for an
 init container that cluster policies inject into every pod and that breaks the site's container
 hooks. Members are numbered across the PodSets in request order,
 and `<count>` below is the total of every PodSet's count:
@@ -810,53 +826,26 @@ bookkeeping files write-only, and the site's `sbatch` shim rewrites files in pla
 ### Shadow
 
 The shadow is a Deployment in the tenant namespace, outside every ClusterQueue, that the executor
-renders for a job: an SSH tunnel to the job's exposed ports (`ssh-forward`), a Service when the
-template exposes ports, a ConfigMap with the compute node and the socket directory the plugin
-reports in `/status`, and a `job-logs` container (`/executor logs`) that streams the job's output
-from the executor's `GET /getLogs`. With `Shadow.AlwaysShadow` every job gets one, also without
-exposed ports, so its logs are always reachable. The executor ensures the shadow on every poll
-once the job runs: a shadow that tunnels waits until the plugin reports the node, one that only
-streams logs starts at once, also on a backend that reports no node. A shadow that tunnels for
-a Workload of one plain pod also carries the labels its Services select the pod by
-([Notebooks and Services](#notebooks-and-services)). For any other owner the template's labels
-stand for rank 0's pod, as a RayCluster's head template carries the labels its head Service
-selects: the shadow does not carry them, since an operator counts its own pods by them, and the
-executor publishes it to each Service of the namespace that selects them with an EndpointSlice
-(labels `kubernetes.io/service-name`, `endpointslice.kubernetes.io/managed-by:
-kueue-offload-executor`, the shadow's own), listing the shadow pod's IP and only the Service's
-ports the shadow forwards (a named `targetPort` resolved against the template), `ready` as the
-EndpointSlice controller sets it. The slice follows the pod's IP, and goes when the shadow turns
-logs-only or is deleted; the executor needs `create`, `update`, `delete` and `list` on
-`endpointslices`. Each poll records the IP and readiness of the shadow's pod in the request's
-`status.shadow`. A deployment restricts who reaches shadows with a NetworkPolicy on their label
-`interlink.eu/shadow: "true"`.
+renders for a job whose rank 0 template exposes a TCP port (container ports or
+`interlink.eu/wstunnel-extra-ports`) or asks for a reverse tunnel, and for no other job: an SSH
+tunnel to the job's exposed ports (`ssh-forward`), a Service when the template exposes ports, and a
+ConfigMap with the compute node and the socket directory the plugin reports in `/status`. The
+executor ensures it on every poll once the job runs on a known node, and deletes it once the job
+ended (`status.shadow` goes with it). Each poll records the IP and readiness of the shadow's pod in
+the request's `status.shadow`, and the virtual node gives rank 0's pod that IP: the owner's
+Services, a RayCluster's head Service, a Notebook's Service and any EndpointSlice select the
+user's pod as on any cluster and reach the shadow. The shadow carries only its own labels
+(`interlink.eu/shadow`, `interlink.eu/shadow-of: <Workload UID>`) and publishes no EndpointSlice.
+Its Deployment uses the `Recreate` strategy, so a reverse tunnel is never held by two pods. A
+deployment restricts who reaches shadows with a NetworkPolicy on their label
+`interlink.eu/shadow: "true"`. The logs never go through a shadow ([Virtual node](#virtual-node)).
 
-Without `Shadow.LoginHost` every shadow only streams logs, and neither `Shadow.User` nor
-`Shadow.KeySecret` is needed: for a backend whose nodes the cluster cannot reach, or that reports no
-node. The executor then refuses a head template that exposes a TCP port (container ports or
-`interlink.eu/wstunnel-extra-ports`) or asks for reverse forwards, and `Shadow.Reverse.Enabled` is
-refused at start. A deployment that wants such ports ignored there removes them at admission
-instead.
-
-At a terminal state the executor renders it once more as logs-only: no `ssh-forward`, no
-`ssh-reverse`, no init containers, no Service, only `job-logs`, which prints the whole log and
-then stays idle, so `kubectl logs <shadow> -c job-logs` still shows the output after the job ended.
-While it tunnels, the shadow's Deployment uses the `Recreate` strategy, so a reverse tunnel is
-never held by two pods. The logs-only shadow it flips to rolls, so its log stays readable while the
-new pod starts; for a few seconds both pods print it, and `kubectl logs deploy/<shadow>` reads one.
-
-`kubectl logs` shows what the kubelet keeps: the container's newest log file, rotated at
-`containerLogMaxSize` (10Mi by default, about 40 bytes of timestamp and stream tags per line
-included), so a large log can leave that file empty once the stream ends. When `job-logs` printed
-more than 10 MiB as stored, it waits 30 s for the kubelet's rotation check (every 10 s by
-default), then prints `--- the end of the log again, ... ---` (`executor.LogsTailBanner`) and the
-log's last lines, at most 256 KiB as stored. A file left between 9.75 and 10 MiB by the stream
-still rotates then, empty. The whole log is always `kubectl exec <shadow pod> -c job-logs --
-/executor logs`: the same client without `--follow`, which reads the executor and the workload
-from the container's environment (`EXECUTOR_URL`, `WORKLOAD_UID`) and copies `GET /getLogs` once.
-Tenants need `pods/exec`, which Kubeflow's `kubeflow-edit` grants.
-The executor deletes the shadow when the job's OffloadRequest is deleted: when the Workload is
-deleted, loses its reservation, or its attempt is retried.
+Without `Shadow.LoginHost` no job has a shadow, and neither `Shadow.User` nor `Shadow.KeySecret`
+is needed: for a backend whose nodes the cluster cannot reach, or that reports no node. The executor
+then refuses a head template that exposes a TCP port or asks for reverse forwards, and
+`Shadow.Reverse.Enabled` is refused at start. A deployment that wants such ports ignored there
+removes them at admission instead. The executor deletes the shadow when the job's OffloadRequest is
+deleted: when the Workload is deleted, loses its reservation, or its attempt is retried.
 
 A head template with `interlink.eu/reverse-forwards` also gets a tunnel from the compute node back
 to the listed cluster endpoints (`ssh-reverse`), parsed with the virtual kubelet's rules plus
@@ -877,18 +866,9 @@ type Spec struct {
     Template     corev1.PodTemplateSpec // rank 0's template: ports, annotations, labels
     NodeName     string                 // empty until running
     SocketDir    string
-    Terminal     bool // job ended: logs-only shadow
     // Reverse is the job's tunnel back into the cluster, nil unless it asked for
     // one (ParseReverseTunnel).
     Reverse *ReverseTunnel
-    // Labels are the owner pod's, for a workload of one plain pod. A shadow that
-    // tunnels carries those a Service selects the pod by (serviceLabels), so that
-    // the Service selects the shadow too. Without them the template's labels
-    // stand for rank 0's pod, as a RayCluster's head template carries the labels
-    // its head Service selects; the shadow does not carry those, which an
-    // operator counts its own pods by, and is published to the Services that
-    // select them with an EndpointSlice each instead.
-    Labels map[string]string
 }
 
 type Ref struct {
@@ -899,9 +879,9 @@ type Ref struct {
 
 type Manager interface {
     // Ensure creates or updates the shadow for spec: Deployment, Service (only with exposed
-    // ports), node ConfigMap with compute-node and socket-dir, and without owner pod labels an
-    // EndpointSlice for each Service that selects the template. Idempotent; called on every
-    // poll once the job runs.
+    // ports), node ConfigMap with compute-node and socket-dir. Nothing, and Ref{}, when spec
+    // neither forwards ports nor tunnels back; an error when it does without LoginHost.
+    // Idempotent; called on every poll once the job runs.
     Ensure(ctx context.Context, spec Spec) (Ref, error)
     // Delete removes every object labelled for this workload. Idempotent.
     Delete(ctx context.Context, workloadUID string) error
@@ -911,45 +891,130 @@ type Manager interface {
 ## Notebooks and Services
 
 A Kubeflow Notebook runs as a StatefulSet whose pod carries `kueue.x-k8s.io/queue-name`, so Kueue's
-pod integration makes it a Workload of one plain pod, held gated. Its Service selects
-`statefulset: <name>` and sends port 80 to the container's port (8888 by default); the Kubeflow UI
-shows the Notebook ready, with Connect, once the StatefulSet counts one ready replica. A shadow
-carrying the pod's labels and a pod reported `Running` gave both under the virtual kubelet; here:
+pod integration makes it a Workload of one plain pod, gated until its job started. Its Service
+selects `statefulset: <name>` and sends port 80 to the container's port (8888 by default); the
+Kubeflow UI shows the Notebook ready, with Connect, once the StatefulSet counts one ready replica.
+Here, as on the virtual kubelet:
 
-- The controller copies the pod's labels into the request's `spec.ownerLabels`. A shadow that
-  tunnels carries those by which a Service of the namespace selects the pod, read on every
-  poll, and no other: Kueue's (`kueue.x-k8s.io/*`) never, since Kueue gates a pod with its
-  queue label, and the shadow's own keys win. Copying every label, as the virtual kubelet does,
-  would also hand the shadow the labels PodDefaults and policies select pods by: the spawner's
-  PodDefault that sets the queue label would get the shadow gated. The Service then selects the
-  shadow, which forwards the pod's ports as any shadow does. The logs-only shadow of an ended job
-  carries none of them, so no Service reaches it.
-- The executor records the shadow pod's IP and readiness in `status.shadow`.
-- While the request is `Admitted`, the controller patches the gated pod's status the way a kubelet
-  would, as MultiKueue copies a worker's pod status onto the manager's gated pod: phase
-  `Running`; `startTime` and every container running since the job's start, init containers
-  terminated with 0; `Initialized` `True`; `Ready` and `ContainersReady` `True` while the shadow
-  is ready, the job is not staging out and every container with a `readinessProbe` is ready in the
-  head rank's status (`RankStatus.Containers`: the site runs the probe in the job, for example a
-  notebook's test of the socket its server listens on), `False` with reason `KueueOffload`
-  otherwise; `podIP` and `podIPs` the shadow pod's. `PodScheduled` stays the gated pod's and
-  `spec.nodeName` stays empty. The StatefulSet counts a `Running` pod with `Ready` `True` as ready,
-  and the notebook controller copies its `readyReplicas` to the Notebook.
-- `kubectl logs` of the pod cannot work, since it never runs on a node. While the job has a shadow,
-  the status message and the annotation `offload.interlink.eu/logs` (`LogsAnnotation`) hold the
-  command that prints its whole log so far, `kubectl exec -n <ns> deploy/<shadow> -c job-logs --
-  /executor logs` (`shadow.JobLogsContainer`, `shadow.JobLogsCommand`), and a terminal message
-  ends with `; logs: <command>`. `kubectl logs -f` of the shadow follows the log as it comes
-  ([Shadow](#shadow)).
-- When the job stops running without ending (requeued at the site, lost, retried, or the Workload
-  lost its reservation), the pod goes back to a gated pod's status: `Pending`, no IP, no container
-  statuses, no kubelet conditions. At the end it takes the terminal status of [Owners](#owners).
+- Once the job started the pod is ungated and bound to the site's node, which reports it `Running`
+  with the shadow's IP ([Virtual node](#virtual-node)). The Service selects the pod as on any
+  cluster, so its endpoint is the shadow, which forwards the pod's ports.
+- The pod is `Ready` when the shadow is ready, the job is not staging out, and every container
+  with a `readinessProbe` in the request's template is ready in the rank's status: the site runs
+  the probe in the job, for example a notebook's test of the socket its server listens on. The
+  StatefulSet counts it ready, and the notebook controller copies `readyReplicas` to the Notebook.
+- `kubectl logs` of the pod, and the UI's log tab, show the job's output; `kubectl exec`, and the
+  UI's terminal, answer that exec is not supported.
+- A job that stops without ending (requeued at the site, lost, retried in place) shows the pod
+  `Pending` until the next attempt runs; at the end the pod takes the rank's terminal state.
 
-Kueue 0.16.9 keeps such a pod suspended: its pod controller's `IsSuspended` is "gated or terminal",
-`Finished` a terminal phase, `IsActive` of a single pod always false, and the jobframework reads
-`PodsReady` only for an admitted Workload; its pod webhooks match `pods`, not `pods/status`. Jobs,
-JobSets, TrainJobs and pod groups get none of this: a Service in front of several ranks would
-reach only the head rank's tunnel.
+Jobs, JobSets, TrainJobs and Ray owners get the same pods, statuses and Services: a Service that
+selects rank 0's pod reaches the shadow, one that selects other ranks reaches no endpoint, since
+only rank 0's pod carries an IP.
+
+## Virtual node
+
+One node per site, named `kueue-offload-<OffloadConfig name>` (`v1alpha1.NodeName`), run inside the
+offload controller by `pkg/node` on the leader: no Deployment, image or credential of its own.
+The pods of a Workload admitted through the site's check are bound to it, and it shows on each the
+state of the member of the job it stands for, as a kubelet shows a pod it runs, and serves its
+logs. It uses the `virtual-kubelet` library (v1.11.0, packages `node` and `node/api`) for the node
+status loop and the kubelet API's routes, not its pod controller.
+
+| Item | Value |
+| --- | --- |
+| owner | the OffloadConfig (garbage collected with it); the node's Lease is owned by the node |
+| labels | `kubernetes.io/hostname`, `kubernetes.io/os: virtual-kubelet` (DaemonSets that select an OS skip it), `kubernetes.io/role: agent`, `type: virtual-kubelet`, `node.kubernetes.io/exclude-from-external-load-balancers`, `offload.interlink.eu/node: <name>`, `offload.interlink.eu/site: <worker>` |
+| labels from the OffloadConfig | `nodeLabels`, for the cluster's own conventions (the label its DaemonSets keep off virtual nodes by); never replacing the ones above |
+| providerID | `external:///<name>`: a cloud controller manager deletes a node that is not ready and has no instance of its provider, and with it the pods bound to it |
+| taint | `offload.interlink.eu/node=<name>:NoSchedule`; binding ignores taints |
+| capacity | `cpu: 1`, `memory: 1Gi`, `pods: 1000`: nothing is scheduled by fit, and autoscalers that count node cores (CoreDNS's) do not grow with the site |
+| addresses, port | `InternalIP` the controller pod's IP (`POD_IP`), kubelet port 10250 |
+| Lease | `kube-node-lease/<name>`, 40 s |
+| conditions | `Ready`, no pressure, network available |
+
+Binding (`pkg/offload/bind.go`): a pod with the annotation `offload.interlink.eu/workload`, no
+node, no scheduling gate and not being deleted, whose Workload is admitted, not finished, and has
+the check `Ready`, is numbered (annotation `offload.interlink.eu/rank`, kept once written) and bound
+through `pods/binding` to the node its `offload.interlink.eu/node` label names, which must be its
+check's. The rank is the offset of the pod's PodSet among those sent to the site plus its index:
+JobSet job and completion index, a Job's completion index, a StatefulSet ordinal, a Ray head 0,
+else the lowest free index of its PodSet in name order; it is the executor's rank of that member.
+A deployment needs three mutating admission rules (Kyverno rules; Kubernetes 1.30 has no
+MutatingAdmissionPolicy), each at create, for a pod or Job with the site's queue label or, made after
+admission, the node label:
+
+- pods: `schedulerName: kueue-offload` (immutable after create): the default scheduler never takes
+  these pods, and the node selector keeps a pod the rule missed away from real nodes;
+- pods: no `tolerationSeconds` on the `NoExecute` tolerations of `node.kubernetes.io/not-ready`
+  and `unreachable`, which the API server adds before admission webhooks run: without it a node
+  not ready for 5 minutes (the controller down) evicts a plain pod and cancels its job. At create,
+  since a policy may freeze a pod's tolerations after;
+- Jobs: `backoffLimit: 0`: a lost job is retried through Kueue (`retryStrategy`), and with the
+  default 6 the node would fail each new pod again from the same finished job, for minutes.
+
+Pod status (`pkg/node/status.go`, from the Workload, its live request and the rank):
+
+| Request | Pod |
+| --- | --- |
+| none, the rank queued or pending, or the job not started | `Pending`, containers waiting with the request's reason (`Queued`, `StagingIn`, `WaitingForAttempt`) and message |
+| started, not finished | `Running` since the rank's start; init containers terminated; `Ready` as in [Notebooks and Services](#notebooks-and-services); rank 0's pod with the shadow's IP |
+| `Finished`, `Succeeded` | `Succeeded`, containers terminated with the rank's exit codes |
+| `Finished`, `Failed` | each rank's own end, its exit codes (1 when missing); when no rank failed (a failed stage-out), rank 0 `Failed` with the request's message |
+| Workload annotation `offload.interlink.eu/failed` | `Failed`, reason `Rejected`, the annotation as message ([Owners](#owners)) |
+| a pod with the node's label but no Workload or rank annotation | `Failed`, reason `NotOffloaded` |
+
+A pod already `Succeeded` or `Failed` is never written again. A pod being deleted is deleted at
+once (grace 0); its job goes with its request. The controller caches only pods with the label
+`offload.interlink.eu/node`, so a pod bound here without it (a DaemonSet's that tolerates the
+taint) is left as it is.
+
+Logs: `kubectl logs <pod>` reaches the node's kubelet API, which asks the executor of the pod's
+namespace (`GET /getLogs` with the Workload's UID, the rank and the container) at the
+OffloadConfig's `executorService` and `executorPort`, and streams the answer: `-f`, `--tail`,
+`--since`, `--since-time`, `--limit-bytes` and `--timestamps` as on any pod, `--previous` refused
+([GET /getLogs](#get-getlogs)). Nothing is stored in the cluster, so no kubelet log file bounds a
+large log. Exec, attach and port-forward are not supported: `kubectl exec` answers "exec into an
+offloaded container is not supported: the interLink plugin API has no exec call". Supporting it
+needs an exec call in interLink's plugin API, an executor route that streams stdin, stdout, stderr
+and resizes, and in each plugin a way to run the command in the job's container on the member's
+node; the virtual kubelet has none of these either. `kubectl port-forward` to a pod's Service
+reaches the shadow.
+
+Kubelet API (`pkg/node/server.go`): one HTTPS listener on `:10250` for every node of the
+controller. Clients are authenticated as a kubelet does, with the API server's client CA
+(`kube-system/extension-apiserver-authentication`) and TokenReview, and authorized with
+SubjectAccessReview on `nodes/proxy`, `nodes/log`, `nodes/stats` and `nodes/metrics`. The serving
+certificate comes from a `kubernetes.io/kubelet-serving` CSR (CN `system:node:kueue-offload`, IP
+SAN the pod's IP), which the controller approves itself when it is its own ServiceAccount's
+(`--approve-kubelet-serving-csr`, default true), kept in memory: a restarted controller makes a
+new one. The API server verifies a kubelet's serving certificate (the reference cluster refuses one that
+is not the cluster's), so there is no other source.
+
+What the node needs in the cluster:
+
+| Object | How many |
+| --- | --- |
+| Node, and its Lease in `kube-node-lease` | one per site |
+| kubelet-serving CSR | one per start of the controller |
+| pods | the Workload's own, made by its owner once Kueue admits and bound to the node; none runs a container in the cluster |
+| shadow | one per job that exposes ports or tunnels back; a batch job has no cluster pod but its own |
+| mutating admission rules | three: `schedulerName` and untimed node tolerations on pods, `backoffLimit: 0` on Jobs |
+| node RBAC by name | patch and delete of the node, patch of its status, granted by the deployment for `kueue-offload-<OffloadConfig>` |
+
+The node has no Deployment, image, CRD or credential of its own: it runs in the offload
+controller's process, reads logs from the executor through the Service the executor already has,
+and keeps the pod to member mapping in pod annotations.
+
+RBAC of the node (markers in `pkg/node/doc.go`): nodes `get`, `list`, `watch`, `create` and
+`nodes/status` `get`; patch and delete of the node and patch of its status, the only writes the
+controller and the virtual-kubelet library make to it, are the deployment's to grant by name, one `kueue-offload-<OffloadConfig>` per site, since
+`resourceNames` cannot name a node before it exists: the controller cannot repoint a node it does
+not run, so the serving certificate it approves for itself is of no use for another node. Leases in
+`kube-node-lease`; pods `get`, `list`, `watch`, `patch`, `delete`, `pods/status`, `pods/binding`
+`create`; TokenReviews and SubjectAccessReviews; the client CA ConfigMap in `kube-system`;
+CertificateSigningRequests, their approval and the `kubernetes.io/kubelet-serving` signer. The
+Roles in `kube-node-lease` and `kube-system` are bound in `config/rbac/role_binding.yaml`.
 
 ## Membership controller
 

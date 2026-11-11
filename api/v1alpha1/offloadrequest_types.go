@@ -153,12 +153,6 @@ type OffloadRequestSpec struct {
 	// value for a key wins.
 	// +optional
 	OwnerAnnotations map[string]string `json:"ownerAnnotations,omitempty"`
-	// ownerLabels are, for a Workload of one plain pod, that pod's labels:
-	// Kueue's PodSet template of a pod holds its spec only. The shadow carries
-	// those a Service of the namespace selects the pod by, so that the Service
-	// selects the shadow too. Empty for every other owner.
-	// +optional
-	OwnerLabels map[string]string `json:"ownerLabels,omitempty"`
 	// podSets are the Workload's PodSets, in its order.
 	// +listType=map
 	// +listMapKey=name
@@ -189,15 +183,24 @@ type RankStatus struct {
 	State string `json:"state"`
 	// +optional
 	ExitCode int32 `json:"exitCode,omitempty"`
+	// nodeName is the member's compute node.
+	// +optional
+	NodeName string `json:"nodeName,omitempty"`
 	// containers are the member's container statuses as the backend reports
-	// them. The head rank's exit codes reach the owner pods.
+	// them. The offload controller's virtual node shows them on the member's
+	// pod.
 	// +listType=atomic
 	// +optional
 	Containers []corev1.ContainerStatus `json:"containers,omitempty"`
+	// initContainers are the member's init container statuses, likewise.
+	// +listType=atomic
+	// +optional
+	InitContainers []corev1.ContainerStatus `json:"initContainers,omitempty"`
 }
 
-// ShadowReference names the shadow objects the executor rendered for the job,
-// and the state of the shadow's pod.
+// ShadowReference names the shadow objects the executor rendered for a job
+// that forwards ports or tunnels back to the cluster, and the state of the
+// shadow's pod. The shadow carries no logs.
 type ShadowReference struct {
 	// +optional
 	Deployment string `json:"deployment,omitempty"`

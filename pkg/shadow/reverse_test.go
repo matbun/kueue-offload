@@ -173,7 +173,7 @@ func TestReversePreExec(t *testing.T) {
 }
 
 // A job that only opens connections into the cluster gets a shadow with the
-// ssh-reverse container and no Service; once it ended, the shadow keeps job-logs only.
+// ssh-reverse container and no Service.
 func TestEnsureReverseOnly(t *testing.T) {
 	cfg := testConfig()
 	cfg.Reverse.Enabled = true
@@ -195,7 +195,7 @@ func TestEnsureReverseOnly(t *testing.T) {
 		t.Errorf("a reverse-only shadow has Service %q", ref.Service)
 	}
 	d := getDeployment(t, client, ref.Deployment)
-	if names := containerNames(d.Spec.Template.Spec.Containers); !slices.Equal(names, []string{"ssh-reverse", JobLogsContainer}) {
+	if names := containerNames(d.Spec.Template.Spec.Containers); !slices.Equal(names, []string{"ssh-reverse"}) {
 		t.Fatalf("containers %v", names)
 	}
 	reverse := container(t, d, "ssh-reverse")
@@ -214,15 +214,8 @@ func TestEnsureReverseOnly(t *testing.T) {
 		t.Errorf("the shadow does not wait for the socket directory: %v", containerNames(d.Spec.Template.Spec.InitContainers))
 	}
 
-	spec.Terminal = true
-	if _, err := m.Ensure(t.Context(), spec); err != nil {
-		t.Fatal(err)
-	}
-	assertLogsOnly(t, client, ref)
-
 	off := testConfig()
 	_, m = newTestManager(t, off)
-	spec.Terminal = false
 	if _, err := m.Ensure(t.Context(), spec); err == nil || !strings.Contains(err.Error(), "Shadow.Reverse.Enabled") {
 		t.Fatalf("reverse tunnel with Reverse off: %v", err)
 	}

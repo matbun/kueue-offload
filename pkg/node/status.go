@@ -380,6 +380,26 @@ func rejectedStatus(st *corev1.PodStatus, pod *corev1.Pod, reason, msg string, n
 	terminalConditions(st, now)
 }
 
+// stoppedStatus ends a pod being deleted whose member has not ended, as a
+// kubelet ends one whose containers it stopped: they exit with 137 (SIGKILL).
+func stoppedStatus(st *corev1.PodStatus, pod *corev1.Pod, now time.Time) {
+	at := metav1.Time{Time: now}
+	st.Phase = corev1.PodFailed
+	if st.StartTime == nil {
+		st.StartTime = at.DeepCopy()
+	}
+	ctrs := make([]corev1.ContainerStatus, 0, len(pod.Spec.Containers))
+	for _, ctr := range pod.Spec.Containers {
+		start := at
+		if own := statusOf(st.ContainerStatuses, ctr.Name); own != nil && own.State.Running != nil {
+			start = own.State.Running.StartedAt
+		}
+		ctrs = append(ctrs, terminatedContainer(ctr, 137, start, at))
+	}
+	st.ContainerStatuses = ctrs
+	terminalConditions(st, now)
+}
+
 // terminalConditions are a kubelet's conditions of a pod that ended.
 func terminalConditions(st *corev1.PodStatus, now time.Time) {
 	st.Conditions = setPodCondition(st.Conditions, corev1.PodReadyToStartContainers, corev1.ConditionFalse, "", "", now)

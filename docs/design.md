@@ -964,8 +964,11 @@ Pod status (`pkg/node/status.go`, from the Workload, its live request and the ra
 | Workload annotation `offload.interlink.eu/failed` | `Failed`, reason `Rejected`, the annotation as message ([Owners](#owners)) |
 | a pod with the node's label but no Workload or rank annotation | `Failed`, reason `NotOffloaded` |
 
-A pod already `Succeeded` or `Failed` is never written again. A pod being deleted is deleted at
-once (grace 0); its job goes with its request. The controller caches only pods with the label
+A pod already `Succeeded` or `Failed` is never written again. A pod being deleted first ends, as a
+kubelet ends one whose containers it stopped: as its member ended, else `Failed` with its containers
+at exit code 137; it is then deleted at once (grace 0), and its job goes with its request. Without
+the end, a finalizer (Kueue's `kueue.x-k8s.io/managed` on a pod group's pods) would keep the pod
+`Running` and the group's quota held. The controller caches only pods with the label
 `offload.interlink.eu/node`, so a pod bound here without it (a DaemonSet's that tolerates the
 taint) is left as it is.
 

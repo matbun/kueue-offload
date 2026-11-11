@@ -170,36 +170,70 @@ func TestReconcileFailedGroupMemberNotRetriable(t *testing.T) {
 	}
 }
 
-// A pod being deleted is deleted at once, with no status write; a pod group
-// member whose job has not finished is first marked not retriable.
+// A pod being deleted ends first, as a kubelet ends one whose containers it
+// stopped, and is then deleted at once: a finalizer (Kueue's, on a pod group's
+// pods) keeps it until it has ended. A pod group member whose job has not
+// finished is first marked not retriable.
 func TestReconcileDeletedPod(t *testing.T) {
-	deleting := func() *corev1.Pod {
+	deleting := func(grace int64) *corev1.Pod {
 		pod := groupPod("train-0", "0")
 		pod.Finalizers = []string{"kueue.x-k8s.io/managed"}
-		pod.DeletionTimestamp, pod.DeletionGracePeriodSeconds = &metav1.Time{Time: t1}, ptr.To[int64](30)
+		pod.DeletionTimestamp, pod.DeletionGracePeriodSeconds = &metav1.Time{Time: t1}, ptr.To(grace)
 		return pod
 	}
 	t.Run("job running", func(t *testing.T) {
 		var calls []apiCall
-		c := fakeClient(t, &calls, deleting(), testWorkload(), runningRequest())
+		c := fakeClient(t, &calls, deleting(30), testWorkload(), runningRequest())
 		reconcilePod(t, c, "train-0")
-		if len(calls) != 2 || calls[0].verb != "patch" || calls[1].verb != "delete" {
-			t.Fatalf("calls %+v, want the annotation patch, then the delete", calls)
+		if len(calls) != 3 || calls[0].verb != "patch" || calls[1].verb != "patch status" || calls[2].verb != "delete" {
+			t.Fatalf("calls %+v, want the annotation patch, the status, then the delete", calls)
 		}
-		if g := calls[1].grace; g == nil || *g != 0 {
+		if g := calls[2].grace; g == nil || *g != 0 {
 			t.Errorf("delete grace %v, want 0", g)
 		}
-		if u := calls[1].uid; u == nil || *u != "uid-train-0" {
+		if u := calls[2].uid; u == nil || *u != "uid-train-0" {
 			t.Errorf("delete precondition %v, want the pod's UID", u)
+		}
+		pod := getPod(t, c, "train-0")
+		if pod.Status.Phase != corev1.PodFailed || code(pod.Status.ContainerStatuses[0]) != 137 {
+			t.Errorf("phase %s containers %+v, want Failed, its container stopped with 137", pod.Status.Phase, pod.Status.ContainerStatuses)
 		}
 	})
 	t.Run("job finished", func(t *testing.T) {
 		q := testRequest(cond(v1alpha1.OffloadRequestFinished, v1alpha1.OffloadRequestSucceeded))
 		var calls []apiCall
-		c := fakeClient(t, &calls, deleting(), testWorkload(), q)
+		c := fakeClient(t, &calls, deleting(30), testWorkload(), q)
 		reconcilePod(t, c, "train-0")
-		if len(calls) != 1 || calls[0].verb != "delete" {
-			t.Fatalf("calls %+v, want only the delete", calls)
+		if len(calls) != 2 || calls[0].verb != "patch status" || calls[1].verb != "delete" {
+			t.Fatalf("calls %+v, want the member's end, then the delete", calls)
+		}
+		if pod := getPod(t, c, "train-0"); pod.Status.Phase != corev1.PodSucceeded {
+			t.Errorf("phase %s, want the member's Succeeded", pod.Status.Phase)
+		}
+	})
+	// Deleted with no grace already, but still running: it ends, with no
+	// second delete.
+	t.Run("deleted before it ended", func(t *testing.T) {
+		pod := deleting(0)
+		pod.Annotations[podconstants.RetriableInGroupAnnotationKey] = podconstants.RetriableInGroupAnnotationValue
+		var calls []apiCall
+		c := fakeClient(t, &calls, pod, testWorkload(), runningRequest())
+		reconcilePod(t, c, "train-0")
+		if len(calls) != 1 || calls[0].verb != "patch status" {
+			t.Fatalf("calls %+v, want only the status", calls)
+		}
+		if got := getPod(t, c, "train-0"); got.Status.Phase != corev1.PodFailed {
+			t.Errorf("phase %s, want Failed", got.Status.Phase)
+		}
+	})
+	t.Run("ended", func(t *testing.T) {
+		pod := deleting(30)
+		pod.Status.Phase = corev1.PodSucceeded
+		var calls []apiCall
+		c := fakeClient(t, &calls, pod, testWorkload(), runningRequest())
+		reconcilePod(t, c, "train-0")
+		if len(calls) != 2 || calls[0].verb != "patch" || calls[1].verb != "delete" {
+			t.Fatalf("calls %+v, want the annotation patch, then only the delete", calls)
 		}
 	})
 }

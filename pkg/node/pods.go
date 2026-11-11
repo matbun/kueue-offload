@@ -98,7 +98,7 @@ func (r *PodStatusReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{}, err
 	}
 	if !pod.DeletionTimestamp.IsZero() {
-		return ctrl.Result{}, r.remove(ctx, pod, q)
+		return ctrl.Result{}, r.remove(ctx, pod, wl, q)
 	}
 	if podFinished(pod) {
 		return ctrl.Result{}, nil
@@ -147,14 +147,29 @@ func (r *PodStatusReconciler) job(ctx context.Context, pod *corev1.Pod) (*kueue.
 	return wl, live, nil
 }
 
-// remove deletes a pod being deleted at once, as a kubelet does once its
-// containers stopped: the job goes with its request. A member of a pod group
-// whose job has not finished is first marked not retriable, since no
-// allocation can take a replacement and Kueue would wait for one.
-func (r *PodStatusReconciler) remove(ctx context.Context, pod *corev1.Pod, q *v1alpha1.OffloadRequest) error {
+// remove ends a pod being deleted and then deletes it at once, as a kubelet
+// does once its containers stopped: the job goes with its request. The pod
+// ends as its member did, else Failed with its containers stopped (137); a
+// finalizer, Kueue's on a pod group's pods, keeps the pod until it has ended. A
+// member of a pod group whose job has not finished is first marked not
+// retriable, since no allocation can take a replacement and Kueue would wait
+// for one.
+func (r *PodStatusReconciler) remove(ctx context.Context, pod *corev1.Pod, wl *kueue.Workload, q *v1alpha1.OffloadRequest) error {
 	if q == nil || !meta.IsStatusConditionTrue(q.Status.Conditions, v1alpha1.OffloadRequestFinished) {
 		if ok, err := r.notRetriableInGroup(ctx, pod); err != nil || !ok {
 			return err
+		}
+	}
+	if !podFinished(pod) {
+		st := podStatus(pod, wl, q, rankAnnotation(pod), r.NodeIP, r.now())
+		if st.Phase != corev1.PodSucceeded && st.Phase != corev1.PodFailed {
+			st = *pod.Status.DeepCopy()
+			stoppedStatus(&st, pod, r.now())
+		}
+		done := pod.DeepCopy()
+		done.Status = st
+		if err := r.Client.Status().Patch(ctx, done, client.StrategicMergeFrom(pod)); err != nil {
+			return client.IgnoreNotFound(err)
 		}
 	}
 	if ptr.Deref(pod.DeletionGracePeriodSeconds, 1) == 0 {

@@ -27,7 +27,7 @@ spec:
     slurmCluster: hpc-a
     associations: {namespace: kueue-offload-membership, name: hpc-a-associations, key: associations}
     executorTemplate: {namespace: kueue-offload-membership, name: hpc-a-executor-template, key: template.yaml}
-    executorImage: registry.example.org/kueue-offload:latest
+    executorImage: ghcr.io/matbun/kueue-offload:latest
     syncInterval: 15m
     defaultProjectQuota:
     - coveredResources: [cpu, memory, nvidia.com/gpu]

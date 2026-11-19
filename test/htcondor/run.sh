@@ -10,7 +10,7 @@
 # Environment:
 #   PLUGIN_SRC     interlink-htcondor-plugin checkout (default ../interlink-htcondor-plugin)
 #   INTERLINK_SRC  interLink checkout the API server is built from, with
-#                  PodStatus.SocketDir (default ../interLink-hardening)
+#                  PodStatus.SocketDir (default the release make test uses)
 #   SKIP_BUILD=1   use the images built by an earlier run
 #   KEEP=1         keep the cluster at the end
 #   CLUSTER        kind cluster name (default kueue-offload-htcondor)
@@ -21,7 +21,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 PLUGIN_SRC=${PLUGIN_SRC:-$REPO/../interlink-htcondor-plugin}
-INTERLINK_SRC=${INTERLINK_SRC:-$REPO/../interLink-hardening}
+INTERLINK_SRC=${INTERLINK_SRC:-$(make -s -C "$REPO" interlink-src)}
 CLUSTER=${CLUSTER:-kueue-offload-htcondor}
 NODE_IMAGE=${NODE_IMAGE:-kindest/node:v1.34.3}
 KUEUE_MANIFESTS=https://github.com/kubernetes-sigs/kueue/releases/download/v0.16.9/manifests.yaml

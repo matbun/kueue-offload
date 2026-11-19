@@ -89,7 +89,8 @@ An executor that stops answering is noticed by its heartbeat ([Executor health](
 
 ### Start estimate
 
-On a plugin that lists the capability `estimate`, the executor asks the API server's `/estimate`,
+By default the executor submits an attempt at once and the job waits in the site's queue; the
+quota stays reserved meanwhile. On a plugin that lists the capability `estimate`, the executor asks the API server's `/estimate`,
 before it creates anything of an attempt, when the site would start a job of the Workload's shape
 ([backends.md](backends.md) 3.1). It records the answer in the request's `status.estimate`
 (`probeTime`, `nodes`, and `startTime`, or `reason` and `message` when the site gave none) and
@@ -117,7 +118,7 @@ Workload again; a Workload deactivated without the annotation stays inactive. A 
 Workload: the next attempt's `spec.deferrals` is the previous one's plus one, and [Retries](#retries)
 count `attempt - 1 - deferrals` against `backoffLimitCount`. A submitted job, or an attempt whose
 stage-in started, is never deferred. Without `maxStartDelay` the estimate only shows in the
-message.
+message, and the attempt is submitted on the next pass.
 
 ### Retries
 
@@ -565,8 +566,8 @@ which changes nothing.
    except deleting an ended job's shadow once.
 4. No job yet: read the request again from the API server, check its shape, its sizing and
    flags, its Workload and the earlier attempts (refuse, or wait with the reason in the status),
-   set `Accepted=True`, ask the start estimate once ([Start estimate](#start-estimate)), then on a
-   later pass submit, staging in first.
+   set `Accepted=True`, and submit, staging in first; on a plugin that lists `estimate`, ask the
+   start estimate once first ([Start estimate](#start-estimate)) and submit on a later pass.
 5. A submitted job: create the ranks of independent pods that wait for the site (after reading
    the request again), read the job's state through `/status`, ensure the shadow, run the
    stage-out, and write the status with the heartbeat, or without one when the API server or the

@@ -22,7 +22,7 @@ spec:
           type: RuntimeDefault
       containers:
       - name: offload-controller
-        image: kueue-offload:latest
+        image: ghcr.io/matbun/kueue-offload:latest
         command: [/offload-controller]
         args:
         - --namespace=kueue-offload

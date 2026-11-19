@@ -20,7 +20,7 @@ import (
 
 // The tests drive the executor through a real interLink API server, built once
 // from INTERLINK_API_SERVER (a binary) or INTERLINK_SRC (a checkout of interLink
-// with PodStatus.SocketDir, default ../../../interLink-hardening). Without either
+// with PodStatus.SocketDir; make test sets it to a pinned release). Without either
 // the tests that submit are skipped.
 var (
 	apiServerBin     string
@@ -51,7 +51,7 @@ func buildAPIServer(dir string) (bin, missing string) {
 	}
 	src := os.Getenv("INTERLINK_SRC")
 	if src == "" {
-		src = filepath.Join("..", "..", "..", "interLink-hardening")
+		return "", "no interLink source: run make test, or set INTERLINK_SRC or INTERLINK_API_SERVER"
 	}
 	if _, err := os.Stat(filepath.Join(src, "cmd", "interlink")); err != nil {
 		return "", "no interLink source at " + src + ": set INTERLINK_SRC or INTERLINK_API_SERVER"

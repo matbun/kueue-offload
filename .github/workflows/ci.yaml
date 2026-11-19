@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: vet
+        run: make vet
+      # Clones the pinned interLink release the executor's tests build the API server from.
+      - name: test
+        run: make test
+      - name: render config
+        run: |
+          for dir in config/default config/membership config/samples/membership; do
+            kubectl kustomize "$dir" > /dev/null
+          done

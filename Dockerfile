@@ -1,4 +1,4 @@
-FROM golang:1.27 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -6,7 +6,8 @@ COPY api/ api/
 COPY cmd/ cmd/
 COPY pkg/ pkg/
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X github.com/matbun/kueue-offload/pkg/node.KubeletVersion=${VERSION}" -o /out/ ./cmd/...
+ARG TARGETOS TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w -X github.com/matbun/kueue-offload/pkg/node.KubeletVersion=${VERSION}" -o /out/ ./cmd/...
 
 FROM gcr.io/distroless/static:nonroot
 COPY --from=build /out/ /

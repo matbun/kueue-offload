@@ -20,7 +20,9 @@ ba9f7e85. `htc` is interlink-htcondor-plugin at 5f9ecdb. Kueue paths follow `kue
 - Queue, account and wall time reach the plugin as annotations that OffloadConfig defines per
   flavor. The executor holds no Slurm flags.
 - A plugin lists `pod-group` in its ping answer when it runs N `/create` calls that share Kueue's
-  pod group label as one allocation. The Slurm plugin already does this. On a plugin without it, a
+  pod group label as one allocation. For the Slurm plugin this is in the open drafts
+  https://github.com/interlink-hq/interlink-slurm-plugin/pull/174 and
+  https://github.com/interlink-hq/interlink-slurm-plugin/pull/173. On a plugin without it, a
   gang is refused, and a Workload marked `independent-pods` runs as one job per pod.
 - `/create` answers 503 for a transient refusal (submit limit, scheduler down) and 4xx for a
   permanent one.
@@ -219,8 +221,9 @@ API server refuses `nodes` below 1 itself with 400 and forwards the body unchang
 plugin answers 200 with `{"start": "<RFC 3339>", "raw": "<its scheduler's text>"}`, or an error
 with its own status code, which the API server relays: 400 for a malformed request, 502 when the
 scheduler gives no start time (a per-user submit limit among them), 404 from a plugin without the
-route. The Slurm plugin runs `sbatch --test-only` with those values and the default flavor's
-flags.
+route. A plugin that does not list `estimate` gets no call: the executor submits at once and the
+job waits in the site's queue. The estimate matters only to an OffloadConfig that sets
+`maxStartDelay`.
 
 ### 3.2 `pod-group`: a gang as one allocation over per-pod /create
 
@@ -264,7 +267,7 @@ pod in request order, every `PodJID` the group's job ID; 400 for a bad request o
 refusal and 503 for a transient one, as `/create` (3.4). Status, logs and delete stay per pod, so
 the shadow and the log relay do not change.
 
-- interLink: the types and the route are an upstream draft,
+- interLink: the types and the route are an open upstream pull request,
   https://github.com/interlink-hq/interLink/pull/606. Until it lands, the executor carries its
   own copy of the type (`pkg/executor/interlink.go`, `PodGroupCreateRequests`).
 - Slurm plugin: the handler renders each pod as `/create` does and submits the group as the one
@@ -520,6 +523,6 @@ project. "Slurm e2e" below means that set of tests.
    or in the mini container. Open an upstream issue for identity forwarding and per-caller scoping
    (section 4).
 10. **`pod-group-create`.** Done: the Slurm plugin's `/createPodGroup` and the executor's choice by
-    capability (3.3). The API server route is an upstream interLink draft,
+    capability (3.3). The API server route is an open upstream interLink pull request,
     https://github.com/interlink-hq/interLink/pull/606. Test: executor tests against the fake plugin, with and without the
     capability; plugin unit tests.
